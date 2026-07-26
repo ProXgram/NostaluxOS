@@ -156,11 +156,37 @@ DECLARE_NOERR_HANDLER(18); DECLARE_NOERR_HANDLER(19); DECLARE_NOERR_HANDLER(20);
 DECLARE_NOERR_HANDLER(23); DECLARE_NOERR_HANDLER(24); DECLARE_NOERR_HANDLER(25); DECLARE_NOERR_HANDLER(26); DECLARE_NOERR_HANDLER(27);
 DECLARE_NOERR_HANDLER(28); DECLARE_ERR_HANDLER(29); DECLARE_ERR_HANDLER(30); DECLARE_NOERR_HANDLER(31);
 
-__attribute__((interrupt)) static void handler_irq_master(struct interrupt_frame* frame) { (void)frame; outb(PIC1_COMMAND, PIC_EOI); }
-__attribute__((interrupt)) static void handler_irq_slave(struct interrupt_frame* frame) { (void)frame; outb(PIC2_COMMAND, PIC_EOI); outb(PIC1_COMMAND, PIC_EOI); }
-__attribute__((interrupt)) static void handler_irq_keyboard(struct interrupt_frame* frame) { (void)frame; uint8_t scancode = inb(0x60); outb(PIC1_COMMAND, PIC_EOI); keyboard_push_byte(scancode); }
-__attribute__((interrupt)) static void handler_irq_timer(struct interrupt_frame* frame) { (void)frame; timer_handler(); outb(PIC1_COMMAND, PIC_EOI); }
-__attribute__((interrupt)) static void handler_irq_mouse(struct interrupt_frame* frame) { (void)frame; mouse_handle_interrupt(); outb(PIC2_COMMAND, PIC_EOI); outb(PIC1_COMMAND, PIC_EOI); }
+__attribute__((interrupt)) static void handler_irq_master(struct interrupt_frame* frame) {
+    (void)frame;
+    timer_interrupt_entry();
+    outb(PIC1_COMMAND, PIC_EOI);
+}
+__attribute__((interrupt)) static void handler_irq_slave(struct interrupt_frame* frame) {
+    (void)frame;
+    timer_interrupt_entry();
+    outb(PIC2_COMMAND, PIC_EOI);
+    outb(PIC1_COMMAND, PIC_EOI);
+}
+__attribute__((interrupt)) static void handler_irq_keyboard(struct interrupt_frame* frame) {
+    (void)frame;
+    timer_interrupt_entry();
+    uint8_t scancode = inb(0x60);
+    outb(PIC1_COMMAND, PIC_EOI);
+    keyboard_push_byte(scancode);
+}
+__attribute__((interrupt)) static void handler_irq_timer(struct interrupt_frame* frame) {
+    (void)frame;
+    timer_interrupt_entry();
+    timer_handler();
+    outb(PIC1_COMMAND, PIC_EOI);
+}
+__attribute__((interrupt)) static void handler_irq_mouse(struct interrupt_frame* frame) {
+    (void)frame;
+    timer_interrupt_entry();
+    mouse_handle_interrupt();
+    outb(PIC2_COMMAND, PIC_EOI);
+    outb(PIC1_COMMAND, PIC_EOI);
+}
 
 static void idt_set_gate(uint8_t vector, void* handler) {
     uint64_t address = (uint64_t)handler;

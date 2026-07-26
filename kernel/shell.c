@@ -21,6 +21,7 @@
 #include "banner.h"
 #include "gui_demo.h" // Includes the GUI entry point
 #include "rtc.h"
+#include "scheduler.h"
 
 struct shell_command {
     const char* name;
@@ -384,11 +385,13 @@ static void command_gui(const char* args) {
     
     kprintf("Launching graphical desktop...\n");
     timer_set_callback(NULL); // Stop kernel background animation
+    scheduler_set_current_name("kernel/desktop");
 
     // The desktop currently shares kernel graphics, input, heap, and filesystem
     // APIs, so run it synchronously until the user presses Escape.
     gui_demo_run();
 
+    scheduler_set_current_name("kernel/shell");
     background_render();
     shell_print_banner();
     timer_set_callback(background_animate);
@@ -423,6 +426,7 @@ static void execute_command(const char* input) {
 }
 
 void shell_run(void) {
+    scheduler_set_current_name("kernel/shell");
     char input[INPUT_CAPACITY];
     sound_init();
     shell_print_banner();

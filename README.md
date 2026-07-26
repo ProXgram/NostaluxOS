@@ -15,6 +15,11 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
   ATA-backed filesystem stored inside the raw disk image.
 - **Graphical desktop** — `gui` opens movable and resizable windows, a Start menu, taskbar, Files, Paint, Notepad,
   Calculator, settings, monitors, games, and other retro desktop apps.
+- **Kernel-backed diagnostics** — System Monitor graphs measured CPU busy time and tracked memory use, while Task
+  Manager enumerates the cooperative scheduler's real kernel tasks rather than treating windows as processes.
+- **Filesystem image viewer** — Image Viewer validates and renders uncompressed 24-bit BMP files stored in the
+  ATA-backed filesystem. A small `nostalux.bmp` is installed automatically as a working example; BMPs must fit the
+  filesystem's current 1,023-byte per-file limit.
 - **AI Assistant** — an offline rule-based helper answers common NostaluxOS questions and can launch apps from
   requests such as `open calculator`.
 
@@ -44,6 +49,12 @@ make
 This creates `build/NostaluxOS.img`, a raw disk image containing the bootloader, kernel, and writable filesystem area.
 The conflict check reads the source tree directly, so the build works from a ZIP extraction or Downloads folder even
 when no `.git` directory is present.
+
+Run the host-side BMP validation tests with:
+
+```sh
+make test
+```
 
 ### Filesystem persistence
 
@@ -138,4 +149,5 @@ This removes the entire `build/` directory, including the disk image and any fil
 - `bootloader/` — 16-bit boot sector plus the protected-mode/long-mode transition stage
 - `kernel/` — freestanding 64-bit kernel sources, headers, assembly entry point, and linker script
 - `scripts/` — source-tree validation helpers used by the build
+- `tests/` — host-side parser tests run by `make test`
 - `Makefile` — build, image assembly, persistence, and QEMU launch orchestration

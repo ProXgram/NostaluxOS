@@ -10,6 +10,18 @@ static uint64_t g_next_pid = 1;
 
 #define STACK_SIZE 16384
 
+static void copy_task_name(char destination[TASK_NAME_MAX], const char* source) {
+    size_t index = 0;
+
+    if (source != NULL) {
+        while (source[index] != '\0' && index + 1 < TASK_NAME_MAX) {
+            destination[index] = source[index];
+            index++;
+        }
+    }
+    destination[index] = '\0';
+}
+
 static void reap_dead_tasks(void) {
     if (g_head == NULL) return;
 
@@ -35,6 +47,7 @@ void scheduler_init(void) {
     }
 
     kmain_task->id = g_next_pid++;
+    copy_task_name(kmain_task->name, "kernel/main");
     kmain_task->rsp = 0; 
     kmain_task->is_user = false;
     kmain_task->state = TASK_READY;
@@ -46,7 +59,7 @@ void scheduler_init(void) {
     g_head = kmain_task;
     g_current_task = kmain_task;
     
-    syslog_write("Scheduler: Initialized (Multitasking enabled)");
+    syslog_write("Scheduler: Cooperative kernel scheduler initialized");
 }
 
 extern void task_return_trampoline(void);
@@ -68,6 +81,7 @@ bool spawn_task(void (*entry_point)(void)) {
     }
     
     new_task->id = g_next_pid++;
+    copy_task_name(new_task->name, "kernel/task");
     new_task->is_user = false;
     new_task->state = TASK_READY;
     new_task->kernel_stack = stack;
@@ -106,6 +120,53 @@ bool spawn_user_task(void (*entry_point)(void)) {
      */
     syslog_write("Scheduler: user tasks are disabled");
     return false;
+}
+
+size_t scheduler_task_count(void) {
+    if (g_head == NULL) return 0;
+
+    size_t count = 0;
+    Task* task = g_head;
+    do {
+        count++;
+        task = (Task*)task->next;
+    } while (task != NULL && task != g_head);
+    return count;
+}
+
+size_t scheduler_snapshot_tasks_from(size_t offset,
+                                     struct scheduler_task_info* tasks,
+                                     size_t capacity) {
+    if (tasks == NULL || capacity == 0 || g_head == NULL) return 0;
+
+    size_t written = 0;
+    size_t index = 0;
+    Task* task = g_head;
+    do {
+        if (index >= offset) {
+            if (written >= capacity) break;
+            tasks[written].id = task->id;
+            copy_task_name(tasks[written].name, task->name);
+            tasks[written].state = task->state;
+            tasks[written].is_user = task->is_user;
+            tasks[written].is_current = task == g_current_task;
+            written++;
+        }
+        index++;
+        task = (Task*)task->next;
+    } while (task != NULL && task != g_head);
+
+    return written;
+}
+
+size_t scheduler_snapshot_tasks(struct scheduler_task_info* tasks, size_t capacity) {
+    return scheduler_snapshot_tasks_from(0, tasks, capacity);
+}
+
+void scheduler_set_current_name(const char* name) {
+    if (g_current_task == NULL) return;
+    copy_task_name(g_current_task->name,
+                   name != NULL && name[0] != '\0' ? name : "kernel/task");
 }
 
 void exit_current_task(void) {

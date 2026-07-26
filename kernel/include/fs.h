@@ -20,6 +20,7 @@ size_t fs_file_count(void);
 const struct fs_file* fs_file_at(size_t index);
 const struct fs_file* fs_find(const char* name);
 bool fs_touch(const char* name);
+bool fs_write_bytes(const char* name, const void* contents, size_t length);
 bool fs_write(const char* name, const char* contents);
 bool fs_append(const char* name, const char* contents);
 bool fs_remove(const char* name);

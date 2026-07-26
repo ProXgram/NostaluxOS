@@ -8,7 +8,8 @@
 #define FS_STORAGE_LBA 2048
 #define FS_MAGIC_VAL   0xBA5EBA11
 #define FS_LEGACY_DISK_VERSION 1u
-#define FS_DISK_VERSION 2u
+#define FS_GENERATION_DISK_VERSION 2u
+#define FS_DISK_VERSION 3u
 #define FS_SLOT_COUNT 2u
 #define FS_DISK_RECORD_BYTES (1u + FS_MAX_FILENAME + 4u + FS_MAX_FILE_SIZE)
 #define FS_DISK_TABLE_BYTES (FS_DISK_RECORD_BYTES * FS_MAX_FILES)
@@ -47,6 +48,7 @@ _Static_assert(FS_DISK_TABLE_SECTORS <= 255u, "ATA PIO count is one byte");
 static struct fs_disk_table g_disk_table;
 static uint8_t g_active_slot = FS_SLOT_COUNT;
 static uint32_t g_active_generation = 0;
+static uint32_t g_loaded_version = 0;
 
 static bool fs_is_valid_name(const char* name);
 
@@ -57,6 +59,7 @@ static uint32_t fs_slot_header_lba(uint8_t slot) {
 static bool fs_header_is_valid(const struct fs_disk_header* header) {
     return header->magic == FS_MAGIC_VAL &&
            (header->version == FS_LEGACY_DISK_VERSION ||
+            header->version == FS_GENERATION_DISK_VERSION ||
             header->version == FS_DISK_VERSION) &&
            header->table_bytes == FS_DISK_TABLE_BYTES;
 }
@@ -119,9 +122,6 @@ static bool fs_deserialize(void) {
             return false;
         }
 
-        for (size_t j = 0; j < record->size; j++) {
-            if (record->data[j] == '\0') return false;
-        }
         for (size_t previous = 0; previous < i; previous++) {
             if (FILES[previous].in_use &&
                 kstrcmp(FILES[previous].name, record->name) == 0) {
@@ -163,6 +163,7 @@ static bool fs_load_slot(uint8_t slot, const struct fs_disk_header* header) {
 
     g_active_slot = slot;
     g_active_generation = fs_header_generation(header);
+    g_loaded_version = header->version;
     return true;
 }
 
@@ -200,6 +201,7 @@ static bool fs_sync_to_disk(void) {
 
     g_active_slot = target_slot;
     g_active_generation = next_generation;
+    g_loaded_version = FS_DISK_VERSION;
     return true;
 }
 
@@ -285,7 +287,13 @@ static struct fs_file* fs_allocate_slot(void) {
     return NULL;
 }
 
-static bool fs_seed_file(const char* name, const char* contents) {
+static bool fs_seed_bytes(const char* name, const void* contents, size_t length) {
+    if (!fs_is_valid_name(name) ||
+        (contents == NULL && length != 0) ||
+        length >= FS_MAX_FILE_SIZE) {
+        return false;
+    }
+
     struct fs_file* existing = fs_find_mutable(name);
     struct fs_file* target = existing;
 
@@ -296,21 +304,105 @@ static bool fs_seed_file(const char* name, const char* contents) {
         fs_copy_name(target, name);
     }
 
-    size_t length = kstrlen(contents);
-    if (length >= FS_MAX_FILE_SIZE) return false;
-
+    const uint8_t* bytes = (const uint8_t*)contents;
     for (size_t i = 0; i < length; i++) {
-        target->data[i] = contents[i];
+        target->data[i] = (char)bytes[i];
     }
     target->data[length] = '\0';
     target->size = length;
     return true;
 }
 
+static bool fs_seed_file(const char* name, const char* contents) {
+    if (contents == NULL) return false;
+    return fs_seed_bytes(name, contents, kstrlen(contents));
+}
+
+static void write_u16_le(uint8_t* bytes, uint16_t value) {
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8);
+}
+
+static void write_u32_le(uint8_t* bytes, uint32_t value) {
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8);
+    bytes[2] = (uint8_t)(value >> 16);
+    bytes[3] = (uint8_t)(value >> 24);
+}
+
+#define DEFAULT_BMP_WIDTH 17u
+#define DEFAULT_BMP_HEIGHT 17u
+#define DEFAULT_BMP_ROW_STRIDE 52u
+#define DEFAULT_BMP_PIXEL_OFFSET 54u
+#define DEFAULT_BMP_SIZE \
+    (DEFAULT_BMP_PIXEL_OFFSET + DEFAULT_BMP_ROW_STRIDE * DEFAULT_BMP_HEIGHT)
+
+_Static_assert(DEFAULT_BMP_SIZE < FS_MAX_FILE_SIZE,
+               "Default BMP must fit in one filesystem record");
+
+static bool fs_seed_default_bmp(void) {
+    uint8_t bmp[DEFAULT_BMP_SIZE];
+    for (size_t i = 0; i < sizeof(bmp); i++) bmp[i] = 0;
+
+    bmp[0] = 'B';
+    bmp[1] = 'M';
+    write_u32_le(bmp + 2, (uint32_t)sizeof(bmp));
+    write_u32_le(bmp + 10, DEFAULT_BMP_PIXEL_OFFSET);
+    write_u32_le(bmp + 14, 40u);
+    write_u32_le(bmp + 18, DEFAULT_BMP_WIDTH);
+    write_u32_le(bmp + 22, DEFAULT_BMP_HEIGHT);
+    write_u16_le(bmp + 26, 1u);
+    write_u16_le(bmp + 28, 24u);
+    write_u32_le(bmp + 34,
+                 DEFAULT_BMP_ROW_STRIDE * DEFAULT_BMP_HEIGHT);
+    write_u32_le(bmp + 38, 2835u);
+    write_u32_le(bmp + 42, 2835u);
+
+    for (uint32_t y = 0; y < DEFAULT_BMP_HEIGHT; y++) {
+        uint32_t file_row = DEFAULT_BMP_HEIGHT - 1u - y;
+        uint8_t* row = bmp + DEFAULT_BMP_PIXEL_OFFSET +
+                       file_row * DEFAULT_BMP_ROW_STRIDE;
+        for (uint32_t x = 0; x < DEFAULT_BMP_WIDTH; x++) {
+            uint8_t red = (uint8_t)(12u + x * 3u);
+            uint8_t green = (uint8_t)(28u + y * 4u);
+            uint8_t blue = (uint8_t)(58u + (x + y) * 2u);
+            bool logo = y >= 2u && y <= 14u &&
+                        (x == 3u || x == 13u ||
+                         (x + 1u >= y && x <= y + 1u));
+            bool border = x == 0u || x == DEFAULT_BMP_WIDTH - 1u ||
+                          y == 0u || y == DEFAULT_BMP_HEIGHT - 1u;
+            if (logo) {
+                red = 86u;
+                green = 238u;
+                blue = 196u;
+            } else if (border) {
+                red = 36u;
+                green = 126u;
+                blue = 148u;
+            }
+            row[x * 3u] = blue;
+            row[x * 3u + 1u] = green;
+            row[x * 3u + 2u] = red;
+        }
+    }
+
+    return fs_seed_bytes("nostalux.bmp", bmp, sizeof(bmp));
+}
+
 void fs_init(void) {
     // Try to load existing FS
     if (fs_load_from_disk()) {
         syslog_write("FS: loaded from persistent storage");
+        if (g_loaded_version < FS_DISK_VERSION &&
+            fs_find_mutable("nostalux.bmp") == NULL) {
+            if (fs_seed_default_bmp() && fs_sync_to_disk()) {
+                syslog_write("FS: installed default BMP image");
+            } else {
+                struct fs_file* image = fs_find_mutable("nostalux.bmp");
+                if (image != NULL) fs_clear(image);
+                syslog_write("FS: could not persist default BMP image");
+            }
+        }
         return;
     }
 
@@ -337,6 +429,8 @@ void fs_init(void) {
     fs_seed_file(
         "system.log",
         "Use the 'logs' command to view the in-memory event log.\n");
+
+    fs_seed_default_bmp();
 
     syslog_write("FS: mounted fresh volume");
 
@@ -391,10 +485,12 @@ bool fs_touch(const char* name) {
     return true;
 }
 
-bool fs_write(const char* name, const char* contents) {
-    if (!fs_is_valid_name(name) || contents == NULL) return false;
-    size_t length = kstrlen(contents);
-    if (length >= FS_MAX_FILE_SIZE) return false;
+bool fs_write_bytes(const char* name, const void* contents, size_t length) {
+    if (!fs_is_valid_name(name) ||
+        (contents == NULL && length != 0) ||
+        length >= FS_MAX_FILE_SIZE) {
+        return false;
+    }
 
     struct fs_file* file = fs_find_mutable(name);
     bool existed = file != NULL;
@@ -409,8 +505,9 @@ bool fs_write(const char* name, const char* contents) {
         fs_copy_name(file, name);
     }
 
+    const uint8_t* bytes = (const uint8_t*)contents;
     for (size_t i = 0; i < length; i++) {
-        file->data[i] = contents[i];
+        file->data[i] = (char)bytes[i];
     }
     file->data[length] = '\0';
     file->size = length;
@@ -421,6 +518,11 @@ bool fs_write(const char* name, const char* contents) {
         return false;
     }
     return true;
+}
+
+bool fs_write(const char* name, const char* contents) {
+    if (contents == NULL) return false;
+    return fs_write_bytes(name, contents, kstrlen(contents));
 }
 
 bool fs_append(const char* name, const char* contents) {
@@ -475,11 +577,22 @@ bool fs_remove(const char* name) {
 
 static void fs_self_test(void) {
     const char* scratch = "__fs_self_test__";
+    const uint8_t binary[] = {0x42u, 0x00u, 0x4Du, 0xFFu};
     struct fs_file* f = fs_find_mutable(scratch);
     if (f) fs_clear(f);
     
-    if (!fs_touch(scratch)) {
-        syslog_write("FS: self-test (touch) failed");
+    if (!fs_write_bytes(scratch, binary, sizeof(binary))) {
+        syslog_write("FS: self-test (binary write) failed");
+        return;
+    }
+
+    f = fs_find_mutable(scratch);
+    if (f == NULL || f->size != sizeof(binary) ||
+        (uint8_t)f->data[0] != binary[0] ||
+        (uint8_t)f->data[1] != binary[1] ||
+        (uint8_t)f->data[2] != binary[2] ||
+        (uint8_t)f->data[3] != binary[3]) {
+        syslog_write("FS: self-test (binary read) failed");
         return;
     }
     

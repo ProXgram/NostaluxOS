@@ -7,6 +7,7 @@
 #include "kstring.h"
 #include "terminal.h"
 #include "interrupts.h"
+#include "timer.h"
 
 /* --- Constants & Macros --- */
 
@@ -91,7 +92,7 @@ void keyboard_push_byte(uint8_t byte) {
 
 static uint8_t keyboard_pop_byte(void) {
     while (g_kb_head == g_kb_tail) {
-        __asm__ volatile("hlt");
+        timer_idle_wait();
     }
     uint8_t byte = g_kb_buffer[g_kb_tail];
     g_kb_tail = (g_kb_tail + 1) & SCANCODE_BUFFER_MASK;
@@ -316,7 +317,7 @@ void keyboard_read_line_ex(char* buffer, size_t size, keyboard_idle_callback_t o
             
             // Wait for interrupt (Timer IRQ 100Hz or Keyboard IRQ)
             // This prevents the CPU from spinning at 100% and running animations too fast
-            __asm__ volatile("hlt"); 
+            timer_idle_wait();
         }
 
         bool released = (raw & SCANCODE_RELEASE_MASK);

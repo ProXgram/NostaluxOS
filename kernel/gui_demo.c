@@ -11,6 +11,8 @@
 #include "heap.h"
 #include "io.h"
 #include "rtc.h"
+#include "bmp.h"
+#include "scheduler.h"
 #include <stdbool.h>
 #include <limits.h>
 
@@ -28,7 +30,7 @@ static void desktop_yield(void) {
      */
     uint64_t tick = timer_get_ticks();
     while (timer_get_ticks() == tick) {
-        __asm__ volatile("hlt");
+        timer_idle_wait();
     }
 }
 
@@ -153,7 +155,10 @@ typedef struct { int selected_index; int scroll_offset; } FileManagerState;
 typedef struct { bool wallpaper_enabled; int theme_id; } SettingsState;
 typedef struct { char prompt[16]; char input[64]; int input_len; char history[6][64]; } TerminalState;
 typedef struct { char url[64]; int url_len; char status[32]; int scroll; } BrowserState;
-typedef struct { int selected_pid; } TaskMgrState;
+typedef struct {
+    uint64_t selected_pid;
+    size_t page_offset;
+} TaskMgrState;
 typedef struct { uint32_t* canvas_buffer; int width; int height; uint32_t current_color; int brush_size; } PaintState;
 typedef struct { char cmd[32]; int len; } RunState;
 
@@ -189,8 +194,12 @@ typedef struct {
 
 // Image Viewer
 typedef struct {
-    int seed;
-    int zoom;
+    char filename[FS_MAX_FILENAME];
+    int file_index;
+    bool fit_to_window;
+    bool valid;
+    struct bmp_image image;
+    char status[48];
 } ImageViewState;
 
 // System Monitor
@@ -199,7 +208,12 @@ typedef struct {
     int cpu_hist[SYSMON_HIST];
     int mem_hist[SYSMON_HIST];
     int head;
-    int update_tick;
+    uint64_t last_sample_tick;
+    struct timer_cpu_counters previous_cpu;
+    uint32_t memory_used_kb;
+    uint32_t memory_total_kb;
+    int cpu_percent;
+    bool has_previous_cpu;
 } SysMonState;
 
 // About Window
@@ -209,7 +223,6 @@ typedef struct {
 
 typedef struct {
     int id;
-    int stable_id;
     AppType type;
     char title[32];
     int x, y, w, h;
@@ -233,7 +246,6 @@ static Point mouse_trail[TRAIL_LEN];
 static int trail_head = 0;
 
 static Window* windows[MAX_WINDOWS];
-static int next_window_id = 1;
 static bool start_menu_open = false;
 static int screen_w, screen_h;
 static MouseState mouse;
@@ -272,6 +284,7 @@ static void handle_assistant_click(Window* w, int x, int y);
 static void handle_minesweeper(Window* w, int rx, int ry, bool right_click);
 static void handle_tictactoe(Window* w, int x, int y);
 static void handle_imageview(Window* w, int x, int y);
+static void imageview_load(Window* w, int direction);
 static void render_window(Window* w);
 static void render_assistant_app(Window* w);
 static void draw_wallpaper(void);
@@ -349,6 +362,22 @@ static void int_to_str(int v, char* buf) {
     int i=0; char t[16]; while(magnitude>0){t[i++]='0'+(magnitude%10);magnitude/=10;}
     if(n)t[i++]='-';
     int j=0; while(i>0)buf[j++]=t[--i]; buf[j]=0;
+}
+static void uint64_to_str(uint64_t value, char* buf) {
+    if (value == 0) {
+        buf[0] = '0';
+        buf[1] = 0;
+        return;
+    }
+    char reversed[24];
+    int count = 0;
+    while (value > 0 && count < (int)sizeof(reversed)) {
+        reversed[count++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    }
+    int out = 0;
+    while (count > 0) buf[out++] = reversed[--count];
+    buf[out] = 0;
 }
 
 // --- BITMAPS (Icons) ---
@@ -649,13 +678,6 @@ static void focus_top_visible(void) {
     }
 }
 
-static int window_index_by_stable_id(int stable_id) {
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (windows[i] && windows[i]->stable_id == stable_id) return i;
-    }
-    return -1;
-}
-
 static void minimize_window(Window* w) {
     if (!w) return;
     bool was_focused = w->focused;
@@ -819,17 +841,12 @@ static void create_window(AppType type, const char* title, int w, int h) {
     mem_zero(win, sizeof(Window));
 
     win->id = slot;
-    win->stable_id = next_window_id;
-    next_window_id = (next_window_id == INT_MAX) ? 1 : next_window_id + 1;
     win->type = type;
     str_copy(win->title, sizeof(win->title), title);
     win->w = w; win->h = h; win->min_w = 150; win->min_h = 100;
     win->visible = true; win->focused = true;
     win->minimized = false; win->maximized = false;
     win->dragging = false; win->resizing = false;
-    win->state.files.selected_index = -1;
-    win->state.taskmgr.selected_pid = -1;
-    win->state.calc.new_entry = true;
 
     // Initialize Apps
     if (type == APP_PAINT) {
@@ -847,16 +864,20 @@ static void create_window(AppType type, const char* title, int w, int h) {
         win->state.ttt.turn = 1; // X starts
         win->state.ttt.winner = 0;
     } else if (type == APP_IMAGEVIEW) {
-        win->min_w = 240; win->min_h = 220;
-        win->state.img.zoom = 1;
-        win->state.img.seed = fast_rand() % 1000;
+        win->min_w = 320; win->min_h = 240;
+        win->state.img.file_index = -1;
+        win->state.img.fit_to_window = true;
+        imageview_load(win, 1);
     } else if (type == APP_SYSMON) {
-        win->min_w = 260; win->min_h = 180;
+        win->min_w = 340; win->min_h = 240;
         for(int i=0; i<SYSMON_HIST; i++) {
             win->state.sysmon.cpu_hist[i] = 0;
             win->state.sysmon.mem_hist[i] = 0;
         }
         win->state.sysmon.head = 0;
+        win->state.sysmon.last_sample_tick = 0;
+        win->state.sysmon.has_previous_cpu = false;
+        update_sysmon(win);
     } else if (type == APP_MINESWEEPER) {
         win->min_w = 220; win->min_h = 260;
         minesweeper_reset(&win->state.mine);
@@ -877,13 +898,18 @@ static void create_window(AppType type, const char* title, int w, int h) {
         str_copy(win->state.browser.url, sizeof(win->state.browser.url), "www.retro-os.net");
         win->state.browser.url_len = kstrlen_local("www.retro-os.net");
     } else if (type == APP_TASKMGR) {
-        win->min_w = 320; win->min_h = 220;
+        win->min_w = 380; win->min_h = 240;
+        win->state.taskmgr.selected_pid = 0;
+        win->state.taskmgr.page_offset = 0;
     } else if (type == APP_FILES) {
         win->min_w = 280; win->min_h = 180;
+        win->state.files.selected_index = -1;
+        win->state.files.scroll_offset = 0;
     } else if (type == APP_NOTEPAD) {
         win->min_w = 260; win->min_h = 180;
     } else if (type == APP_CALC) {
         win->min_w = 190; win->min_h = 210;
+        win->state.calc.new_entry = true;
     } else if (type == APP_WELCOME) {
         win->min_w = 420; win->min_h = 200;
     } else if (type == APP_ABOUT) {
@@ -914,13 +940,13 @@ static void launch_app(AppType type) {
         case APP_TERMINAL: create_window(APP_TERMINAL, "Terminal", 400, 300); break;
         case APP_PAINT: create_window(APP_PAINT, "Paint", 500, 400); break;
         case APP_FILES: create_window(APP_FILES, "Files", 420, 320); break;
-        case APP_TASKMGR: create_window(APP_TASKMGR, "Task Manager", 360, 320); break;
+        case APP_TASKMGR: create_window(APP_TASKMGR, "Task Manager", 440, 320); break;
         case APP_NOTEPAD: create_window(APP_NOTEPAD, "Notepad", 400, 300); break;
         case APP_CALC: create_window(APP_CALC, "Calculator", 220, 300); break;
         case APP_MINESWEEPER: create_window(APP_MINESWEEPER, "Minesweeper", 220, 260); break;
         case APP_TICTACTOE: create_window(APP_TICTACTOE, "Tic-Tac-Toe", 220, 280); break;
-        case APP_IMAGEVIEW: create_window(APP_IMAGEVIEW, "Image Viewer", 360, 320); break;
-        case APP_SYSMON: create_window(APP_SYSMON, "System Monitor", 340, 220); break;
+        case APP_IMAGEVIEW: create_window(APP_IMAGEVIEW, "Image Viewer", 420, 340); break;
+        case APP_SYSMON: create_window(APP_SYSMON, "System Monitor", 420, 300); break;
         case APP_SETTINGS: create_window(APP_SETTINGS, "Settings", 360, 240); break;
         case APP_RUN: create_window(APP_RUN, "Run", 360, 140); break;
         case APP_ABOUT: create_window(APP_ABOUT, "About Nostalux", 340, 260); break;
@@ -1071,19 +1097,75 @@ static void handle_tictactoe(Window* w, int x, int y) {
     }
 }
 
+static bool filename_is_bmp(const char* name) {
+    int length = kstrlen_local(name);
+    return length >= 4 &&
+           name[length - 4] == '.' &&
+           ascii_lower(name[length - 3]) == 'b' &&
+           ascii_lower(name[length - 2]) == 'm' &&
+           ascii_lower(name[length - 1]) == 'p';
+}
+
+static void imageview_load(Window* w, int direction) {
+    ImageViewState* state = &w->state.img;
+    int count = (int)fs_file_count();
+    int start = state->file_index;
+
+    state->valid = false;
+    mem_zero(&state->image, sizeof(state->image));
+    if (count <= 0) {
+        state->file_index = -1;
+        state->filename[0] = 0;
+        str_copy(state->status, sizeof(state->status), "No BMP files in the filesystem.");
+        return;
+    }
+
+    for (int offset = 0; offset < count; offset++) {
+        int index;
+        if (start < 0) {
+            index = direction < 0 ? count - 1 - offset : offset;
+        } else {
+            int step = offset + 1;
+            index = direction < 0 ? start - step : start + step;
+            while (index < 0) index += count;
+            index %= count;
+        }
+
+        const struct fs_file* file = fs_file_at((size_t)index);
+        if (!file || !filename_is_bmp(file->name)) continue;
+
+        state->file_index = index;
+        state->fit_to_window = true;
+        str_copy(state->filename, sizeof(state->filename), file->name);
+        if (bmp_open(file->data, file->size, &state->image)) {
+            state->valid = true;
+            str_copy(state->status, sizeof(state->status), "Loaded from the filesystem.");
+        } else {
+            str_copy(state->status, sizeof(state->status), "Invalid or unsupported 24-bit BMP.");
+        }
+        return;
+    }
+
+    state->file_index = -1;
+    state->filename[0] = 0;
+    str_copy(state->status, sizeof(state->status), "No BMP files in the filesystem.");
+}
+
 static void handle_imageview(Window* w, int x, int y) {
     int cx = w->x + 2;
     int cy = w->y + WIN_CAPTION_H + 2;
     int cw = w->w - 4;
     int ch = w->h - WIN_CAPTION_H - 4;
-    int ix = cx + 8;
-    int iy = cy + 8;
-    int iw = cw - 16;
-    int ih = ch - 48;
-    if (rect_contains(ix, iy + ih + 10, 80, 20, x, y)) {
-        w->state.img.seed = fast_rand() % 1000;
-    } else if (rect_contains(ix, iy, iw, ih, x, y)) {
-        w->state.img.zoom = (w->state.img.zoom % 4) + 1;
+    int button_y = cy + ch - 30;
+
+    if (rect_contains(cx + 8, button_y, 58, 22, x, y)) {
+        imageview_load(w, -1);
+    } else if (rect_contains(cx + 72, button_y, 58, 22, x, y)) {
+        imageview_load(w, 1);
+    } else if (rect_contains(cx + 136, button_y, 70, 22, x, y)) {
+        w->state.img.fit_to_window = !w->state.img.fit_to_window;
+    } else if (rect_contains(cx + 8, cy + 24, cw - 16, ch - 62, x, y)) {
+        w->state.img.fit_to_window = !w->state.img.fit_to_window;
     }
 }
 
@@ -1332,29 +1414,62 @@ static void handle_files_click(Window* w, int x, int y) {
     }
 }
 
-static void handle_taskmgr_click(Window* w, int x, int y) {
-    int cx = w->x + 2;
-    int cy = w->y + WIN_CAPTION_H + 2;
-    int end_x = cx + (w->w - 4) - 80;
-    if (rect_contains(end_x, cy + 10, 60, 24, x, y)) {
-        int target_index = window_index_by_stable_id(w->state.taskmgr.selected_pid);
-        if (target_index >= 0 && windows[target_index] != w) {
-            close_window(target_index);
-            w->state.taskmgr.selected_pid = -1;
-        }
+#define TASKMGR_PAGE_CAPACITY 16
+
+static int taskmgr_visible_rows(const Window* w) {
+    int content_height = w->h - WIN_CAPTION_H - 4;
+    int rows = (content_height - 80) / 20;
+    if (rows < 1) rows = 1;
+    if (rows > TASKMGR_PAGE_CAPACITY) rows = TASKMGR_PAGE_CAPACITY;
+    return rows;
+}
+
+static void taskmgr_normalize_page(Window* w, size_t total, int rows) {
+    if (total == 0) {
+        w->state.taskmgr.page_offset = 0;
         return;
     }
 
-    int list_y = cy + 30;
-    for(int i=0; i<MAX_WINDOWS; i++) {
-        if (windows[i] && windows[i]->visible) {
-            if (list_y + 20 <= w->y + w->h &&
-                rect_contains(cx + 8, list_y - 2, w->w - 20, 18, x, y)) {
-                w->state.taskmgr.selected_pid = windows[i]->stable_id;
-                return;
-            }
-            list_y += 20;
+    if (w->state.taskmgr.page_offset >= total) {
+        w->state.taskmgr.page_offset =
+            ((total - 1) / (size_t)rows) * (size_t)rows;
+    }
+}
+
+static void handle_taskmgr_click(Window* w, int x, int y) {
+    int cx = w->x + 2;
+    int cy = w->y + WIN_CAPTION_H + 2;
+    int ch = w->h - WIN_CAPTION_H - 4;
+    int rows = taskmgr_visible_rows(w);
+    size_t total = scheduler_task_count();
+    taskmgr_normalize_page(w, total, rows);
+
+    int button_y = cy + ch - 24;
+    if (rect_contains(cx + 10, button_y, 44, 20, x, y)) {
+        size_t step = (size_t)rows;
+        if (w->state.taskmgr.page_offset > step) {
+            w->state.taskmgr.page_offset -= step;
+        } else {
+            w->state.taskmgr.page_offset = 0;
         }
+        return;
+    }
+    if (rect_contains(cx + 60, button_y, 44, 20, x, y)) {
+        size_t next = w->state.taskmgr.page_offset + (size_t)rows;
+        if (next < total) w->state.taskmgr.page_offset = next;
+        return;
+    }
+
+    struct scheduler_task_info tasks[TASKMGR_PAGE_CAPACITY];
+    size_t count = scheduler_snapshot_tasks_from(
+        w->state.taskmgr.page_offset, tasks, (size_t)rows);
+    int list_y = cy + 36;
+    for (size_t i = 0; i < count; i++) {
+        if (rect_contains(cx + 8, list_y - 2, w->w - 20, 18, x, y)) {
+            w->state.taskmgr.selected_pid = tasks[i].id;
+            return;
+        }
+        list_y += 20;
     }
 }
 
@@ -1451,14 +1566,43 @@ static void handle_browser_input(Window* w, char c) {
 
 static void update_sysmon(Window* w) {
     SysMonState* s = &w->state.sysmon;
-    s->update_tick++;
-    if (s->update_tick % 5 == 0) {
+    uint64_t now_tick = timer_get_ticks();
+    if (s->has_previous_cpu && now_tick - s->last_sample_tick < 25u) return;
+
+    struct timer_cpu_counters current;
+    timer_read_cpu_counters(&current);
+
+    int cpu_percent = 0;
+    if (s->has_previous_cpu) {
+        uint64_t total_delta = current.total_cycles - s->previous_cpu.total_cycles;
+        uint64_t idle_delta = current.idle_cycles - s->previous_cpu.idle_cycles;
+        if (idle_delta > total_delta) idle_delta = total_delta;
+        if (total_delta > 0) {
+            uint64_t busy_delta = total_delta - idle_delta;
+            cpu_percent = (int)((busy_delta * 100u) / total_delta);
+            if (cpu_percent > 100) cpu_percent = 100;
+        }
         s->head = (s->head + 1) % SYSMON_HIST;
-        int cpu = (fast_rand() % 40) + (fast_rand() % 40);
-        int mem = 20 + (fast_rand() % 10);
-        s->cpu_hist[s->head] = cpu;
-        s->mem_hist[s->head] = mem;
     }
+
+    const struct system_profile* profile = system_profile_info();
+    uint32_t total_kb = profile->memory_total_kb;
+    uint32_t used_kb = profile->memory_used_kb;
+    int memory_percent = 0;
+    if (total_kb > 0) {
+        uint64_t scaled = (uint64_t)used_kb * 100u;
+        memory_percent = (int)(scaled / total_kb);
+        if (memory_percent > 100) memory_percent = 100;
+    }
+
+    s->cpu_percent = cpu_percent;
+    s->memory_used_kb = used_kb;
+    s->memory_total_kb = total_kb;
+    s->cpu_hist[s->head] = cpu_percent;
+    s->mem_hist[s->head] = memory_percent;
+    s->previous_cpu = current;
+    s->last_sample_tick = now_tick;
+    s->has_previous_cpu = true;
 }
 
 // --- Context Menu Functions ---
@@ -1917,23 +2061,92 @@ static void render_window(Window* w) {
         }
     }
     else if (w->type == APP_IMAGEVIEW) {
-        int ix = cx + 8; int iy = cy + 8;
-        int iw = cw - 16; int ih = ch - 48;
-        
-        // Procedural Image
-        rand_state = w->state.img.seed;
-        for (int y=0; y<ih; y+=w->state.img.zoom) {
-            for (int x=0; x<iw; x+=w->state.img.zoom) {
-                int r = (x ^ y) & 0xFF;
-                int g = (x * y) & 0xFF;
-                int b = ((x+y)*2) & 0xFF;
-                uint32_t col = 0xFF000000 | (r<<16) | (g<<8) | b;
-                graphics_fill_rect(ix+x, iy+y, w->state.img.zoom, w->state.img.zoom, col);
+        ImageViewState* state = &w->state.img;
+        int ix = cx + 8;
+        int iy = cy + 24;
+        int iw = cw - 16;
+        int ih = ch - 62;
+        int button_y = cy + ch - 30;
+
+        graphics_fill_rect(ix, iy, iw, ih, 0xFF202020);
+
+        char image_label[64];
+        image_label[0] = 0;
+        if (state->filename[0]) {
+            str_copy(image_label, sizeof(image_label), state->filename);
+            if (state->valid) {
+                char number[16];
+                str_append(image_label, sizeof(image_label), "  ");
+                int_to_str((int)state->image.width, number);
+                str_append(image_label, sizeof(image_label), number);
+                str_append(image_label, sizeof(image_label), "x");
+                int_to_str((int)state->image.height, number);
+                str_append(image_label, sizeof(image_label), number);
             }
+        } else {
+            str_copy(image_label, sizeof(image_label), "Filesystem BMP viewer");
         }
-        
-        draw_bevel_box(ix, iy + ih + 10, 80, 20, false);
-        graphics_draw_string_scaled(ix+10, iy+ih+14, "Next Img", COL_BLACK, COL_BTN_FACE, 1);
+        draw_string_bounded(ix, cy + 8, iw, image_label, COL_BLACK, COL_WIN_BODY, 1);
+
+        if (state->valid && state->image.width > 0 && state->image.height > 0) {
+            int draw_w = (int)state->image.width;
+            int draw_h = (int)state->image.height;
+            if (state->fit_to_window) {
+                if ((uint64_t)iw * state->image.height <=
+                    (uint64_t)ih * state->image.width) {
+                    draw_w = iw;
+                    draw_h = (int)(((uint64_t)state->image.height * (uint32_t)iw) /
+                                   state->image.width);
+                } else {
+                    draw_h = ih;
+                    draw_w = (int)(((uint64_t)state->image.width * (uint32_t)ih) /
+                                   state->image.height);
+                }
+                if (draw_w < 1) draw_w = 1;
+                if (draw_h < 1) draw_h = 1;
+            }
+
+            int draw_x = ix + (iw - draw_w) / 2;
+            int draw_y = iy + (ih - draw_h) / 2;
+            for (uint32_t source_y = 0; source_y < state->image.height; source_y++) {
+                int y0 = draw_y + (int)(((uint64_t)source_y * (uint32_t)draw_h) /
+                                        state->image.height);
+                int y1 = draw_y + (int)(((uint64_t)(source_y + 1u) * (uint32_t)draw_h) /
+                                        state->image.height);
+                int clipped_y0 = y0 < iy ? iy : y0;
+                int clipped_y1 = y1 > iy + ih ? iy + ih : y1;
+                if (clipped_y1 <= clipped_y0) continue;
+                for (uint32_t source_x = 0; source_x < state->image.width; source_x++) {
+                    uint32_t color;
+                    if (!bmp_get_pixel(&state->image, source_x, source_y, &color)) continue;
+                    int x0 = draw_x + (int)(((uint64_t)source_x * (uint32_t)draw_w) /
+                                            state->image.width);
+                    int x1 = draw_x + (int)(((uint64_t)(source_x + 1u) * (uint32_t)draw_w) /
+                                            state->image.width);
+                    int clipped_x0 = x0 < ix ? ix : x0;
+                    int clipped_x1 = x1 > ix + iw ? ix + iw : x1;
+                    if (clipped_x1 > clipped_x0) {
+                        graphics_fill_rect(clipped_x0, clipped_y0,
+                                           clipped_x1 - clipped_x0,
+                                           clipped_y1 - clipped_y0, color);
+                    }
+                }
+            }
+        } else {
+            draw_string_bounded(ix + 10, iy + ih / 2 - 4, iw - 20,
+                                state->status, COL_WHITE, 0xFF202020, 1);
+        }
+
+        draw_bevel_box(cx + 8, button_y, 58, 22, false);
+        graphics_draw_string_scaled(cx + 20, button_y + 7, "Prev", COL_BLACK, COL_BTN_FACE, 1);
+        draw_bevel_box(cx + 72, button_y, 58, 22, false);
+        graphics_draw_string_scaled(cx + 84, button_y + 7, "Next", COL_BLACK, COL_BTN_FACE, 1);
+        draw_bevel_box(cx + 136, button_y, 70, 22, state->fit_to_window);
+        graphics_draw_string_scaled(cx + 150, button_y + 7,
+                                    state->fit_to_window ? "Fit" : "1:1",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+        draw_string_bounded(cx + 214, button_y + 7, cw - 222,
+                            state->status, 0xFF555555, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_BROWSER) {
         draw_bevel_box(cx+2, cy+2, cw-40, 24, true);
@@ -1955,58 +2168,131 @@ static void render_window(Window* w) {
                             COL_BLACK, COL_WHITE, 1);
     }
     else if (w->type == APP_TASKMGR) {
-        graphics_draw_string_scaled(cx+10, cy+10, "PID  Name        Status", COL_BLACK, COL_WIN_BODY, 1);
-        graphics_fill_rect(cx+10, cy+22, cw-20, 1, 0xFF888888);
-        int list_y = cy + 30;
-        for(int i=0; i<MAX_WINDOWS; i++) {
-            if (windows[i] && windows[i]->visible) {
-                if (list_y + 14 > w->y + w->h - 4) break;
-                if (w->state.taskmgr.selected_pid == windows[i]->stable_id) {
-                    graphics_fill_rect(cx+8, list_y-2, cw-16, 14, 0xFFCCCCFF);
-                }
-                char pid_s[12]; int_to_str(windows[i]->stable_id, pid_s);
-                graphics_draw_string_scaled(cx+10, list_y, pid_s, COL_BLACK, COL_WIN_BODY, 1);
-                draw_string_bounded(cx+50, list_y, cw-150, windows[i]->title,
-                                    COL_BLACK, COL_WIN_BODY, 1);
-                const char* st = windows[i]->minimized ? "Min" : "Vis";
-                graphics_draw_string_scaled(cx+cw-55, list_y, st, COL_BLACK, COL_WIN_BODY, 1);
-                list_y += 20;
-            }
+        int rows = taskmgr_visible_rows(w);
+        size_t total = scheduler_task_count();
+        taskmgr_normalize_page(w, total, rows);
+        struct scheduler_task_info tasks[TASKMGR_PAGE_CAPACITY];
+        size_t count = scheduler_snapshot_tasks_from(
+            w->state.taskmgr.page_offset, tasks, (size_t)rows);
+        graphics_draw_string_scaled(cx + 10, cy + 10, "PID", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_draw_string_scaled(cx + 70, cy + 10, "Name", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_draw_string_scaled(cx + cw - 150, cy + 10, "Mode", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_draw_string_scaled(cx + cw - 82, cy + 10, "State", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_fill_rect(cx + 10, cy + 25, cw - 20, 1, 0xFF888888);
+
+        int list_y = cy + 36;
+        for (size_t i = 0; i < count; i++) {
+            bool selected = w->state.taskmgr.selected_pid == tasks[i].id;
+            uint32_t row_bg = selected ? 0xFFCCCCFF : COL_WIN_BODY;
+            if (selected) graphics_fill_rect(cx + 8, list_y - 2, cw - 16, 18, row_bg);
+
+            char pid_string[24];
+            uint64_to_str(tasks[i].id, pid_string);
+            draw_string_bounded(cx + 10, list_y, 52, pid_string,
+                                COL_BLACK, row_bg, 1);
+            draw_string_bounded(cx + 70, list_y, cw - 228, tasks[i].name,
+                                COL_BLACK, row_bg, 1);
+            draw_string_bounded(cx + cw - 150, list_y, 60,
+                                tasks[i].is_user ? "User" : "Kernel",
+                                COL_BLACK, row_bg, 1);
+            const char* task_state = tasks[i].state == TASK_DEAD
+                                   ? "Dead"
+                                   : (tasks[i].is_current ? "Running" : "Ready");
+            draw_string_bounded(cx + cw - 82, list_y, 72, task_state,
+                                COL_BLACK, row_bg, 1);
+            list_y += 20;
         }
-        draw_bevel_box(cx + cw - 80, cy + 10, 60, 24, false);
-        graphics_draw_string_scaled(cx+cw-70, cy+16, "End Task", COL_BLACK, COL_BTN_FACE, 1);
+
+        draw_string_bounded(cx + 10, cy + ch - 38, cw - 20,
+                            "Desktop apps share the kernel/desktop task.",
+                            0xFF555555, COL_WIN_BODY, 1);
+
+        int button_y = cy + ch - 24;
+        draw_bevel_box(cx + 10, button_y, 44, 20, false);
+        graphics_draw_string_scaled(cx + 16, button_y + 6, "Prev",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+        draw_bevel_box(cx + 60, button_y, 44, 20, false);
+        graphics_draw_string_scaled(cx + 66, button_y + 6, "Next",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+
+        char task_footer[64] = "Tasks ";
+        char task_number[24];
+        size_t first = total == 0 ? 0 : w->state.taskmgr.page_offset + 1;
+        size_t last = w->state.taskmgr.page_offset + count;
+        uint64_to_str((uint64_t)first, task_number);
+        str_append(task_footer, sizeof(task_footer), task_number);
+        str_append(task_footer, sizeof(task_footer), "-");
+        uint64_to_str((uint64_t)last, task_number);
+        str_append(task_footer, sizeof(task_footer), task_number);
+        str_append(task_footer, sizeof(task_footer), " of ");
+        uint64_to_str((uint64_t)total, task_number);
+        str_append(task_footer, sizeof(task_footer), task_number);
+        draw_string_bounded(cx + 114, button_y + 6, cw - 124, task_footer,
+                            0xFF555555, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_SYSMON) {
-        graphics_draw_string_scaled(cx+10, cy+10, "CPU Usage History", COL_BLACK, COL_WIN_BODY, 1);
+        SysMonState* state = &w->state.sysmon;
+        char cpu_label[48] = "Measured CPU busy time: ";
+        char number[24];
+        int_to_str(state->cpu_percent, number);
+        str_append(cpu_label, sizeof(cpu_label), number);
+        str_append(cpu_label, sizeof(cpu_label), "%");
+        graphics_draw_string_scaled(cx + 10, cy + 8, cpu_label, COL_BLACK, COL_WIN_BODY, 1);
+
         int graph_x = cx + 10;
-        int graph_y = cy + 30;
+        int graph_y = cy + 24;
         int graph_w = cw - 20;
-        int graph_h = 60;
-        
-        // Background
+        int graph_h = 70;
         graphics_fill_rect(graph_x, graph_y, graph_w, graph_h, COL_BLACK);
-        
-        // Draw CPU line
-        for(int i=0; i<SYSMON_HIST; i++) {
-            int idx = (w->state.sysmon.head - i + SYSMON_HIST) % SYSMON_HIST;
-            int val = w->state.sysmon.cpu_hist[idx]; // 0-100ish
+        int graph_step = graph_w / SYSMON_HIST;
+        if (graph_step < 2) graph_step = 2;
+        for (int i = 0; i < SYSMON_HIST; i++) {
+            int idx = (state->head - i + SYSMON_HIST) % SYSMON_HIST;
+            int val = state->cpu_hist[idx];
             if (val > 100) val = 100;
             int bar_h = (val * graph_h) / 100;
-            int bx = graph_x + graph_w - 2 - (i * 3);
-            if (bx > graph_x) {
-                graphics_fill_rect(bx, graph_y + graph_h - bar_h, 2, bar_h, 0xFF00FF00);
+            if (val > 0 && bar_h == 0) bar_h = 1;
+            int bx = graph_x + graph_w - graph_step * (i + 1);
+            if (bx >= graph_x) {
+                graphics_fill_rect(bx, graph_y + graph_h - bar_h,
+                                   graph_step - 1, bar_h, 0xFF00FF00);
             }
         }
 
-        // Memory usage text
-        char mem_str[32];
-        str_copy(mem_str, sizeof(mem_str), "Mem: ");
-        char num[8]; int_to_str(w->state.sysmon.mem_hist[w->state.sysmon.head], num);
-        int l = kstrlen_local(mem_str);
-        int k=0; while(num[k]) mem_str[l++] = num[k++]; 
-        mem_str[l++] = '%'; mem_str[l] = 0;
-        
-        graphics_draw_string_scaled(cx+10, cy+100, mem_str, COL_BLACK, COL_WIN_BODY, 1);
+        char memory_label[64] = "Tracked RAM: ";
+        uint64_to_str((uint64_t)state->memory_used_kb, number);
+        str_append(memory_label, sizeof(memory_label), number);
+        str_append(memory_label, sizeof(memory_label), " / ");
+        uint64_to_str((uint64_t)state->memory_total_kb, number);
+        str_append(memory_label, sizeof(memory_label), number);
+        str_append(memory_label, sizeof(memory_label), " KB  ");
+        int_to_str(state->mem_hist[state->head], number);
+        str_append(memory_label, sizeof(memory_label), number);
+        str_append(memory_label, sizeof(memory_label), "%");
+        draw_string_bounded(cx + 10, cy + 104, cw - 20, memory_label,
+                            COL_BLACK, COL_WIN_BODY, 1);
+
+        int memory_graph_y = cy + 120;
+        graphics_fill_rect(graph_x, memory_graph_y, graph_w, graph_h, COL_BLACK);
+        for (int i = 0; i < SYSMON_HIST; i++) {
+            int idx = (state->head - i + SYSMON_HIST) % SYSMON_HIST;
+            int val = state->mem_hist[idx];
+            if (val > 100) val = 100;
+            int bar_h = (val * graph_h) / 100;
+            if (val > 0 && bar_h == 0) bar_h = 1;
+            int bx = graph_x + graph_w - graph_step * (i + 1);
+            if (bx >= graph_x) {
+                graphics_fill_rect(bx, memory_graph_y + graph_h - bar_h,
+                                   graph_step - 1, bar_h, 0xFF3399FF);
+            }
+        }
+
+        char uptime_label[48] = "Uptime: ";
+        uint64_to_str(timer_get_uptime(), number);
+        str_append(uptime_label, sizeof(uptime_label), number);
+        str_append(uptime_label, sizeof(uptime_label), " seconds");
+        draw_string_bounded(cx + 10, cy + ch - 18, cw - 20, uptime_label,
+                            0xFF555555, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_SETTINGS) {
         w->state.settings.wallpaper_enabled = g_wallpaper_enabled;

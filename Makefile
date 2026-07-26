@@ -2,6 +2,7 @@ NASM       ?= nasm
 CC         ?= gcc
 LD         ?= ld
 OBJCOPY    ?= objcopy
+HOST_CC    ?= cc
 
 CONFLICT_CHECK := ./scripts/check-conflicts.sh
 
@@ -87,12 +88,19 @@ define RUN_QEMU
 	exit 1
 endef
 
-.PHONY: all clean run run-windowed run-fullscreen check-conflicts
+.PHONY: all clean test test-bmp run run-windowed run-fullscreen check-conflicts
 
 all: check-conflicts $(OS_IMAGE)
 
 check-conflicts:
 	@$(CONFLICT_CHECK)
+
+test: test-bmp
+
+test-bmp: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/bmp_test.c kernel/bmp.c -o $(BUILD_DIR)/bmp_test
+	$(BUILD_DIR)/bmp_test
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
@@ -121,11 +129,10 @@ $(BOOT_BIN): bootloader/boot.asm $(PAYLOAD_BIN) | $(BUILD_DIR)
 
 $(OS_IMAGE): $(BOOT_BIN) $(PAYLOAD_BIN)
 	@set -eu; \
-	TMP_IMAGE='$@.tmp'; \
-	SAVED_STORAGE='$@.storage.tmp'; \
+	TMP_IMAGE=$$(mktemp '$@.tmp.XXXXXX'); \
+	SAVED_STORAGE=$$(mktemp '$@.storage.tmp.XXXXXX'); \
 	FS_OFFSET=$$(( $(FS_STORAGE_LBA) * 512 )); \
 	MIN_IMAGE_SIZE=$$(( FS_OFFSET + $(IMAGE_DATA_MIB) * 1024 * 1024 )); \
-	rm -f "$$TMP_IMAGE" "$$SAVED_STORAGE"; \
 	trap 'rm -f "$$TMP_IMAGE" "$$SAVED_STORAGE"' 0 1 2 15; \
 	if [ -f '$@' ]; then \
 		OLD_SIZE=$$(stat -c%s '$@'); \
