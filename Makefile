@@ -37,7 +37,7 @@ QEMU_AUDIO_HEADLESS ?= -machine pcspk-audiodev=snd0 -audiodev none,id=snd0
 # GTK keeps Windows physical X/Y motion in one frontend path, hides the host
 # pointer, and preserves a 1:1 guest framebuffer scale. Hover grab also keeps
 # keyboard focus with the guest while the pointer is over the display.
-QEMU_DISPLAY_FULLSCREEN ?= -display gtk,full-screen=on,grab-on-hover=on,show-cursor=off,show-tabs=off,show-menubar=off,zoom-to-fit=off
+QEMU_DISPLAY_FULLSCREEN ?= -display gtk,full-screen=on,grab-on-hover=on,show-cursor=off,show-tabs=off,show-menubar=off,zoom-to-fit=on
 QEMU_DISPLAY_WINDOWED ?= -display gtk,grab-on-hover=on,show-cursor=off,show-tabs=off,show-menubar=off,zoom-to-fit=off
 QEMU_DISPLAY_HEADLESS ?= -display none -serial mon:stdio
 
@@ -87,7 +87,7 @@ define RUN_QEMU
 	exit 1
 endef
 
-.PHONY: all clean run run-windowed check-conflicts
+.PHONY: all clean run run-windowed run-fullscreen check-conflicts
 
 all: check-conflicts $(OS_IMAGE)
 
@@ -155,9 +155,12 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 run: check-conflicts $(OS_IMAGE)
-	$(call RUN_QEMU,$(QEMU_DISPLAY_FULLSCREEN))
+	$(call RUN_QEMU,$(QEMU_DISPLAY_WINDOWED))
 
 run-windowed: check-conflicts $(OS_IMAGE)
 	$(call RUN_QEMU,$(QEMU_DISPLAY_WINDOWED))
+
+run-fullscreen: check-conflicts $(OS_IMAGE)
+	$(call RUN_QEMU,$(QEMU_DISPLAY_FULLSCREEN))
 
 -include $(DEPS)

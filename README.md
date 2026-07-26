@@ -66,30 +66,30 @@ make
 
 ## Run in QEMU
 
-### Full-screen interactive mode
+### Windowed interactive mode (default)
 
 ```sh
 make run
 ```
 
+`make run-windowed` is an equivalent explicit command.
+
 On WSL, the launcher first looks for `qemu-system-x86_64.exe` on `PATH` and in common Windows QEMU install
 directories. If found, it uses the native Windows GTK frontend; otherwise it falls back to Linux
 `qemu-system-x86_64`.
 
-The full-screen GTK command uses hover grabbing, disables display scaling, and includes `show-cursor=off`. Together
-with the normal QEMU mouse grab, this keeps physical horizontal and vertical movement in one frontend path, allows
-smooth diagonal movement, and makes the NostaluxOS cursor replace the Windows pointer. Press `Ctrl+Alt+F` to toggle
-full-screen mode and `Ctrl+Alt+G` to release QEMU's input grab.
+The normal GTK window shows the complete 800x600 guest framebuffer at a 1:1 scale. Keyboard input follows the pointer
+on hover; click the guest once if QEMU has not yet captured the mouse. Press `Ctrl+Alt+G` to release the grab. The host
+cursor remains hidden while it is over the guest display.
 
-### Windowed interactive mode
+### Full-screen interactive mode
 
 ```sh
-make run-windowed
+make run-fullscreen
 ```
 
-This uses the same native-Windows detection and Linux fallback in a normal GTK window. Keyboard input follows the
-pointer on hover; click the guest once if QEMU has not yet captured the mouse. Press `Ctrl+Alt+G` to release the grab.
-The host cursor remains hidden while it is over the guest display.
+Full-screen mode enables GTK's `zoom-to-fit`, so the complete guest framebuffer is scaled down when necessary instead
+of being cropped by the host display or Windows DPI scaling. Press `Ctrl+Alt+F` to toggle full-screen mode.
 
 ### Headless mode
 
