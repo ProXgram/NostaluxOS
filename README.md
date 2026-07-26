@@ -73,11 +73,13 @@ make run
 ```
 
 On WSL, the launcher first looks for `qemu-system-x86_64.exe` on `PATH` and in common Windows QEMU install
-directories. If found, it uses the native Windows SDL frontend; otherwise it falls back to Linux
+directories. If found, it uses the native Windows GTK frontend; otherwise it falls back to Linux
 `qemu-system-x86_64`.
 
-The full-screen SDL command includes `show-cursor=off`, so the Windows pointer is hidden over QEMU and the NostaluxOS
-cursor replaces it. Press `Ctrl+Alt+F` to toggle full-screen mode and `Ctrl+Alt+G` to release QEMU's input grab.
+The full-screen GTK command uses hover grabbing, disables display scaling, and includes `show-cursor=off`. Together
+with the normal QEMU mouse grab, this keeps physical horizontal and vertical movement in one frontend path, allows
+smooth diagonal movement, and makes the NostaluxOS cursor replace the Windows pointer. Press `Ctrl+Alt+F` to toggle
+full-screen mode and `Ctrl+Alt+G` to release QEMU's input grab.
 
 ### Windowed interactive mode
 
@@ -85,8 +87,9 @@ cursor replaces it. Press `Ctrl+Alt+F` to toggle full-screen mode and `Ctrl+Alt+
 make run-windowed
 ```
 
-This uses the same native-Windows detection and Linux fallback in a normal SDL window. Click inside the guest to
-capture input; press `Ctrl+Alt+G` to release it. The host cursor remains hidden while it is over the guest display.
+This uses the same native-Windows detection and Linux fallback in a normal GTK window. Keyboard input follows the
+pointer on hover; click the guest once if QEMU has not yet captured the mouse. Press `Ctrl+Alt+G` to release the grab.
+The host cursor remains hidden while it is over the guest display.
 
 ### Headless mode
 

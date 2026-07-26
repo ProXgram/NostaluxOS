@@ -34,8 +34,11 @@ QEMU_NATIVE ?=
 QEMU_AUDIO_LINUX ?= -machine pcspk-audiodev=snd0 -audiodev pa,id=snd0
 QEMU_AUDIO_NATIVE ?= -machine pcspk-audiodev=snd0 -audiodev dsound,id=snd0
 QEMU_AUDIO_HEADLESS ?= -machine pcspk-audiodev=snd0 -audiodev none,id=snd0
-QEMU_DISPLAY_FULLSCREEN ?= -display sdl,full-screen=on,show-cursor=off
-QEMU_DISPLAY_WINDOWED ?= -display sdl,show-cursor=off
+# GTK keeps Windows physical X/Y motion in one frontend path, hides the host
+# pointer, and preserves a 1:1 guest framebuffer scale. Hover grab also keeps
+# keyboard focus with the guest while the pointer is over the display.
+QEMU_DISPLAY_FULLSCREEN ?= -display gtk,full-screen=on,grab-on-hover=on,show-cursor=off,show-tabs=off,show-menubar=off,zoom-to-fit=off
+QEMU_DISPLAY_WINDOWED ?= -display gtk,grab-on-hover=on,show-cursor=off,show-tabs=off,show-menubar=off,zoom-to-fit=off
 QEMU_DISPLAY_HEADLESS ?= -display none -serial mon:stdio
 
 # The ATA-backed flat filesystem begins at LBA 2048. Preserve everything from

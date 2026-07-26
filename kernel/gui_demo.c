@@ -20,7 +20,16 @@
 // port straightforward without pretending that isolation exists today.
 
 static void desktop_yield(void) {
-    __asm__ volatile("hlt");
+    /*
+     * Render once per PIT tick instead of once per interrupt byte. Some host
+     * frontends deliver the X and Y portions of one physical diagonal gesture
+     * as adjacent events. Coalescing them into the same 100 Hz desktop frame
+     * prevents a visible horizontal-then-vertical staircase.
+     */
+    uint64_t tick = timer_get_ticks();
+    while (timer_get_ticks() == tick) {
+        __asm__ volatile("hlt");
+    }
 }
 
 static void desktop_shutdown(void) {
