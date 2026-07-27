@@ -29,7 +29,9 @@ CFLAGS := -std=gnu11 -O2 -ffreestanding -fno-stack-protector -fcf-protection=non
           -fno-pic -mno-red-zone -mgeneral-regs-only -nostdlib -nostartfiles \
           -Wall -Wextra -Ikernel/include -mno-mmx -mno-sse -mno-sse2 -mno-sse3 \
           -mno-ssse3 -mno-sse4 -mno-avx -MMD -MP
-NASMFLAGS := -Wall -Werror
+# NASM 3.x diagnoses the bootloader's intentional fixed-address references
+# between flat-binary sections. Keep every other assembler warning fatal.
+NASMFLAGS := -Wall -Werror -w-reloc-abs-word -w-reloc-abs-dword
 
 BUILD_DIR := build
 BOOT_BIN := $(BUILD_DIR)/boot.bin

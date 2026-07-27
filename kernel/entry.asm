@@ -1,4 +1,5 @@
 BITS 64
+DEFAULT ABS
 
 section .text
     global _start
