@@ -1,6 +1,7 @@
 #ifndef TERMINAL_H
 #define TERMINAL_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -19,6 +20,16 @@ void terminal_write_uint(unsigned int value);
 void terminal_newline(void);
 void terminal_move_cursor_left(size_t count);
 void terminal_move_cursor_right(size_t count);
+
+/*
+ * Redirect terminal output into a caller-owned, NUL-terminated buffer.
+ * Only one capture may be active at a time. The capacity includes the
+ * terminator. Output beyond the buffer is discarded and reported by
+ * terminal_capture_end().
+ */
+bool terminal_capture_begin(char* buffer, size_t capacity);
+size_t terminal_capture_end(bool* truncated);
+bool terminal_capture_active(void);
 
 /* Scrolling Support */
 void terminal_scroll_up(void);

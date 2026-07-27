@@ -17,7 +17,7 @@
 #include "gui_demo.h"
 #include "kstdio.h"
 
-#define HEAP_START_ADDR  0x00800000ull
+#define HEAP_START_ADDR  SYSTEM_RESERVED_LOW_MEMORY_BYTES
 #define HEAP_TARGET_SIZE (16ull * 1024ull * 1024ull)
 
 static void halt_boot(const char* message) {
@@ -26,6 +26,26 @@ static void halt_boot(const char* message) {
     syslog_write(message);
     for (;;) {
         __asm__ volatile("cli; hlt");
+    }
+}
+
+static void system_profile_maintenance_task(void) {
+    (void)system_profile_info();
+    syslog_write("Scheduler: profile maintenance task running");
+    uint64_t last_refresh = timer_get_ticks();
+
+    for (;;) {
+        const uint64_t now = timer_get_ticks();
+        if (now - last_refresh >= 25u) {
+            /*
+             * Refresh live heap-backed memory accounting four times per
+             * second. This is a real cooperative kernel workload, not a
+             * synthetic Task Manager entry.
+             */
+            (void)system_profile_info();
+            last_refresh = now;
+        }
+        schedule();
     }
 }
 
@@ -57,11 +77,22 @@ static void boot_sequence(const struct BootInfo* boot_info) {
 
     // Initialize the currently cooperative task scheduler.
     scheduler_init();
+    if (!spawn_named_task("kernel/profile-maint", system_profile_maintenance_task)) {
+        syslog_write("Scheduler: profile maintenance task unavailable");
+    }
 
     background_render();
     timer_set_callback(background_animate);
     
     fs_init();
+
+    /*
+     * Start every cooperative boot task once. The maintenance task yields
+     * straight back after its first real profile refresh, so shell startup
+     * remains synchronous.
+     */
+    schedule();
+    syslog_write("Scheduler: boot task handoff complete");
 }
 
 void kmain(const struct BootInfo* boot_info) {

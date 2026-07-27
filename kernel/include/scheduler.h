@@ -33,11 +33,17 @@ struct scheduler_task_info {
 };
 
 void scheduler_init(void);
+bool spawn_named_task(const char* name, void (*entry_point)(void));
 bool spawn_task(void (*entry_point)(void));
 /* User tasks remain disabled until separate user mappings are implemented. */
 bool spawn_user_task(void (*entry_point)(void));
 void schedule(void);
 void exit_current_task(void);
+/*
+ * Marks a non-current task dead and safely reclaims it. The currently
+ * executing task must use exit_current_task() so its live stack is not freed.
+ */
+bool scheduler_terminate_task(uint64_t id);
 size_t scheduler_task_count(void);
 size_t scheduler_snapshot_tasks(struct scheduler_task_info* tasks, size_t capacity);
 size_t scheduler_snapshot_tasks_from(size_t offset,

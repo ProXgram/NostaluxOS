@@ -40,23 +40,26 @@ static uint32_t bytes_to_kib(uint64_t bytes) {
 }
 
 static void refresh_memory_usage(void) {
-    uint64_t framebuffer_bytes = (uint64_t)g_boot_info.width * (uint64_t)g_boot_info.height * 2u;
-    if (g_boot_info.pitch != 0 && g_boot_info.height != 0) {
-        framebuffer_bytes = (uint64_t)g_boot_info.pitch * (uint64_t)g_boot_info.height;
-    }
-
+    /*
+     * Count the complete low-memory kernel reservation rather than only the
+     * framebuffer. This covers the bootloader, kernel image, stacks, page
+     * tables, and static kernel storage below the 8 MiB heap boundary.
+     * Video memory is device memory and is therefore not charged as RAM.
+     */
     const uint64_t heap_bytes = (uint64_t)heap_used_space();
-    uint64_t used_bytes = framebuffer_bytes;
+    uint64_t used_bytes = SYSTEM_RESERVED_LOW_MEMORY_BYTES;
     if (heap_bytes > UINT64_MAX - used_bytes) {
         used_bytes = UINT64_MAX;
     } else {
         used_bytes += heap_bytes;
     }
 
-    uint32_t kib = bytes_to_kib(used_bytes);
-    if (kib < 64) {
-        kib = 64;
+    const uint64_t total_bytes = (uint64_t)g_profile.memory_total_kb * 1024u;
+    if (used_bytes > total_bytes) {
+        used_bytes = total_bytes;
     }
+
+    uint32_t kib = bytes_to_kib(used_bytes);
     g_profile.memory_used_kb = kib;
 }
 
@@ -84,6 +87,7 @@ void system_cache_boot_info(const struct BootInfo* boot_info) {
 
 void system_set_total_memory(uint32_t total_kb) {
     g_profile.memory_total_kb = total_kb;
+    refresh_memory_usage();
 }
 
 const struct BootInfo* system_boot_info(void) {

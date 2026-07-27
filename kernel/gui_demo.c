@@ -13,6 +13,8 @@
 #include "rtc.h"
 #include "bmp.h"
 #include "scheduler.h"
+#include "shell.h"
+#include "os_info.h"
 #include <stdbool.h>
 #include <limits.h>
 
@@ -28,16 +30,11 @@ static void desktop_yield(void) {
      * as adjacent events. Coalescing them into the same 100 Hz desktop frame
      * prevents a visible horizontal-then-vertical staircase.
      */
+    schedule();
     uint64_t tick = timer_get_ticks();
     while (timer_get_ticks() == tick) {
         timer_idle_wait();
     }
-}
-
-static void desktop_shutdown(void) {
-    outw(0x604, 0x2000);
-    outw(0xB004, 0x2000);
-    outw(0x4004, 0x3400);
 }
 
 static void desktop_get_mouse(MouseState* out) {
@@ -84,9 +81,7 @@ void gui_set_running(bool running) { g_gui_running = running; }
 #define MINE_GRID_PIXELS (MINE_GRID_W * MINE_CELL_SIZE)
 
 // Colors
-#define COL_DESKTOP     0xFF004488 
 #define COL_TASKBAR     0xFF101010
-#define COL_WIN_BODY    0xFFF0F0F0
 #define COL_WIN_TITLE_1 0xFF003366
 #define COL_WIN_TITLE_2 0xFF0055AA
 #define COL_WIN_TEXT    0xFF000000
@@ -115,6 +110,8 @@ static Theme themes[] = {
     { 0xFF008080, 0xFFC0C0C0, 0xFFC0C0C0, 0xFF000080, 0xFF808080, 0xFFFFFFFF, false }
 };
 static int current_theme_idx = 0;
+#define COL_DESKTOP  (themes[current_theme_idx].desktop)
+#define COL_WIN_BODY (themes[current_theme_idx].win_body)
 
 // --- App Types ---
 typedef enum { 
@@ -149,18 +146,75 @@ typedef struct {
 static ContextMenu g_ctx_menu;
 
 // --- App States ---
-typedef struct { int current_val; int accumulator; char op; bool new_entry; } CalcState;
-typedef struct { char buffer[512]; int length; } NotepadState;
-typedef struct { int selected_index; int scroll_offset; } FileManagerState;
-typedef struct { bool wallpaper_enabled; int theme_id; } SettingsState;
-typedef struct { char prompt[16]; char input[64]; int input_len; char history[6][64]; } TerminalState;
-typedef struct { char url[64]; int url_len; char status[32]; int scroll; } BrowserState;
+#define CALC_ERROR_NONE 0
+#define CALC_ERROR_DIV_ZERO 1
+#define CALC_ERROR_OVERFLOW 2
+typedef struct {
+    int current_val;
+    int accumulator;
+    char op;
+    bool new_entry;
+    int error_code;
+} CalcState;
+typedef struct {
+    char buffer[FS_MAX_FILE_SIZE];
+    int length;
+    char filename[FS_MAX_FILENAME];
+    char status[48];
+    bool dirty;
+    uint64_t discard_deadline;
+} NotepadState;
+typedef struct {
+    int selected_index;
+    char selected_name[FS_MAX_FILENAME];
+    int scroll_offset;
+    bool renaming;
+    bool rename_select_all;
+    char rename_buffer[FS_MAX_FILENAME];
+    int rename_length;
+    char delete_name[FS_MAX_FILENAME];
+    uint64_t delete_deadline;
+    char status[48];
+} FileManagerState;
+typedef struct {
+    bool wallpaper_enabled;
+    int theme_id;
+    char status[48];
+} SettingsState;
+#define GUI_TERM_LINES 20
+#define GUI_TERM_LINE_LEN 80
+typedef struct {
+    char input[96];
+    int input_len;
+    char lines[GUI_TERM_LINES][GUI_TERM_LINE_LEN];
+    int line_count;
+    bool history_truncated;
+} TerminalState;
+typedef struct {
+    char address[64];
+    int address_len;
+    char content[FS_MAX_FILE_SIZE];
+    int content_len;
+    char status[64];
+    int scroll;
+    bool address_select_all;
+} BrowserState;
 typedef struct {
     uint64_t selected_pid;
     size_t page_offset;
+    char status[48];
 } TaskMgrState;
-typedef struct { uint32_t* canvas_buffer; int width; int height; uint32_t current_color; int brush_size; } PaintState;
-typedef struct { char cmd[32]; int len; } RunState;
+#define PAINT_CANVAS_W 17
+#define PAINT_CANVAS_H 17
+typedef struct {
+    uint32_t pixels[PAINT_CANVAS_W * PAINT_CANVAS_H];
+    uint32_t current_color;
+    char filename[FS_MAX_FILENAME];
+    char status[48];
+    bool dirty;
+    uint64_t discard_deadline;
+} PaintState;
+typedef struct { char cmd[96]; int len; char status[48]; } RunState;
 
 #define ASSISTANT_MAX_LINES 14
 #define ASSISTANT_LINE_LEN 64
@@ -253,6 +307,10 @@ static MouseState prev_mouse;
 static bool g_wallpaper_enabled = false;
 static bool g_desktop_shown_mode = false;
 static int g_wallpaper_seed = 1234;
+static char g_desktop_notice[64];
+static uint64_t g_desktop_notice_until = 0;
+static uint64_t g_exit_discard_deadline = 0;
+#define DISCARD_CONFIRM_TICKS 300u
 static const AppType start_menu_apps[START_MENU_ITEM_COUNT] = {
     APP_ASSISTANT, APP_BROWSER, APP_TERMINAL, APP_PAINT,
     APP_FILES, APP_TASKMGR, APP_NOTEPAD, APP_CALC,
@@ -260,17 +318,20 @@ static const AppType start_menu_apps[START_MENU_ITEM_COUNT] = {
     APP_SYSMON, APP_RUN, APP_NONE
 };
 static const char* start_menu_labels[START_MENU_ITEM_COUNT] = {
-    "AI Assistant", "Browser", "Terminal", "Paint",
+    "AI Assistant", "Local Browser", "Terminal", "Paint",
     "Files", "Task Manager", "Notepad", "Calculator",
     "Minesweeper", "Tic-Tac-Toe", "Image Viewer",
     "Sys Monitor", "Run...", "Exit Desktop"
 };
 
 // --- Forward Declarations ---
-static void close_window(int index);
+static bool close_window(int index);
 static int focus_window(int index);
 static void toggle_maximize(Window* w);
+static bool notepad_save(Window* w);
+static bool paint_save(Window* w);
 static void handle_paint_click(Window* w, int x, int y);
+static void handle_notepad_click(Window* w, int x, int y);
 static void handle_settings_click(Window* w, int x, int y);
 static void handle_files_click(Window* w, int x, int y);
 static void handle_taskmgr_click(Window* w, int x, int y);
@@ -285,14 +346,24 @@ static void handle_minesweeper(Window* w, int rx, int ry, bool right_click);
 static void handle_tictactoe(Window* w, int x, int y);
 static void handle_imageview(Window* w, int x, int y);
 static void imageview_load(Window* w, int direction);
+static bool imageview_open_named(Window* w, const char* name);
+static void browser_load(Window* w);
+static void terminal_execute(Window* w);
+static void settings_load(void);
+static bool settings_save(void);
+static bool desktop_save_all(void);
+static void desktop_notify(const char* message);
+static bool open_file_has_unsaved_changes(const char* filename);
+static void reconcile_filesystem_windows(const char* files_status);
+static void desktop_refresh(void);
 static void render_window(Window* w);
 static void render_assistant_app(Window* w);
 static void draw_wallpaper(void);
 static void on_click(int x, int y);
 static void on_right_click(int x, int y);
 static void update_sysmon(Window* w);
-static void create_window(AppType type, const char* title, int w, int h);
-static void launch_app(AppType type);
+static Window* create_window(AppType type, const char* title, int w, int h);
+static bool launch_app(AppType type);
 static Window* get_top_window(void);
 
 // Context Menu
@@ -319,15 +390,27 @@ static void str_copy(char* d, int capacity, const char* s) {
     }
     d[i] = 0;
 }
+static void desktop_notify(const char* message) {
+    str_copy(g_desktop_notice, sizeof(g_desktop_notice),
+             message ? message : "");
+    g_desktop_notice_until = timer_get_ticks() + 500u;
+}
+static void cancel_exit_discard_confirmation(void) {
+    if (g_exit_discard_deadline == 0) return;
+    g_exit_discard_deadline = 0;
+    g_desktop_notice[0] = 0;
+    g_desktop_notice_until = 0;
+}
 static void mem_zero(void* ptr, size_t size) {
     uint8_t* bytes = (uint8_t*)ptr;
     for (size_t i = 0; i < size; i++) bytes[i] = 0;
 }
-static void str_append(char* d, int capacity, const char* s) {
+static bool str_append(char* d, int capacity, const char* s) {
     int i = kstrlen_local(d);
     int j = 0;
     while (s[j] && i + 1 < capacity) d[i++] = s[j++];
     d[i] = 0;
+    return s[j] == 0;
 }
 static char ascii_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
@@ -343,6 +426,23 @@ static bool text_contains_ci(const char* text, const char* needle) {
         if (!needle[j]) return true;
     }
     return false;
+}
+static bool text_equals_ci_trimmed(const char* text, const char* expected) {
+    if (!text || !expected) return false;
+    while (*text == ' ' || *text == '\t') text++;
+
+    int text_length = kstrlen_local(text);
+    while (text_length > 0 &&
+           (text[text_length - 1] == ' ' ||
+            text[text_length - 1] == '\t')) {
+        text_length--;
+    }
+    int expected_length = kstrlen_local(expected);
+    if (text_length != expected_length) return false;
+    for (int i = 0; i < text_length; i++) {
+        if (ascii_lower(text[i]) != ascii_lower(expected[i])) return false;
+    }
+    return true;
 }
 static bool text_equals_ci(const char* left, const char* right) {
     int i = 0;
@@ -378,6 +478,206 @@ static void uint64_to_str(uint64_t value, char* buf) {
     int out = 0;
     while (count > 0) buf[out++] = reversed[--count];
     buf[out] = 0;
+}
+
+static int wrapped_text_line_count(const char* text, int max_columns) {
+    int lines = 1;
+    int column = 0;
+    if (max_columns < 1) max_columns = 1;
+    for (int i = 0; text && text[i]; i++) {
+        char current = text[i];
+        if (current == '\r') continue;
+        if (current == '\n') {
+            lines++;
+            column = 0;
+            continue;
+        }
+        if (column >= max_columns) {
+            lines++;
+            column = 0;
+        }
+        column++;
+    }
+    if (column >= max_columns) lines++;
+    return lines;
+}
+
+static int wrapped_content_line_count(const char* text, int max_columns) {
+    int lines = 1;
+    int column = 0;
+    if (max_columns < 1) max_columns = 1;
+    for (int i = 0; text && text[i]; i++) {
+        char current = text[i];
+        if (current == '\r') continue;
+        if (current == '\n') {
+            lines++;
+            column = 0;
+            continue;
+        }
+        if (column >= max_columns) {
+            lines++;
+            column = 0;
+        }
+        column++;
+    }
+    return lines;
+}
+
+static void wrapped_text_cursor(const char* text, int max_columns,
+                                int* output_row, int* output_column) {
+    int row = 0;
+    int column = 0;
+    if (max_columns < 1) max_columns = 1;
+    for (int i = 0; text && text[i]; i++) {
+        char current = text[i];
+        if (current == '\r') continue;
+        if (current == '\n') {
+            row++;
+            column = 0;
+            continue;
+        }
+        if (column >= max_columns) {
+            row++;
+            column = 0;
+        }
+        column++;
+    }
+    if (column >= max_columns) {
+        row++;
+        column = 0;
+    }
+    if (output_row) *output_row = row;
+    if (output_column) *output_column = column;
+}
+
+static bool str_starts_with(const char* text, const char* prefix) {
+    int i = 0;
+    if (!text || !prefix) return false;
+    while (prefix[i]) {
+        if (text[i] != prefix[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+static bool str_ends_with_ci(const char* text, const char* suffix) {
+    int text_length = kstrlen_local(text);
+    int suffix_length = kstrlen_local(suffix);
+    if (suffix_length > text_length) return false;
+    int offset = text_length - suffix_length;
+    for (int i = 0; i < suffix_length; i++) {
+        if (ascii_lower(text[offset + i]) != ascii_lower(suffix[i])) return false;
+    }
+    return true;
+}
+
+static bool file_is_text(const struct fs_file* file) {
+    if (!file) return false;
+    for (size_t i = 0; i < file->size; i++) {
+        unsigned char c = (unsigned char)file->data[i];
+        if (c == '\n' || c == '\r' || c == '\t') continue;
+        if (c < 32 || c > 126) return false;
+    }
+    return true;
+}
+
+static int file_index_by_name(const char* name) {
+    size_t count = fs_file_count();
+    for (size_t i = 0; i < count; i++) {
+        const struct fs_file* file = fs_file_at(i);
+        if (file && kstrcmp(file->name, name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static bool create_unique_file(const char* prefix, const char* extension,
+                               char output[FS_MAX_FILENAME]) {
+    for (int number = 1; number < 1000; number++) {
+        char candidate[FS_MAX_FILENAME];
+        char digits[16];
+        str_copy(candidate, sizeof(candidate), prefix);
+        int_to_str(number, digits);
+        str_append(candidate, sizeof(candidate), digits);
+        str_append(candidate, sizeof(candidate), extension);
+        if (fs_find(candidate) == NULL && fs_touch(candidate)) {
+            str_copy(output, FS_MAX_FILENAME, candidate);
+            return true;
+        }
+    }
+    output[0] = 0;
+    return false;
+}
+
+static int config_read_int(const char* contents, const char* key, int fallback) {
+    if (!contents || !key) return fallback;
+    int key_length = kstrlen_local(key);
+    for (int i = 0; contents[i]; i++) {
+        bool at_line_start = i == 0 || contents[i - 1] == '\n';
+        if (!at_line_start) continue;
+        int j = 0;
+        while (j < key_length && contents[i + j] == key[j]) j++;
+        if (j != key_length || contents[i + j] != '=') continue;
+        int value = 0;
+        bool found_digit = false;
+        j++;
+        while (contents[i + j] >= '0' && contents[i + j] <= '9') {
+            int digit = contents[i + j] - '0';
+            found_digit = true;
+            if (value > (INT_MAX - digit) / 10) return fallback;
+            value = value * 10 + digit;
+            j++;
+        }
+        if (!found_digit) return fallback;
+
+        char terminator = contents[i + j];
+        if (terminator == '\r') {
+            char next = contents[i + j + 1];
+            if (next != '\n' && next != '\0') return fallback;
+        } else if (terminator != '\n' && terminator != '\0') {
+            return fallback;
+        }
+        return value;
+    }
+    return fallback;
+}
+
+static void settings_load(void) {
+    const struct fs_file* config = fs_find("desktop.cfg");
+    if (!config || !file_is_text(config)) return;
+
+    int theme = config_read_int(config->data, "theme", current_theme_idx);
+    int wallpaper = config_read_int(config->data, "wallpaper",
+                                    g_wallpaper_enabled ? 1 : 0);
+    int seed = config_read_int(config->data, "seed", g_wallpaper_seed);
+    if (theme >= 0 && theme < (int)(sizeof(themes) / sizeof(themes[0])))
+        current_theme_idx = theme;
+    if (wallpaper == 0 || wallpaper == 1)
+        g_wallpaper_enabled = wallpaper == 1;
+    if (seed >= 0) g_wallpaper_seed = seed;
+}
+
+static bool settings_save(void) {
+    if (open_file_has_unsaved_changes("desktop.cfg")) {
+        desktop_log("GUI: settings save blocked by modified desktop.cfg editor");
+        return false;
+    }
+
+    char config[96] = "theme=";
+    char number[16];
+    int_to_str(current_theme_idx, number);
+    str_append(config, sizeof(config), number);
+    str_append(config, sizeof(config), "\nwallpaper=");
+    str_append(config, sizeof(config), g_wallpaper_enabled ? "1" : "0");
+    str_append(config, sizeof(config), "\nseed=");
+    int_to_str(g_wallpaper_seed, number);
+    str_append(config, sizeof(config), number);
+    str_append(config, sizeof(config), "\n");
+    if (!fs_write("desktop.cfg", config)) {
+        desktop_log("GUI: failed to persist desktop settings");
+        return false;
+    }
+    reconcile_filesystem_windows("desktop.cfg was updated.");
+    return true;
 }
 
 // --- BITMAPS (Icons) ---
@@ -688,13 +988,41 @@ static void minimize_window(Window* w) {
     if (was_focused) focus_top_visible();
 }
 
-static void close_window(int index) {
-    if (index < 0 || index >= MAX_WINDOWS || windows[index] == NULL) return;
+static bool close_window(int index) {
+    if (index < 0 || index >= MAX_WINDOWS || windows[index] == NULL)
+        return false;
     Window* w = windows[index];
     bool was_focused = w->focused;
     
-    if (w->type == APP_PAINT && w->state.paint.canvas_buffer) {
-        desktop_free(w->state.paint.canvas_buffer);
+    if (w->type == APP_NOTEPAD && w->state.notepad.dirty) {
+        uint64_t now = timer_get_ticks();
+        if (w->state.notepad.discard_deadline != 0 &&
+            now <= w->state.notepad.discard_deadline) {
+            w->state.notepad.dirty = false;
+            w->state.notepad.discard_deadline = 0;
+        } else if (!notepad_save(w)) {
+            w->state.notepad.discard_deadline =
+                timer_get_ticks() + DISCARD_CONFIRM_TICKS;
+            str_copy(w->state.notepad.status,
+                     sizeof(w->state.notepad.status),
+                     "Save failed; click X again within 3s to discard.");
+            return false;
+        }
+    }
+    if (w->type == APP_PAINT && w->state.paint.dirty) {
+        uint64_t now = timer_get_ticks();
+        if (w->state.paint.discard_deadline != 0 &&
+            now <= w->state.paint.discard_deadline) {
+            w->state.paint.dirty = false;
+            w->state.paint.discard_deadline = 0;
+        } else if (!paint_save(w)) {
+            w->state.paint.discard_deadline =
+                timer_get_ticks() + DISCARD_CONFIRM_TICKS;
+            str_copy(w->state.paint.status,
+                     sizeof(w->state.paint.status),
+                     "Save failed; click X again within 3s to discard.");
+            return false;
+        }
     }
     
     desktop_free(w);
@@ -706,6 +1034,52 @@ static void close_window(int index) {
     }
     windows[MAX_WINDOWS - 1] = NULL;
     if (was_focused) focus_top_visible();
+    return true;
+}
+
+static bool desktop_save_all(void) {
+    uint64_t now = timer_get_ticks();
+    if (g_exit_discard_deadline != 0 &&
+        now <= g_exit_discard_deadline) {
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            Window* w = windows[i];
+            if (!w) continue;
+            if (w->type == APP_NOTEPAD) {
+                w->state.notepad.dirty = false;
+                w->state.notepad.discard_deadline = 0;
+            }
+            if (w->type == APP_PAINT) {
+                w->state.paint.dirty = false;
+                w->state.paint.discard_deadline = 0;
+            }
+        }
+        g_exit_discard_deadline = 0;
+        desktop_log("GUI: unsaved editor changes discarded by repeated exit");
+        return true;
+    }
+    cancel_exit_discard_confirmation();
+
+    bool success = true;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* w = windows[i];
+        if (!w) continue;
+        if (w->type == APP_NOTEPAD && w->state.notepad.dirty &&
+            !notepad_save(w))
+            success = false;
+        if (w->type == APP_PAINT && w->state.paint.dirty &&
+            !paint_save(w))
+            success = false;
+    }
+    if (!success) {
+        g_exit_discard_deadline =
+            timer_get_ticks() + DISCARD_CONFIRM_TICKS;
+        desktop_notify("Save failed. Exit again within 3s to discard.");
+        g_desktop_notice_until = g_exit_discard_deadline;
+        desktop_log("GUI: exit blocked because an editor could not save");
+    } else {
+        g_exit_discard_deadline = 0;
+    }
+    return success;
 }
 
 static int focus_window(int index) {
@@ -828,16 +1202,112 @@ static void minesweeper_reset(MineState* ms) {
     }
 }
 
-static void create_window(AppType type, const char* title, int w, int h) {
-    int slot = -1;
-    for (int i = 0; i < MAX_WINDOWS; i++) { if (windows[i] == NULL) { slot = i; break; } }
-    if (slot == -1) {
-        close_window(0);
-        slot = MAX_WINDOWS - 1;
+static bool notepad_save(Window* w) {
+    if (!w || w->type != APP_NOTEPAD)
+        return false;
+
+    NotepadState* state = &w->state.notepad;
+    state->discard_deadline = 0;
+    cancel_exit_discard_confirmation();
+    if (!state->filename[0]) {
+        if (!create_unique_file("note", ".txt", state->filename)) {
+            str_copy(state->status, sizeof(state->status),
+                     "Save failed: no free filename.");
+            return false;
+        }
+        str_copy(w->title, sizeof(w->title), state->filename);
+    }
+    if (!fs_write_bytes(state->filename, state->buffer, (size_t)state->length)) {
+        str_copy(state->status, sizeof(state->status), "Save failed.");
+        return false;
+    }
+    state->dirty = false;
+    state->discard_deadline = 0;
+    str_copy(state->status, sizeof(state->status), "Saved to filesystem.");
+    return true;
+}
+
+static bool paint_save(Window* w) {
+    if (!w || w->type != APP_PAINT)
+        return false;
+
+    uint8_t encoded[FS_MAX_FILE_SIZE];
+    size_t encoded_size = 0;
+    PaintState* state = &w->state.paint;
+    state->discard_deadline = 0;
+    cancel_exit_discard_confirmation();
+    if (!state->filename[0]) {
+        if (!create_unique_file("painting", ".bmp", state->filename)) {
+            str_copy(state->status, sizeof(state->status),
+                     "Save failed: no free filename.");
+            return false;
+        }
+        str_copy(w->title, sizeof(w->title), state->filename);
+    }
+    if (!bmp_encode_rgb24(state->pixels, PAINT_CANVAS_W, PAINT_CANVAS_H,
+                          PAINT_CANVAS_W, encoded, sizeof(encoded),
+                          &encoded_size) ||
+        !fs_write_bytes(state->filename, encoded, encoded_size)) {
+        str_copy(state->status, sizeof(state->status), "BMP save failed.");
+        return false;
+    }
+    state->dirty = false;
+    state->discard_deadline = 0;
+    str_copy(state->status, sizeof(state->status), "Saved 17x17 BMP.");
+    return true;
+}
+
+static bool paint_reload(Window* w) {
+    if (!w || w->type != APP_PAINT || !w->state.paint.filename[0])
+        return false;
+
+    PaintState* state = &w->state.paint;
+    const struct fs_file* file = fs_find(state->filename);
+    struct bmp_image image;
+    if (!file || !bmp_open(file->data, file->size, &image) ||
+        image.width != PAINT_CANVAS_W ||
+        image.height != PAINT_CANVAS_H) {
+        state->filename[0] = 0;
+        state->dirty = false;
+        state->discard_deadline = 0;
+        str_copy(w->title, sizeof(w->title), "Changed painting");
+        str_copy(state->status, sizeof(state->status),
+                 "Backing file changed; paint to save a new BMP.");
+        return false;
     }
 
+    for (uint32_t y = 0; y < image.height; y++) {
+        for (uint32_t x = 0; x < image.width; x++) {
+            uint32_t color = COL_WHITE;
+            if (!bmp_get_pixel(&image, x, y, &color)) return false;
+            state->pixels[y * PAINT_CANVAS_W + x] = color;
+        }
+    }
+    state->dirty = false;
+    state->discard_deadline = 0;
+    str_copy(state->status, sizeof(state->status),
+             "Reloaded from filesystem.");
+    return true;
+}
+
+static Window* create_window(AppType type, const char* title, int w, int h) {
+    int slot = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++) { if (windows[i] == NULL) { slot = i; break; } }
+
     Window* win = (Window*)desktop_malloc(sizeof(Window));
-    if (!win) return;
+    if (!win) {
+        desktop_notify("Not enough memory to open another window.");
+        desktop_log("GUI: window allocation failed");
+        return NULL;
+    }
+
+    if (slot == -1) {
+        desktop_free(win);
+        desktop_notify("Window limit reached; close a window first.");
+        desktop_log("GUI: window creation refused at window limit");
+        return NULL;
+    }
+
     mem_zero(win, sizeof(Window));
 
     win->id = slot;
@@ -850,13 +1320,17 @@ static void create_window(AppType type, const char* title, int w, int h) {
 
     // Initialize Apps
     if (type == APP_PAINT) {
-        win->min_w = 260; win->min_h = 220;
-        int cw = w-12; int ch = h-WIN_CAPTION_H-12;
-        win->state.paint.width = cw; win->state.paint.height = ch;
-        win->state.paint.canvas_buffer = desktop_malloc((size_t)cw * (size_t)ch * sizeof(uint32_t));
-        win->state.paint.current_color = 0xFF000000; win->state.paint.brush_size = 2;
-        if(win->state.paint.canvas_buffer) {
-            for(int i=0; i<cw*ch; i++) win->state.paint.canvas_buffer[i] = 0xFFFFFFFF;
+        win->min_w = 330; win->min_h = 220;
+        for (int i = 0; i < PAINT_CANVAS_W * PAINT_CANVAS_H; i++)
+            win->state.paint.pixels[i] = COL_WHITE;
+        win->state.paint.current_color = COL_BLACK;
+        if (create_unique_file("painting", ".bmp", win->state.paint.filename)) {
+            str_copy(win->title, sizeof(win->title), win->state.paint.filename);
+            win->state.paint.dirty = true;
+            paint_save(win);
+        } else {
+            str_copy(win->state.paint.status,
+                     sizeof(win->state.paint.status), "No free filename.");
         }
     } else if (type == APP_TICTACTOE) {
         win->min_w = 220; win->min_h = 280;
@@ -886,27 +1360,39 @@ static void create_window(AppType type, const char* title, int w, int h) {
         win->state.run.cmd[0] = 0; win->state.run.len = 0;
     } else if (type == APP_TERMINAL) {
         win->min_w = 300; win->min_h = 150;
-        str_copy(win->state.term.prompt, sizeof(win->state.term.prompt), "$ ");
-        win->state.term.input[0]=0; win->state.term.input_len=0;
-        for(int k=0; k<6; k++) win->state.term.history[k][0] = 0;
+        str_copy(win->state.term.lines[0], GUI_TERM_LINE_LEN,
+                 "Real shell commands are available. Type help.");
+        win->state.term.line_count = 1;
     } else if (type == APP_SETTINGS) {
         win->min_w = 240; win->min_h = 210;
         win->state.settings.wallpaper_enabled = g_wallpaper_enabled;
         win->state.settings.theme_id = current_theme_idx;
+        str_copy(win->state.settings.status,
+                 sizeof(win->state.settings.status),
+                 "Changes persist automatically.");
     } else if (type == APP_BROWSER) {
         win->min_w = 360; win->min_h = 180;
-        str_copy(win->state.browser.url, sizeof(win->state.browser.url), "www.retro-os.net");
-        win->state.browser.url_len = kstrlen_local("www.retro-os.net");
+        str_copy(win->state.browser.address,
+                 sizeof(win->state.browser.address), "about:home");
+        win->state.browser.address_len = kstrlen_local("about:home");
+        win->state.browser.address_select_all = true;
+        browser_load(win);
     } else if (type == APP_TASKMGR) {
         win->min_w = 380; win->min_h = 240;
         win->state.taskmgr.selected_pid = 0;
         win->state.taskmgr.page_offset = 0;
+        str_copy(win->state.taskmgr.status,
+                 sizeof(win->state.taskmgr.status), "Select a non-current task to end it.");
     } else if (type == APP_FILES) {
-        win->min_w = 280; win->min_h = 180;
+        win->min_w = 310; win->min_h = 180;
         win->state.files.selected_index = -1;
         win->state.files.scroll_offset = 0;
+        str_copy(win->state.files.status,
+                 sizeof(win->state.files.status), "Filesystem is live.");
     } else if (type == APP_NOTEPAD) {
         win->min_w = 260; win->min_h = 180;
+        str_copy(win->state.notepad.status,
+                 sizeof(win->state.notepad.status), "No file loaded.");
     } else if (type == APP_CALC) {
         win->min_w = 190; win->min_h = 210;
         win->state.calc.new_entry = true;
@@ -931,28 +1417,119 @@ static void create_window(AppType type, const char* title, int w, int h) {
 
     windows[slot] = win;
     focus_window(slot);
+    return win;
 }
 
-static void launch_app(AppType type) {
-    switch (type) {
-        case APP_ASSISTANT: create_window(APP_ASSISTANT, "AI Assistant", 520, 380); break;
-        case APP_BROWSER: create_window(APP_BROWSER, "Browser", 500, 400); break;
-        case APP_TERMINAL: create_window(APP_TERMINAL, "Terminal", 400, 300); break;
-        case APP_PAINT: create_window(APP_PAINT, "Paint", 500, 400); break;
-        case APP_FILES: create_window(APP_FILES, "Files", 420, 320); break;
-        case APP_TASKMGR: create_window(APP_TASKMGR, "Task Manager", 440, 320); break;
-        case APP_NOTEPAD: create_window(APP_NOTEPAD, "Notepad", 400, 300); break;
-        case APP_CALC: create_window(APP_CALC, "Calculator", 220, 300); break;
-        case APP_MINESWEEPER: create_window(APP_MINESWEEPER, "Minesweeper", 220, 260); break;
-        case APP_TICTACTOE: create_window(APP_TICTACTOE, "Tic-Tac-Toe", 220, 280); break;
-        case APP_IMAGEVIEW: create_window(APP_IMAGEVIEW, "Image Viewer", 420, 340); break;
-        case APP_SYSMON: create_window(APP_SYSMON, "System Monitor", 420, 300); break;
-        case APP_SETTINGS: create_window(APP_SETTINGS, "Settings", 360, 240); break;
-        case APP_RUN: create_window(APP_RUN, "Run", 360, 140); break;
-        case APP_ABOUT: create_window(APP_ABOUT, "About Nostalux", 340, 260); break;
-        case APP_WELCOME: create_window(APP_WELCOME, "Welcome", 420, 200); break;
-        default: break;
+static Window* open_notepad_file(const char* filename) {
+    const struct fs_file* file = fs_find(filename);
+    if (!file || !file_is_text(file)) return NULL;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* existing = windows[i];
+        if (existing && existing->type == APP_NOTEPAD &&
+            kstrcmp(existing->state.notepad.filename, filename) == 0) {
+            existing->minimized = false;
+            int focused_index = focus_window(i);
+            return focused_index >= 0 ? windows[focused_index] : existing;
+        }
     }
+
+    Window* win = create_window(APP_NOTEPAD, filename, 440, 320);
+    if (!win) return NULL;
+    NotepadState* state = &win->state.notepad;
+    size_t length = file->size;
+    if (length >= sizeof(state->buffer)) length = sizeof(state->buffer) - 1;
+    for (size_t i = 0; i < length; i++) state->buffer[i] = file->data[i];
+    state->buffer[length] = 0;
+    state->length = (int)length;
+    str_copy(state->filename, sizeof(state->filename), filename);
+    str_copy(state->status, sizeof(state->status), "Opened from filesystem.");
+    state->dirty = false;
+    return win;
+}
+
+static Window* create_notepad_file(void) {
+    char filename[FS_MAX_FILENAME];
+    if (!create_unique_file("note", ".txt", filename)) {
+        desktop_notify("Could not create a note on the filesystem.");
+        return NULL;
+    }
+    Window* note = open_notepad_file(filename);
+    if (!note) {
+        if (!fs_remove(filename))
+            desktop_log("GUI: failed to roll back unopened note file");
+        return NULL;
+    }
+    return note;
+}
+
+static Window* open_image_file(const char* filename) {
+    Window* win = create_window(APP_IMAGEVIEW, "Image Viewer", 440, 360);
+    if (!win) return NULL;
+    if (!imageview_open_named(win, filename)) {
+        close_window(win->id);
+        return NULL;
+    }
+    str_copy(win->title, sizeof(win->title), filename);
+    return win;
+}
+
+static bool launch_app(AppType type) {
+    Window* opened = NULL;
+    switch (type) {
+        case APP_ASSISTANT:
+            opened = create_window(APP_ASSISTANT, "AI Assistant", 520, 380);
+            break;
+        case APP_BROWSER:
+            opened = create_window(APP_BROWSER, "Local Browser", 500, 400);
+            break;
+        case APP_TERMINAL:
+            opened = create_window(APP_TERMINAL, "Terminal", 400, 300);
+            break;
+        case APP_PAINT:
+            opened = create_window(APP_PAINT, "Paint", 500, 400);
+            break;
+        case APP_FILES:
+            opened = create_window(APP_FILES, "Files", 420, 320);
+            break;
+        case APP_TASKMGR:
+            opened = create_window(
+                APP_TASKMGR, "Kernel Task Manager", 460, 320);
+            break;
+        case APP_NOTEPAD:
+            opened = create_notepad_file();
+            break;
+        case APP_CALC:
+            opened = create_window(APP_CALC, "Calculator", 220, 300);
+            break;
+        case APP_MINESWEEPER:
+            opened = create_window(APP_MINESWEEPER, "Minesweeper", 220, 260);
+            break;
+        case APP_TICTACTOE:
+            opened = create_window(APP_TICTACTOE, "Tic-Tac-Toe", 220, 280);
+            break;
+        case APP_IMAGEVIEW:
+            opened = create_window(APP_IMAGEVIEW, "Image Viewer", 420, 340);
+            break;
+        case APP_SYSMON:
+            opened = create_window(APP_SYSMON, "System Monitor", 420, 300);
+            break;
+        case APP_SETTINGS:
+            opened = create_window(APP_SETTINGS, "Settings", 360, 240);
+            break;
+        case APP_RUN:
+            opened = create_window(APP_RUN, "Run", 360, 140);
+            break;
+        case APP_ABOUT:
+            opened = create_window(APP_ABOUT, "About Nostalux", 340, 260);
+            break;
+        case APP_WELCOME:
+            opened = create_window(APP_WELCOME, "Welcome", 420, 200);
+            break;
+        default:
+            break;
+    }
+    return opened != NULL;
 }
 
 // --- Logic ---
@@ -1097,13 +1674,163 @@ static void handle_tictactoe(Window* w, int x, int y) {
     }
 }
 
+static void browser_set_content(BrowserState* state, const char* text) {
+    str_copy(state->content, sizeof(state->content), text ? text : "");
+    state->content_len = kstrlen_local(state->content);
+}
+
+static bool browser_append_content(BrowserState* state, const char* text) {
+    bool complete =
+        str_append(state->content, sizeof(state->content), text ? text : "");
+    state->content_len = kstrlen_local(state->content);
+    return complete;
+}
+
+static int browser_max_columns(const Window* w) {
+    int content_width = w->w - 4;
+    int columns = (content_width - 20) / 8;
+    return columns < 1 ? 1 : columns;
+}
+
+static int browser_visible_rows(const Window* w) {
+    int content_height = w->h - WIN_CAPTION_H - 4;
+    int browser_content_height = content_height - 60;
+    int rows = (browser_content_height - 12) / 10;
+    return rows < 1 ? 1 : rows;
+}
+
+static void browser_load(Window* w) {
+    BrowserState* state = &w->state.browser;
+    const char* address = state->address;
+    state->scroll = 0;
+    state->content[0] = 0;
+    state->content_len = 0;
+
+    if (kstrcmp(address, "about:home") == 0 || address[0] == 0) {
+        browser_set_content(state,
+            "Nostalux Local Browser\n\n"
+            "This browser opens real files from the Nostalux filesystem.\n"
+            "Try file:readme.txt, file:motd.txt, about:files, or about:system.\n"
+            "Internet URLs are rejected because no network driver is installed.");
+        str_copy(state->status, sizeof(state->status), "Built-in home page.");
+        return;
+    }
+
+    if (kstrcmp(address, "about:files") == 0) {
+        browser_set_content(state, "Filesystem files\n\n");
+        size_t count = fs_file_count();
+        bool complete = true;
+        for (size_t i = 0; i < count; i++) {
+            const struct fs_file* file = fs_file_at(i);
+            if (!file) continue;
+            int required = 5 + kstrlen_local(file->name) + 1;
+            int remaining = (int)sizeof(state->content) -
+                            kstrlen_local(state->content) - 1;
+            if (remaining < required + 32) {
+                browser_append_content(
+                    state, "[Additional files omitted.]\n");
+                complete = false;
+                break;
+            }
+            browser_append_content(state, "file:");
+            browser_append_content(state, file->name);
+            browser_append_content(state, "\n");
+        }
+        str_copy(state->status, sizeof(state->status),
+                 complete ? "Live filesystem index."
+                          : "Index shortened to fit the page.");
+        return;
+    }
+
+    if (kstrcmp(address, "about:system") == 0) {
+        const struct BootInfo* boot = system_boot_info();
+        const struct system_profile* profile = system_profile_info();
+        char number[24];
+        browser_set_content(state, "NostaluxOS system page\n\nResolution: ");
+        int_to_str((int)boot->width, number);
+        browser_append_content(state, number);
+        browser_append_content(state, "x");
+        int_to_str((int)boot->height, number);
+        browser_append_content(state, number);
+        browser_append_content(state, "\nDetected RAM: ");
+        uint64_to_str(profile->memory_total_kb, number);
+        browser_append_content(state, number);
+        browser_append_content(state, " KB\nKernel RAM in use: ");
+        uint64_to_str(profile->memory_used_kb, number);
+        browser_append_content(state, number);
+        browser_append_content(state, " KB\nUptime: ");
+        uint64_to_str(timer_get_uptime(), number);
+        browser_append_content(state, number);
+        browser_append_content(state, " seconds\n");
+        str_copy(state->status, sizeof(state->status), "Live kernel information.");
+        return;
+    }
+
+    if (str_starts_with(address, "http:") ||
+        str_starts_with(address, "https:") ||
+        text_contains_ci(address, "://")) {
+        browser_set_content(state,
+            "Internet access is unavailable.\n\n"
+            "NostaluxOS does not include a network driver or TCP/IP stack yet.\n"
+            "Use file:<name> to open a real filesystem document.");
+        str_copy(state->status, sizeof(state->status), "Network URL rejected honestly.");
+        return;
+    }
+
+    const char* filename = str_starts_with(address, "file:")
+                         ? address + 5 : address;
+    const struct fs_file* file = fs_find(filename);
+    if (!file) {
+        browser_set_content(state, "The requested filesystem file does not exist.");
+        str_copy(state->status, sizeof(state->status), "File not found.");
+        return;
+    }
+    if (!file_is_text(file)) {
+        browser_set_content(state,
+            "This is a binary file.\n\n"
+            "Open BMP images in Image Viewer, or use hexdump in Terminal.");
+        str_copy(state->status, sizeof(state->status), "Binary file identified.");
+        return;
+    }
+
+    size_t length = file->size;
+    if (length >= sizeof(state->content)) length = sizeof(state->content) - 1;
+    for (size_t i = 0; i < length; i++) state->content[i] = file->data[i];
+    state->content[length] = 0;
+    state->content_len = (int)length;
+    char status[64] = "Opened ";
+    char number[24];
+    uint64_to_str(file->size, number);
+    str_append(status, sizeof(status), number);
+    str_append(status, sizeof(status), " filesystem bytes.");
+    str_copy(state->status, sizeof(state->status), status);
+}
+
 static bool filename_is_bmp(const char* name) {
-    int length = kstrlen_local(name);
-    return length >= 4 &&
-           name[length - 4] == '.' &&
-           ascii_lower(name[length - 3]) == 'b' &&
-           ascii_lower(name[length - 2]) == 'm' &&
-           ascii_lower(name[length - 1]) == 'p';
+    return str_ends_with_ci(name, ".bmp");
+}
+
+static bool imageview_open_named(Window* w, const char* name) {
+    ImageViewState* state = &w->state.img;
+    int index = file_index_by_name(name);
+    const struct fs_file* file =
+        index >= 0 ? fs_file_at((size_t)index) : NULL;
+    if (!file) return false;
+
+    state->file_index = index;
+    state->fit_to_window = true;
+    state->valid = false;
+    mem_zero(&state->image, sizeof(state->image));
+    str_copy(state->filename, sizeof(state->filename), file->name);
+    if (bmp_open(file->data, file->size, &state->image)) {
+        state->valid = true;
+        str_copy(state->status, sizeof(state->status),
+                 "Loaded from the filesystem.");
+    } else {
+        str_copy(state->status, sizeof(state->status),
+                 "Invalid or unsupported 24-bit BMP.");
+    }
+    return true;
 }
 
 static void imageview_load(Window* w, int direction) {
@@ -1134,15 +1861,7 @@ static void imageview_load(Window* w, int direction) {
         const struct fs_file* file = fs_file_at((size_t)index);
         if (!file || !filename_is_bmp(file->name)) continue;
 
-        state->file_index = index;
-        state->fit_to_window = true;
-        str_copy(state->filename, sizeof(state->filename), file->name);
-        if (bmp_open(file->data, file->size, &state->image)) {
-            state->valid = true;
-            str_copy(state->status, sizeof(state->status), "Loaded from the filesystem.");
-        } else {
-            str_copy(state->status, sizeof(state->status), "Invalid or unsupported 24-bit BMP.");
-        }
+        imageview_open_named(w, file->name);
         return;
     }
 
@@ -1195,7 +1914,7 @@ static const char* assistant_app_name(AppType type) {
         case APP_NOTEPAD: return "Notepad";
         case APP_FILES: return "Files";
         case APP_PAINT: return "Paint";
-        case APP_BROWSER: return "Browser";
+        case APP_BROWSER: return "Local Browser";
         case APP_TASKMGR: return "Task Manager";
         case APP_SYSMON: return "System Monitor";
         case APP_SETTINGS: return "Settings";
@@ -1226,11 +1945,15 @@ static void assistant_submit(Window* w) {
             assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
                 "You are already talking to AI Assistant.");
         } else if (requested != APP_NONE) {
-            char reply[64] = "Opening ";
-            str_append(reply, sizeof(reply), assistant_app_name(requested));
-            str_append(reply, sizeof(reply), ".");
+            bool opened = launch_app(requested);
+            char reply[64];
+            str_copy(reply, sizeof(reply),
+                     opened ? "Opened " : "I could not open ");
+            str_append(reply, sizeof(reply),
+                       assistant_app_name(requested));
+            str_append(reply, sizeof(reply),
+                       opened ? "." : "; check the desktop notice.");
             assistant_add_wrapped(state, ASSISTANT_ROLE_AI, reply);
-            launch_app(requested);
         } else {
             assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
                 "I could not match that app. Say list apps to see my launchers.");
@@ -1259,7 +1982,7 @@ static void assistant_submit(Window* w) {
     } else if (text_contains_ci(prompt, "list apps") || text_contains_ci(prompt, "applications") ||
                text_contains_ci(prompt, "installed apps")) {
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
-            "Apps: Terminal, Files, Paint, Browser, Notepad, Calculator, Settings, monitors, games, and Image Viewer.");
+            "Apps: Terminal, Files, Paint, Local Browser, Notepad, Calculator, Settings, monitors, games, and Image Viewer.");
     } else if (text_contains_ci(prompt, "time") || text_contains_ci(prompt, "clock")) {
         char now[16];
         char reply[48] = "The system clock says ";
@@ -1295,7 +2018,7 @@ static void assistant_submit(Window* w) {
     } else if (text_contains_ci(prompt, "internet") || text_contains_ci(prompt, "online") ||
                text_contains_ci(prompt, "network")) {
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
-            "NostaluxOS has no network stack yet. I run fully offline, and Browser is currently a visual demo.");
+            "NostaluxOS has no network stack yet. Local Browser opens real filesystem and built-in pages offline.");
     } else if (text_contains_ci(prompt, "joke")) {
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
             "Why did the kernel stay calm? It had complete control of its processes.");
@@ -1331,62 +2054,158 @@ static void handle_assistant_click(Window* w, int x, int y) {
 }
 
 static void handle_run_command(Window* w) {
-    const char* cmd = w->state.run.cmd;
-    if (kstrcmp(cmd, "calc") == 0) launch_app(APP_CALC);
-    else if (kstrcmp(cmd, "term") == 0) launch_app(APP_TERMINAL);
-    else if (kstrcmp(cmd, "paint") == 0) launch_app(APP_PAINT);
-    else if (kstrcmp(cmd, "sys") == 0) launch_app(APP_SYSMON);
-    else if (kstrcmp(cmd, "mine") == 0) launch_app(APP_MINESWEEPER);
-    else if (kstrcmp(cmd, "browser") == 0) launch_app(APP_BROWSER);
-    else if (kstrcmp(cmd, "ttt") == 0) launch_app(APP_TICTACTOE);
-    else if (kstrcmp(cmd, "img") == 0) launch_app(APP_IMAGEVIEW);
-    else if (kstrcmp(cmd, "about") == 0) launch_app(APP_ABOUT);
-    else if (kstrcmp(cmd, "ai") == 0 || kstrcmp(cmd, "assistant") == 0) launch_app(APP_ASSISTANT);
-    else if (kstrcmp(cmd, "shutdown") == 0) desktop_shutdown();
-    close_window(w->id);
+    char command[sizeof(w->state.run.cmd)];
+    str_copy(command, sizeof(command), w->state.run.cmd);
+    if (text_equals_ci_trimmed(command, "")) {
+        str_copy(w->state.run.status, sizeof(w->state.run.status),
+                 "Enter an app name or shell command.");
+        return;
+    }
+
+    AppType target = APP_NONE;
+    if (text_equals_ci_trimmed(command, "calc") ||
+        text_equals_ci_trimmed(command, "calculator"))
+        target = APP_CALC;
+    else if (text_equals_ci_trimmed(command, "term") ||
+             text_equals_ci_trimmed(command, "terminal"))
+        target = APP_TERMINAL;
+    else if (text_equals_ci_trimmed(command, "paint"))
+        target = APP_PAINT;
+    else if (text_equals_ci_trimmed(command, "files") ||
+             text_equals_ci_trimmed(command, "file manager"))
+        target = APP_FILES;
+    else if (text_equals_ci_trimmed(command, "notepad"))
+        target = APP_NOTEPAD;
+    else if (text_equals_ci_trimmed(command, "settings"))
+        target = APP_SETTINGS;
+    else if (text_equals_ci_trimmed(command, "tasks") ||
+             text_equals_ci_trimmed(command, "task manager") ||
+             text_equals_ci_trimmed(command, "taskmgr"))
+        target = APP_TASKMGR;
+    else if (text_equals_ci_trimmed(command, "sys") ||
+             text_equals_ci_trimmed(command, "sysmon") ||
+             text_equals_ci_trimmed(command, "system monitor"))
+        target = APP_SYSMON;
+    else if (text_equals_ci_trimmed(command, "mine") ||
+             text_equals_ci_trimmed(command, "minesweeper"))
+        target = APP_MINESWEEPER;
+    else if (text_equals_ci_trimmed(command, "browser") ||
+             text_equals_ci_trimmed(command, "local browser"))
+        target = APP_BROWSER;
+    else if (text_equals_ci_trimmed(command, "ttt") ||
+             text_equals_ci_trimmed(command, "tic-tac-toe") ||
+             text_equals_ci_trimmed(command, "tic tac toe"))
+        target = APP_TICTACTOE;
+    else if (text_equals_ci_trimmed(command, "img") ||
+             text_equals_ci_trimmed(command, "images") ||
+             text_equals_ci_trimmed(command, "image viewer"))
+        target = APP_IMAGEVIEW;
+    else if (text_equals_ci_trimmed(command, "about"))
+        target = APP_ABOUT;
+    else if (text_equals_ci_trimmed(command, "ai") ||
+             text_equals_ci_trimmed(command, "assistant") ||
+             text_equals_ci_trimmed(command, "ai assistant"))
+        target = APP_ASSISTANT;
+
+    int run_id = w->id;
+    if (!close_window(run_id)) return;
+    if (target != APP_NONE) {
+        launch_app(target);
+        return;
+    }
+
+    Window* terminal = create_window(APP_TERMINAL, "Terminal", 480, 340);
+    if (terminal) {
+        str_copy(terminal->state.term.input,
+                 sizeof(terminal->state.term.input), command);
+        terminal->state.term.input_len =
+            kstrlen_local(terminal->state.term.input);
+        terminal_execute(terminal);
+    } else {
+        desktop_notify("Could not open Terminal for the Run command.");
+    }
+}
+
+static void paint_canvas_rect(Window* w, int* x, int* y, int* width, int* height) {
+    int available_w = w->w - 16;
+    int available_h = w->h - WIN_CAPTION_H - 60;
+    int side = available_w < available_h ? available_w : available_h;
+    if (side < PAINT_CANVAS_W) side = PAINT_CANVAS_W;
+    *width = side;
+    *height = side;
+    *x = w->x + (w->w - side) / 2;
+    *y = w->y + WIN_CAPTION_H + 48;
 }
 
 static void handle_paint_click(Window* w, int x, int y) {
-    if (!w->state.paint.canvas_buffer) return;
-    
-    int cx = w->x + 6;
-    int cy = w->y + WIN_CAPTION_H + 46;
-    
-    if (y < cy) {
+    int toolbar_y = w->y + WIN_CAPTION_H + 11;
+    if (y >= toolbar_y && y < toolbar_y + 25) {
+        if (rect_contains(w->x + w->w - 70, toolbar_y, 58, 25, x, y)) {
+            paint_save(w);
+            return;
+        }
         int palette_y = w->y + WIN_CAPTION_H + 11;
-        if (y >= palette_y && y < palette_y + 25) {
-            int local_x = x - (cx + 5);
-            if (local_x >= 0) {
-                int idx = local_x / 30;
-                if (idx >= 0 && idx < 8) {
-                    uint32_t colors[] = {0xFF000000, 0xFFFFFFFF, 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFF00, 0xFFFF00FF, 0xFF00FFFF};
-                    w->state.paint.current_color = colors[idx];
-                }
+        int local_x = x - (w->x + 11);
+        if (y >= palette_y && local_x >= 0) {
+            int idx = local_x / 30;
+            if (idx >= 0 && idx < 8) {
+                uint32_t colors[] = {
+                    COL_BLACK, COL_WHITE, 0xFFFF0000, 0xFF00FF00,
+                    0xFF0000FF, 0xFFFFFF00, 0xFFFF00FF, 0xFF00FFFF
+                };
+                w->state.paint.current_color = colors[idx];
             }
         }
         return;
     }
-    
-    int rel_x = x - cx;
-    int rel_y = y - cy;
-    int cw = w->state.paint.width;
-    int ch = w->state.paint.height;
-    
-    if (rel_x >= 0 && rel_x < cw && rel_y >= 0 && rel_y < ch) {
-        int sz = w->state.paint.brush_size;
-        uint32_t col = w->state.paint.current_color;
-        uint32_t* buf = w->state.paint.canvas_buffer;
-        
-        for(int dy=-sz; dy<=sz; dy++) {
-            for(int dx=-sz; dx<=sz; dx++) {
-                int px = rel_x + dx;
-                int py = rel_y + dy;
-                if (px >= 0 && px < cw && py >= 0 && py < ch) {
-                    buf[py * cw + px] = col;
-                }
-            }
+
+    int canvas_x, canvas_y, canvas_w, canvas_h;
+    paint_canvas_rect(w, &canvas_x, &canvas_y, &canvas_w, &canvas_h);
+    if (rect_contains(canvas_x, canvas_y, canvas_w, canvas_h, x, y)) {
+        int px = ((x - canvas_x) * PAINT_CANVAS_W) / canvas_w;
+        int py = ((y - canvas_y) * PAINT_CANVAS_H) / canvas_h;
+        if (px >= 0 && px < PAINT_CANVAS_W &&
+            py >= 0 && py < PAINT_CANVAS_H) {
+            w->state.paint.pixels[py * PAINT_CANVAS_W + px] =
+                w->state.paint.current_color;
+            w->state.paint.dirty = true;
+            w->state.paint.discard_deadline = 0;
+            cancel_exit_discard_confirmation();
+            str_copy(w->state.paint.status,
+                     sizeof(w->state.paint.status), "Unsaved changes.");
         }
     }
+}
+
+static void handle_notepad_click(Window* w, int x, int y) {
+    int button_x = w->x + w->w - 70;
+    int button_y = w->y + WIN_CAPTION_H + 5;
+    if (rect_contains(button_x, button_y, 58, 22, x, y))
+        notepad_save(w);
+}
+
+static void settings_report_result(bool saved) {
+    bool editor_blocked =
+        !saved && open_file_has_unsaved_changes("desktop.cfg");
+    const char* status =
+        saved ? "Saved to desktop.cfg."
+              : editor_blocked
+                    ? "Session only: desktop.cfg has unsaved edits."
+                    : "Session only: desktop.cfg save failed.";
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* settings = windows[i];
+        if (!settings || settings->type != APP_SETTINGS) continue;
+        settings->state.settings.wallpaper_enabled = g_wallpaper_enabled;
+        settings->state.settings.theme_id = current_theme_idx;
+        str_copy(settings->state.settings.status,
+                 sizeof(settings->state.settings.status), status);
+    }
+    desktop_notify(
+        saved ? "Desktop settings saved."
+              : editor_blocked
+                    ? "Save or close desktop.cfg in Notepad first."
+                    : "Desktop settings changed for this session only.");
 }
 
 static void handle_settings_click(Window* w, int x, int y) {
@@ -1395,20 +2214,376 @@ static void handle_settings_click(Window* w, int x, int y) {
     if (rect_contains(cx + 10, cy + 30, 140, 30, x, y)) {
         g_wallpaper_enabled = !g_wallpaper_enabled;
         w->state.settings.wallpaper_enabled = g_wallpaper_enabled;
+        settings_report_result(settings_save());
     } else if (rect_contains(cx + 10, cy + 100, 140, 30, x, y)) {
         current_theme_idx = (current_theme_idx + 1) % 2;
         w->state.settings.theme_id = current_theme_idx;
+        settings_report_result(settings_save());
     }
+}
+
+static int files_visible_rows(const Window* w) {
+    int content_height = w->h - WIN_CAPTION_H - 8;
+    int rows = (content_height - 70) / 18;
+    if (rows < 1) rows = 1;
+    return rows;
+}
+
+static void files_normalize(Window* w) {
+    int count = (int)fs_file_count();
+    int rows = files_visible_rows(w);
+    if (count <= 0) {
+        w->state.files.selected_index = -1;
+        w->state.files.selected_name[0] = 0;
+        w->state.files.scroll_offset = 0;
+        return;
+    }
+    if (w->state.files.selected_name[0]) {
+        int resolved = file_index_by_name(w->state.files.selected_name);
+        if (resolved >= 0) {
+            w->state.files.selected_index = resolved;
+        } else {
+            w->state.files.selected_index = -1;
+            w->state.files.selected_name[0] = 0;
+        }
+    } else {
+        w->state.files.selected_index = -1;
+    }
+    if (w->state.files.selected_index >= 0) {
+        if (w->state.files.selected_index < w->state.files.scroll_offset) {
+            w->state.files.scroll_offset =
+                w->state.files.selected_index;
+        } else if (w->state.files.selected_index >=
+                   w->state.files.scroll_offset + rows) {
+            w->state.files.scroll_offset =
+                w->state.files.selected_index - rows + 1;
+        }
+    }
+    int max_offset = count > rows ? count - rows : 0;
+    if (w->state.files.scroll_offset > max_offset)
+        w->state.files.scroll_offset = max_offset;
+    if (w->state.files.scroll_offset < 0)
+        w->state.files.scroll_offset = 0;
+}
+
+static const struct fs_file* files_selected(Window* w) {
+    files_normalize(w);
+    if (w->state.files.selected_index < 0 ||
+        !w->state.files.selected_name[0])
+        return NULL;
+    return fs_file_at((size_t)w->state.files.selected_index);
+}
+
+static void retarget_open_file(const char* old_name, const char* new_name) {
+    char old_address[FS_MAX_FILENAME + 6] = "file:";
+    char new_address[FS_MAX_FILENAME + 6] = "file:";
+    str_append(old_address, sizeof(old_address), old_name);
+    str_append(new_address, sizeof(new_address), new_name);
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* open = windows[i];
+        if (!open) continue;
+        if (open->type == APP_NOTEPAD &&
+            kstrcmp(open->state.notepad.filename, old_name) == 0) {
+            str_copy(open->state.notepad.filename,
+                     sizeof(open->state.notepad.filename), new_name);
+            str_copy(open->title, sizeof(open->title), new_name);
+            str_copy(open->state.notepad.status,
+                     sizeof(open->state.notepad.status),
+                     "Backing file was renamed.");
+        } else if (open->type == APP_PAINT &&
+                   kstrcmp(open->state.paint.filename, old_name) == 0) {
+            str_copy(open->state.paint.filename,
+                     sizeof(open->state.paint.filename), new_name);
+            str_copy(open->title, sizeof(open->title), new_name);
+            str_copy(open->state.paint.status,
+                     sizeof(open->state.paint.status),
+                     "Backing file was renamed.");
+        } else if (open->type == APP_IMAGEVIEW &&
+                   kstrcmp(open->state.img.filename, old_name) == 0) {
+            imageview_open_named(open, new_name);
+            str_copy(open->title, sizeof(open->title), new_name);
+        } else if (open->type == APP_BROWSER &&
+                   (kstrcmp(open->state.browser.address, old_name) == 0 ||
+                    kstrcmp(open->state.browser.address, old_address) == 0)) {
+            str_copy(open->state.browser.address,
+                     sizeof(open->state.browser.address), new_address);
+            open->state.browser.address_len =
+                kstrlen_local(open->state.browser.address);
+            browser_load(open);
+        } else if (open->type == APP_FILES &&
+                   kstrcmp(open->state.files.selected_name, old_name) == 0) {
+            str_copy(open->state.files.selected_name,
+                     sizeof(open->state.files.selected_name), new_name);
+            open->state.files.selected_index =
+                file_index_by_name(new_name);
+        }
+    }
+}
+
+static void detach_deleted_file(const char* filename) {
+    char file_address[FS_MAX_FILENAME + 6] = "file:";
+    str_append(file_address, sizeof(file_address), filename);
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* open = windows[i];
+        if (!open) continue;
+        if (open->type == APP_NOTEPAD &&
+            kstrcmp(open->state.notepad.filename, filename) == 0) {
+            bool was_dirty = open->state.notepad.dirty;
+            open->state.notepad.filename[0] = 0;
+            open->state.notepad.dirty = was_dirty;
+            open->state.notepad.discard_deadline = 0;
+            str_copy(open->title, sizeof(open->title), "Deleted text file");
+            str_copy(open->state.notepad.status,
+                     sizeof(open->state.notepad.status),
+                     was_dirty ? "Deleted externally; edits save as a new note."
+                               : "Deleted; edit to save as a new note.");
+        } else if (open->type == APP_PAINT &&
+                   kstrcmp(open->state.paint.filename, filename) == 0) {
+            bool was_dirty = open->state.paint.dirty;
+            open->state.paint.filename[0] = 0;
+            open->state.paint.dirty = was_dirty;
+            open->state.paint.discard_deadline = 0;
+            str_copy(open->title, sizeof(open->title), "Deleted painting");
+            str_copy(open->state.paint.status,
+                     sizeof(open->state.paint.status),
+                     was_dirty ? "Deleted externally; edits save as a new BMP."
+                               : "Deleted; paint to save as a new BMP.");
+        } else if (open->type == APP_IMAGEVIEW &&
+                   kstrcmp(open->state.img.filename, filename) == 0) {
+            open->state.img.file_index = -1;
+            open->state.img.filename[0] = 0;
+            open->state.img.valid = false;
+            imageview_load(open, 1);
+        } else if (open->type == APP_BROWSER &&
+                   (kstrcmp(open->state.browser.address, filename) == 0 ||
+                    kstrcmp(open->state.browser.address, file_address) == 0)) {
+            browser_load(open);
+        } else if (open->type == APP_FILES &&
+                   kstrcmp(open->state.files.selected_name, filename) == 0) {
+            open->state.files.selected_name[0] = 0;
+            open->state.files.selected_index = -1;
+            open->state.files.delete_name[0] = 0;
+            open->state.files.delete_deadline = 0;
+        }
+    }
+}
+
+static bool open_file_has_unsaved_changes(const char* filename) {
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* open = windows[i];
+        if (!open) continue;
+        if (open->type == APP_NOTEPAD &&
+            open->state.notepad.dirty &&
+            kstrcmp(open->state.notepad.filename, filename) == 0)
+            return true;
+        if (open->type == APP_PAINT &&
+            open->state.paint.dirty &&
+            kstrcmp(open->state.paint.filename, filename) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void files_open_selected(Window* w) {
+    const struct fs_file* file = files_selected(w);
+    if (!file) {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Select a file first.");
+        return;
+    }
+
+    char filename[FS_MAX_FILENAME];
+    str_copy(filename, sizeof(filename), file->name);
+    if (filename_is_bmp(filename)) {
+        if (open_image_file(filename))
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "Opened in Image Viewer.");
+        else
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "BMP could not be opened.");
+    } else if (file_is_text(file)) {
+        if (open_notepad_file(filename))
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "Opened in Notepad.");
+        else
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "Text file could not be opened.");
+    } else {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Binary file: inspect it with Terminal hexdump.");
+    }
+}
+
+static void files_create_text(Window* w) {
+    Window* note = create_notepad_file();
+    if (!note) {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Could not create a text file.");
+        return;
+    }
+    w->state.files.selected_index =
+        file_index_by_name(note->state.notepad.filename);
+    str_copy(w->state.files.selected_name,
+             sizeof(w->state.files.selected_name),
+             note->state.notepad.filename);
+    str_copy(w->state.files.status, sizeof(w->state.files.status),
+             "Created a persistent text file.");
+    files_normalize(w);
+}
+
+static void files_cancel_delete_confirmation(FileManagerState* state) {
+    state->delete_name[0] = 0;
+    state->delete_deadline = 0;
+}
+
+static void files_delete_selected(Window* w) {
+    const struct fs_file* file = files_selected(w);
+    if (!file) {
+        files_cancel_delete_confirmation(&w->state.files);
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Select a file first.");
+        return;
+    }
+    char filename[FS_MAX_FILENAME];
+    str_copy(filename, sizeof(filename), file->name);
+    if (open_file_has_unsaved_changes(filename)) {
+        files_cancel_delete_confirmation(&w->state.files);
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Save or close the modified editor first.");
+        return;
+    }
+
+    uint64_t now = timer_get_ticks();
+    if (w->state.files.delete_deadline == 0 ||
+        now > w->state.files.delete_deadline ||
+        kstrcmp(w->state.files.delete_name, filename) != 0) {
+        str_copy(w->state.files.delete_name,
+                 sizeof(w->state.files.delete_name), filename);
+        w->state.files.delete_deadline =
+            now + DISCARD_CONFIRM_TICKS;
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Click Delete again within 3s to confirm.");
+        return;
+    }
+
+    files_cancel_delete_confirmation(&w->state.files);
+    if (fs_remove(filename)) {
+        detach_deleted_file(filename);
+        w->state.files.selected_index = -1;
+        w->state.files.selected_name[0] = 0;
+        w->state.files.renaming = false;
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "File deleted from persistent storage.");
+        files_normalize(w);
+    } else {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Delete failed.");
+    }
+}
+
+static void files_begin_rename(Window* w) {
+    const struct fs_file* file = files_selected(w);
+    if (!file) {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Select a file first.");
+        return;
+    }
+    str_copy(w->state.files.rename_buffer,
+             sizeof(w->state.files.rename_buffer), file->name);
+    w->state.files.rename_length =
+        kstrlen_local(w->state.files.rename_buffer);
+    w->state.files.renaming = true;
+    w->state.files.rename_select_all = true;
+    str_copy(w->state.files.status, sizeof(w->state.files.status),
+             "Type a new name and press Enter.");
+}
+
+static void files_commit_rename(Window* w) {
+    const struct fs_file* file = files_selected(w);
+    if (!file || !w->state.files.rename_buffer[0]) {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Rename cancelled: invalid name.");
+        w->state.files.renaming = false;
+        return;
+    }
+    char old_name[FS_MAX_FILENAME];
+    char new_name[FS_MAX_FILENAME];
+    str_copy(old_name, sizeof(old_name), file->name);
+    str_copy(new_name, sizeof(new_name), w->state.files.rename_buffer);
+    if (fs_rename(old_name, new_name)) {
+        retarget_open_file(old_name, new_name);
+        w->state.files.selected_index = file_index_by_name(new_name);
+        str_copy(w->state.files.selected_name,
+                 sizeof(w->state.files.selected_name), new_name);
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "File renamed on persistent storage.");
+    } else {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "Rename failed: name may be invalid or in use.");
+    }
+    w->state.files.renaming = false;
+    w->state.files.rename_select_all = false;
 }
 
 static void handle_files_click(Window* w, int x, int y) {
     int cx = w->x + 4;
     int cy = w->y + WIN_CAPTION_H + 4;
-    size_t count = fs_file_count();
-    for (size_t i = 0; i < count; i++) {
-        int ry = cy + 24 + i * 18;
-        if (ry + 18 < w->y + w->h && rect_contains(cx + 2, ry, w->w - 12, 18, x, y)) {
-            w->state.files.selected_index = (int)i;
+    int rows = files_visible_rows(w);
+    int count = (int)fs_file_count();
+    files_normalize(w);
+
+    if (rect_contains(cx + 4, cy + 2, 38, 22, x, y)) {
+        files_cancel_delete_confirmation(&w->state.files);
+        files_create_text(w);
+        return;
+    }
+    if (rect_contains(cx + 46, cy + 2, 42, 22, x, y)) {
+        files_cancel_delete_confirmation(&w->state.files);
+        files_open_selected(w);
+        return;
+    }
+    if (rect_contains(cx + 92, cy + 2, 54, 22, x, y)) {
+        files_cancel_delete_confirmation(&w->state.files);
+        files_begin_rename(w);
+        return;
+    }
+    if (rect_contains(cx + 150, cy + 2, 50, 22, x, y)) {
+        files_delete_selected(w);
+        return;
+    }
+    if (rect_contains(cx + 204, cy + 2, 32, 22, x, y)) {
+        files_cancel_delete_confirmation(&w->state.files);
+        w->state.files.scroll_offset -= rows;
+        w->state.files.selected_index = -1;
+        w->state.files.selected_name[0] = 0;
+        files_normalize(w);
+        return;
+    }
+    if (rect_contains(cx + 240, cy + 2, 42, 22, x, y)) {
+        files_cancel_delete_confirmation(&w->state.files);
+        if (w->state.files.scroll_offset + rows < count)
+            w->state.files.scroll_offset += rows;
+        w->state.files.selected_index = -1;
+        w->state.files.selected_name[0] = 0;
+        files_normalize(w);
+        return;
+    }
+
+    for (int row = 0; row < rows; row++) {
+        int index = w->state.files.scroll_offset + row;
+        if (index >= count) break;
+        int ry = cy + 50 + row * 18;
+        if (rect_contains(cx + 2, ry, w->w - 12, 18, x, y)) {
+            files_cancel_delete_confirmation(&w->state.files);
+            w->state.files.selected_index = index;
+            const struct fs_file* selected = fs_file_at((size_t)index);
+            str_copy(w->state.files.selected_name,
+                     sizeof(w->state.files.selected_name),
+                     selected ? selected->name : "");
+            w->state.files.renaming = false;
+            w->state.files.rename_select_all = false;
             return;
         }
     }
@@ -1418,7 +2593,7 @@ static void handle_files_click(Window* w, int x, int y) {
 
 static int taskmgr_visible_rows(const Window* w) {
     int content_height = w->h - WIN_CAPTION_H - 4;
-    int rows = (content_height - 80) / 20;
+    int rows = (content_height - 96) / 20;
     if (rows < 1) rows = 1;
     if (rows > TASKMGR_PAGE_CAPACITY) rows = TASKMGR_PAGE_CAPACITY;
     return rows;
@@ -1452,11 +2627,40 @@ static void handle_taskmgr_click(Window* w, int x, int y) {
         } else {
             w->state.taskmgr.page_offset = 0;
         }
+        w->state.taskmgr.selected_pid = 0;
         return;
     }
     if (rect_contains(cx + 60, button_y, 44, 20, x, y)) {
         size_t next = w->state.taskmgr.page_offset + (size_t)rows;
         if (next < total) w->state.taskmgr.page_offset = next;
+        w->state.taskmgr.selected_pid = 0;
+        return;
+    }
+    if (rect_contains(cx + 110, button_y, 70, 20, x, y)) {
+        uint64_t selected = w->state.taskmgr.selected_pid;
+        struct scheduler_task_info visible[TASKMGR_PAGE_CAPACITY];
+        size_t visible_count = scheduler_snapshot_tasks_from(
+            w->state.taskmgr.page_offset, visible, (size_t)rows);
+        bool selected_is_visible = false;
+        for (size_t i = 0; i < visible_count; i++) {
+            if (visible[i].id == selected) {
+                selected_is_visible = true;
+                break;
+            }
+        }
+        if (selected_is_visible &&
+            selected != 0 &&
+            scheduler_terminate_task(selected)) {
+            w->state.taskmgr.selected_pid = 0;
+            total = scheduler_task_count();
+            taskmgr_normalize_page(w, total, rows);
+            str_copy(w->state.taskmgr.status,
+                     sizeof(w->state.taskmgr.status), "Selected task ended.");
+        } else {
+            str_copy(w->state.taskmgr.status,
+                     sizeof(w->state.taskmgr.status),
+                     "Cannot end current or missing task.");
+        }
         return;
     }
 
@@ -1474,10 +2678,30 @@ static void handle_taskmgr_click(Window* w, int x, int y) {
 }
 
 static void handle_browser_click(Window* w, int x, int y) {
-    int cx = w->x;
-    int cy = w->y + WIN_CAPTION_H;
-    if (rect_contains(cx + w->w - 40, cy + 5, 30, 20, x, y)) {
-        str_copy(w->state.browser.status, sizeof(w->state.browser.status), "Loading...");
+    int cx = w->x + 2;
+    int cy = w->y + WIN_CAPTION_H + 2;
+    int cw = w->w - 4;
+    int ch = w->h - WIN_CAPTION_H - 4;
+    int button_y = cy + ch - 24;
+    BrowserState* state = &w->state.browser;
+
+    if (rect_contains(cx + 2, cy + 2, cw - 44, 24, x, y)) {
+        state->address_select_all = true;
+        str_copy(state->status, sizeof(state->status),
+                 "Type an address and press Enter.");
+    } else if (rect_contains(cx + cw - 38, cy + 2, 34, 24, x, y)) {
+        state->address_select_all = false;
+        browser_load(w);
+    } else if (rect_contains(cx + 8, button_y, 42, 20, x, y)) {
+        if (state->scroll > 0) state->scroll--;
+    } else if (rect_contains(cx + 56, button_y, 50, 20, x, y)) {
+        int max_cols = browser_max_columns(w);
+        int visible_rows = browser_visible_rows(w);
+        int logical_rows =
+            wrapped_content_line_count(state->content, max_cols);
+        int max_scroll = logical_rows > visible_rows
+                       ? logical_rows - visible_rows : 0;
+        if (state->scroll < max_scroll) state->scroll++;
     }
 }
 
@@ -1488,10 +2712,12 @@ static void calc_button_rect(Window* w, int button, int* x, int* y) {
     *y = cy + 45 + (button / 4) * 30;
 }
 
-static int clamp_calc_result(long long value) {
-    if (value > INT_MAX) return INT_MAX;
-    if (value < INT_MIN) return INT_MIN;
-    return (int)value;
+static void calc_store_result(CalcState* state, long long value) {
+    if (value > INT_MAX || value < INT_MIN) {
+        state->error_code = CALC_ERROR_OVERFLOW;
+        return;
+    }
+    state->current_val = (int)value;
 }
 
 static void handle_calc_logic(Window* w, int x, int y) {
@@ -1503,21 +2729,48 @@ static void handle_calc_logic(Window* w, int x, int y) {
             char c = btns[b]; 
             CalcState* s = &w->state.calc;
             if (c >= '0' && c <= '9') {
+                if (s->error_code != CALC_ERROR_NONE) {
+                    s->current_val = 0;
+                    s->accumulator = 0;
+                    s->op = 0;
+                    s->new_entry = true;
+                    s->error_code = CALC_ERROR_NONE;
+                }
                 int d = c - '0';
                 if (s->new_entry) { s->current_val = d; s->new_entry = false; }
                 else if (s->current_val >= 0 && s->current_val <= (INT_MAX - d) / 10)
                     s->current_val = s->current_val * 10 + d;
-            } 
-            else if (c == 'C') { s->current_val = 0; s->accumulator = 0; s->op = 0; s->new_entry = true; } 
-            else if (c == '+' || c == '-' || c == '*' || c == '/') { s->accumulator = s->current_val; s->op = c; s->new_entry = true; } 
-            else if (c == '=') {
+                else {
+                    s->error_code = CALC_ERROR_OVERFLOW;
+                    s->op = 0;
+                    s->new_entry = true;
+                }
+            }
+            else if (c == 'C') {
+                s->current_val = 0;
+                s->accumulator = 0;
+                s->op = 0;
+                s->new_entry = true;
+                s->error_code = CALC_ERROR_NONE;
+            }
+            else if (s->error_code == CALC_ERROR_NONE &&
+                     (c == '+' || c == '-' || c == '*' || c == '/')) {
+                s->accumulator = s->current_val;
+                s->op = c;
+                s->new_entry = true;
+            }
+            else if (s->error_code == CALC_ERROR_NONE && c == '=') {
                 long long left = s->accumulator;
                 long long right = s->current_val;
-                if (s->op == '+') s->current_val = clamp_calc_result(left + right);
-                else if (s->op == '-') s->current_val = clamp_calc_result(left - right);
-                else if (s->op == '*') s->current_val = clamp_calc_result(left * right);
-                else if (s->op == '/' && right != 0)
-                    s->current_val = clamp_calc_result(left / right);
+                if (s->op == '+') calc_store_result(s, left + right);
+                else if (s->op == '-') calc_store_result(s, left - right);
+                else if (s->op == '*') calc_store_result(s, left * right);
+                else if (s->op == '/') {
+                    if (right == 0)
+                        s->error_code = CALC_ERROR_DIV_ZERO;
+                    else
+                        calc_store_result(s, left / right);
+                }
                 s->op = 0; s->new_entry = true;
             }
             return;
@@ -1525,42 +2778,225 @@ static void handle_calc_logic(Window* w, int x, int y) {
     }
 }
 
-static void handle_terminal_input(Window* w, char c) {
-    TerminalState* ts = &w->state.term;
-    if (c == '\n') {
-        for (int i=0; i<5; i++) str_copy(ts->history[i], sizeof(ts->history[i]), ts->history[i+1]);
-        char line[80]; 
-        str_copy(line, sizeof(line), ts->prompt);
-        int p_len = kstrlen_local(line); 
-        int i = 0; 
-        while(ts->input[i] && p_len < 79) line[p_len++] = ts->input[i++];
-        line[p_len] = 0; 
-        str_copy(ts->history[5], sizeof(ts->history[5]), line);
-        
-        if (kstrcmp(ts->input, "exit") == 0) {
-            close_window(w->id);
-            return;
+static void gui_terminal_add_line(TerminalState* state, const char* line) {
+    if (state->line_count >= GUI_TERM_LINES) {
+        for (int i = 1; i < GUI_TERM_LINES; i++) {
+            str_copy(state->lines[i - 1], GUI_TERM_LINE_LEN, state->lines[i]);
         }
-        else if (kstrcmp(ts->input, "cls") == 0) for(int k=0; k<6; k++) ts->history[k][0] = 0;
-        else if (kstrcmp(ts->input, "ai") == 0 || kstrcmp(ts->input, "assistant") == 0)
-            launch_app(APP_ASSISTANT);
-        
-        ts->input[0] = 0; 
-        ts->input_len = 0;
-    } 
-    else if (c == '\b') { if (ts->input_len > 0) ts->input[--ts->input_len] = 0; } 
-    else if (c >= 32 && c <= 126 && ts->input_len < 60) { ts->input[ts->input_len++] = c; ts->input[ts->input_len] = 0; }
+        state->line_count = GUI_TERM_LINES - 1;
+        state->history_truncated = true;
+    }
+    str_copy(state->lines[state->line_count], GUI_TERM_LINE_LEN, line);
+    state->line_count++;
+}
+
+static void gui_terminal_add_output(TerminalState* state, const char* output,
+                                    size_t output_length) {
+    char line[GUI_TERM_LINE_LEN];
+    int length = 0;
+    bool wrote_anything = false;
+    bool replaced_binary = false;
+
+    for (size_t i = 0; output && i < output_length; i++) {
+        char current = output[i];
+        if (current == '\r') continue;
+        if (current == '\n') {
+            line[length] = 0;
+            gui_terminal_add_line(state, line);
+            length = 0;
+            wrote_anything = true;
+            continue;
+        }
+        if (current == '\t') current = ' ';
+        if ((unsigned char)current < 32 ||
+            (unsigned char)current > 126) {
+            current = '?';
+            replaced_binary = true;
+        }
+        line[length++] = current;
+        if (length + 1 >= GUI_TERM_LINE_LEN) {
+            line[length] = 0;
+            gui_terminal_add_line(state, line);
+            length = 0;
+            wrote_anything = true;
+        }
+    }
+    if (length > 0) {
+        line[length] = 0;
+        gui_terminal_add_line(state, line);
+        wrote_anything = true;
+    }
+    if (!wrote_anything)
+        gui_terminal_add_line(state, "(command completed with no output)");
+    if (replaced_binary)
+        gui_terminal_add_line(state, "[non-text output bytes shown as ?]");
+}
+
+enum gui_fs_mutation {
+    GUI_FS_MUTATION_NONE,
+    GUI_FS_MUTATION_TOUCH,
+    GUI_FS_MUTATION_MODIFY,
+    GUI_FS_MUTATION_REMOVE
+};
+
+static enum gui_fs_mutation gui_fs_command_target(
+    const char* command_line, char target[FS_MAX_FILENAME]) {
+    const char* cursor = kskip_spaces(command_line);
+    char command[16];
+    size_t command_length = 0;
+    target[0] = 0;
+
+    while (cursor[command_length] &&
+           cursor[command_length] != ' ' &&
+           cursor[command_length] != '\t') {
+        if (command_length + 1 >= sizeof(command))
+            return GUI_FS_MUTATION_NONE;
+        command[command_length] = cursor[command_length];
+        command_length++;
+    }
+    command[command_length] = 0;
+    cursor = kskip_spaces(cursor + command_length);
+
+    size_t target_length = 0;
+    while (cursor[target_length] &&
+           cursor[target_length] != ' ' &&
+           cursor[target_length] != '\t') {
+        if (target_length + 1 >= FS_MAX_FILENAME) {
+            target[0] = 0;
+            return GUI_FS_MUTATION_NONE;
+        }
+        target[target_length] = cursor[target_length];
+        target_length++;
+    }
+    target[target_length] = 0;
+    if (target_length == 0) return GUI_FS_MUTATION_NONE;
+
+    if (kstrcmp(command, "touch") == 0)
+        return cursor[target_length] == 0
+             ? GUI_FS_MUTATION_TOUCH : GUI_FS_MUTATION_NONE;
+    if (kstrcmp(command, "write") == 0 ||
+        kstrcmp(command, "append") == 0) {
+        if (*kskip_spaces(cursor + target_length) == 0) {
+            target[0] = 0;
+            return GUI_FS_MUTATION_NONE;
+        }
+        return GUI_FS_MUTATION_MODIFY;
+    }
+    if (kstrcmp(command, "rm") == 0)
+        return cursor[target_length] == 0
+             ? GUI_FS_MUTATION_REMOVE : GUI_FS_MUTATION_NONE;
+    target[0] = 0;
+    return GUI_FS_MUTATION_NONE;
+}
+
+static uint32_t gui_file_hash(const struct fs_file* file) {
+    uint32_t hash = 2166136261u;
+    if (!file) return 0;
+    for (size_t i = 0; i < file->size; i++) {
+        hash ^= (uint8_t)file->data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void terminal_execute(Window* w) {
+    TerminalState* state = &w->state.term;
+    char command[sizeof(state->input)];
+    str_copy(command, sizeof(command), state->input);
+    state->input[0] = 0;
+    state->input_len = 0;
+
+    if (command[0] == 0) return;
+    if (kstrcmp(command, "exit") == 0) {
+        close_window(w->id);
+        return;
+    }
+    if (kstrcmp(command, "cls") == 0 || kstrcmp(command, "clear") == 0) {
+        for (int i = 0; i < GUI_TERM_LINES; i++) state->lines[i][0] = 0;
+        state->line_count = 0;
+        state->history_truncated = false;
+        return;
+    }
+
+    char prompt_line[GUI_TERM_LINE_LEN] = "$ ";
+    str_append(prompt_line, sizeof(prompt_line), command);
+    gui_terminal_add_line(state, prompt_line);
+
+    char mutation_target[FS_MAX_FILENAME];
+    enum gui_fs_mutation mutation =
+        gui_fs_command_target(command, mutation_target);
+    if ((mutation == GUI_FS_MUTATION_MODIFY ||
+         mutation == GUI_FS_MUTATION_REMOVE) &&
+        open_file_has_unsaved_changes(mutation_target)) {
+        gui_terminal_add_line(
+            state, "Blocked: save or close the modified editor first.");
+        return;
+    }
+
+    const struct fs_file* before_file =
+        mutation != GUI_FS_MUTATION_NONE ? fs_find(mutation_target) : NULL;
+    bool before_exists = before_file != NULL;
+    size_t before_size = before_file ? before_file->size : 0;
+    uint32_t before_hash = gui_file_hash(before_file);
+
+    char output[FS_MAX_FILE_SIZE];
+    size_t output_length = 0;
+    bool truncated = false;
+    if (!shell_execute_capture(command, output, sizeof(output),
+                               &output_length, &truncated)) {
+        gui_terminal_add_line(state, "Terminal capture is busy or unavailable.");
+        return;
+    }
+    gui_terminal_add_output(state, output, output_length);
+    if (truncated)
+        gui_terminal_add_line(state, "[output truncated to terminal capacity]");
+    const struct fs_file* after_file =
+        mutation != GUI_FS_MUTATION_NONE ? fs_find(mutation_target) : NULL;
+    bool filesystem_changed =
+        mutation != GUI_FS_MUTATION_NONE &&
+        (before_exists != (after_file != NULL) ||
+         before_size != (after_file ? after_file->size : 0) ||
+         before_hash != gui_file_hash(after_file));
+    if (filesystem_changed)
+        reconcile_filesystem_windows("Filesystem changed by Terminal.");
+}
+
+static void handle_terminal_input(Window* w, char c) {
+    TerminalState* state = &w->state.term;
+    if (c == '\n') {
+        terminal_execute(w);
+    } else if (c == '\b') {
+        if (state->input_len > 0) state->input[--state->input_len] = 0;
+    } else if (c >= 32 && c <= 126 &&
+               state->input_len < (int)sizeof(state->input) - 1) {
+        state->input[state->input_len++] = c;
+        state->input[state->input_len] = 0;
+    }
 }
 
 static void handle_browser_input(Window* w, char c) {
-    BrowserState* bs = &w->state.browser;
+    BrowserState* state = &w->state.browser;
     if (c == '\b') {
-        if (bs->url_len > 0) bs->url[--bs->url_len] = 0;
+        if (state->address_select_all) {
+            state->address[0] = 0;
+            state->address_len = 0;
+            state->address_select_all = false;
+        } else if (state->address_len > 0) {
+            state->address[--state->address_len] = 0;
+        }
     } else if (c == '\n') {
-        str_copy(bs->status, sizeof(bs->status), "Loaded.");
-    } else if (c >= 32 && c <= 126 && bs->url_len < 60) {
-        bs->url[bs->url_len++] = c;
-        bs->url[bs->url_len] = 0;
+        state->address_select_all = false;
+        browser_load(w);
+    } else if (c >= 32 && c <= 126) {
+        if (state->address_select_all) {
+            state->address[0] = 0;
+            state->address_len = 0;
+            state->address_select_all = false;
+        }
+        if (state->address_len < (int)sizeof(state->address) - 1) {
+            state->address[state->address_len++] = c;
+            state->address[state->address_len] = 0;
+        }
     }
 }
 
@@ -1603,6 +3039,88 @@ static void update_sysmon(Window* w) {
     s->previous_cpu = current;
     s->last_sample_tick = now_tick;
     s->has_previous_cpu = true;
+}
+
+static void reconcile_filesystem_windows(const char* files_status) {
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* w = windows[i];
+        if (!w) continue;
+
+        if (w->type == APP_FILES) {
+            files_cancel_delete_confirmation(&w->state.files);
+            files_normalize(w);
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     files_status ? files_status
+                                  : "Refreshed live filesystem listing.");
+        } else if (w->type == APP_BROWSER) {
+            browser_load(w);
+        } else if (w->type == APP_IMAGEVIEW) {
+            char filename[FS_MAX_FILENAME];
+            str_copy(filename, sizeof(filename), w->state.img.filename);
+            if (!filename[0] || !imageview_open_named(w, filename))
+                imageview_load(w, 1);
+        } else if (w->type == APP_NOTEPAD &&
+                   !w->state.notepad.dirty &&
+                   w->state.notepad.filename[0]) {
+            const struct fs_file* file =
+                fs_find(w->state.notepad.filename);
+            if (file && file_is_text(file)) {
+                size_t length = file->size;
+                if (length >= sizeof(w->state.notepad.buffer))
+                    length = sizeof(w->state.notepad.buffer) - 1;
+                for (size_t j = 0; j < length; j++)
+                    w->state.notepad.buffer[j] = file->data[j];
+                w->state.notepad.buffer[length] = 0;
+                w->state.notepad.length = (int)length;
+                str_copy(w->state.notepad.status,
+                         sizeof(w->state.notepad.status),
+                         "Reloaded from filesystem.");
+            } else if (!file) {
+                char missing[FS_MAX_FILENAME];
+                str_copy(missing, sizeof(missing),
+                         w->state.notepad.filename);
+                detach_deleted_file(missing);
+            } else {
+                w->state.notepad.filename[0] = 0;
+                w->state.notepad.dirty = false;
+                w->state.notepad.discard_deadline = 0;
+                str_copy(w->title, sizeof(w->title), "Changed text file");
+                str_copy(w->state.notepad.status,
+                         sizeof(w->state.notepad.status),
+                         "Backing file became binary; edit to save a new note.");
+            }
+        } else if (w->type == APP_PAINT &&
+                   !w->state.paint.dirty &&
+                   w->state.paint.filename[0]) {
+            char filename[FS_MAX_FILENAME];
+            str_copy(filename, sizeof(filename),
+                     w->state.paint.filename);
+            if (fs_find(filename))
+                paint_reload(w);
+            else
+                detach_deleted_file(filename);
+        }
+    }
+}
+
+static void desktop_refresh(void) {
+    settings_load();
+    reconcile_filesystem_windows("Refreshed live filesystem listing.");
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* w = windows[i];
+        if (!w) continue;
+        if (w->type == APP_TASKMGR) {
+            int rows = taskmgr_visible_rows(w);
+            taskmgr_normalize_page(w, scheduler_task_count(), rows);
+            str_copy(w->state.taskmgr.status,
+                     sizeof(w->state.taskmgr.status),
+                     "Refreshed live scheduler snapshot.");
+        } else if (w->type == APP_SYSMON) {
+            w->state.sysmon.has_previous_cpu = false;
+            update_sysmon(w);
+        }
+    }
+    desktop_log("GUI: desktop state refreshed");
 }
 
 // --- Context Menu Functions ---
@@ -1651,15 +3169,18 @@ static void handle_context_menu_click(int x, int y) {
         if (idx >= 0 && idx < g_ctx_menu.count) {
             int action = g_ctx_menu.items[idx].action_id;
             switch(action) {
-                case CTX_REFRESH: 
-                    // Simple refresh effect handled by redraw
+                case CTX_REFRESH:
+                    desktop_refresh();
                     break;
-                case CTX_WALLPAPER:
+                case CTX_WALLPAPER: {
                     g_wallpaper_enabled = true;
                     g_wallpaper_seed = fast_rand() % 1000;
+                    bool saved = settings_save();
+                    settings_report_result(saved);
                     break;
+                }
                 case CTX_NEW_FILE:
-                    create_window(APP_NOTEPAD, "Untitled.txt", 300, 200);
+                    create_notepad_file();
                     break;
                 case CTX_SYS_INFO:
                     create_window(APP_SYSMON, "System Monitor", 300, 200);
@@ -1789,43 +3310,53 @@ static void draw_wallpaper(void) {
 }
 
 static void render_paint_app(Window* w) {
-    int cx = w->x + 6; 
+    int cx = w->x + 6;
     int cy = w->y + WIN_CAPTION_H + 6;
-    int cw = w->w - 12; 
-    int ch = w->h - WIN_CAPTION_H - 12;
-    
+    int cw = w->w - 12;
+
     int tool_h = 40;
     graphics_fill_rect(cx, cy, cw, tool_h, 0xFFE0E0E0);
-    
-    // Fixed: Added last color to match loop count of 8
-    uint32_t colors[] = {0xFF000000, 0xFFFFFFFF, 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFF00, 0xFFFF00FF, 0xFF00FFFF};
-    for(int i=0; i<8; i++) {
-        int px = cx + 5 + (i*30);
+
+    uint32_t colors[] = {
+        COL_BLACK, COL_WHITE, 0xFFFF0000, 0xFF00FF00,
+        0xFF0000FF, 0xFFFFFF00, 0xFFFF00FF, 0xFF00FFFF
+    };
+    for (int i = 0; i < 8; i++) {
+        int px = cx + 5 + i * 30;
         int py = cy + 5;
         graphics_fill_rect(px, py, 25, 25, colors[i]);
         if (w->state.paint.current_color == colors[i]) {
-            graphics_fill_rect(px, py+26, 25, 3, 0xFF000000);
+            graphics_fill_rect(px, py + 26, 25, 3, COL_BLACK);
         }
     }
-    
-    int cv_y = cy + tool_h;
-    int cv_h = ch - tool_h;
 
-    if (cv_h <= 0 || cw <= 0) return;
-    graphics_fill_rect(cx, cv_y, cw, cv_h, COL_WHITE);
-    if (w->state.paint.canvas_buffer) {
-        uint32_t* buf = w->state.paint.canvas_buffer;
-        int buf_w = w->state.paint.width;
-        int buf_h = w->state.paint.height;
-        int start_x = cx;
-        int start_y = cv_y;
+    int save_x = w->x + w->w - 70;
+    int save_y = w->y + WIN_CAPTION_H + 11;
+    draw_bevel_box(save_x, save_y, 58, 25, false);
+    graphics_draw_string_scaled(save_x + 12, save_y + 8, "SAVE",
+                                COL_BLACK, COL_BTN_FACE, 1);
 
-        int rows = cv_h < buf_h ? cv_h : buf_h;
-        int cols = cw < buf_w ? cw : buf_w;
-        for (int y = 0; y < rows; y++) {
-            for (int x = 0; x < cols; x++) {
-                uint32_t col = buf[y * buf_w + x];
-                graphics_put_pixel(start_x + x, start_y + y, col);
+    draw_string_bounded(cx + 5, cy + 34, cw - 10,
+                        w->state.paint.status,
+                        w->state.paint.dirty ? 0xFFAA5500 : 0xFF226622,
+                        COL_WIN_BODY, 1);
+
+    int canvas_x, canvas_y, canvas_w, canvas_h;
+    paint_canvas_rect(w, &canvas_x, &canvas_y, &canvas_w, &canvas_h);
+    graphics_fill_rect(canvas_x - 2, canvas_y - 2,
+                       canvas_w + 4, canvas_h + 4, 0xFF555555);
+    for (int py = 0; py < PAINT_CANVAS_H; py++) {
+        int y0 = canvas_y + (py * canvas_h) / PAINT_CANVAS_H;
+        int y1 = canvas_y + ((py + 1) * canvas_h) / PAINT_CANVAS_H;
+        for (int px = 0; px < PAINT_CANVAS_W; px++) {
+            int x0 = canvas_x + (px * canvas_w) / PAINT_CANVAS_W;
+            int x1 = canvas_x + ((px + 1) * canvas_w) / PAINT_CANVAS_W;
+            graphics_fill_rect(x0, y0, x1 - x0, y1 - y0,
+                               w->state.paint.pixels[
+                                   py * PAINT_CANVAS_W + px]);
+            if (canvas_w >= PAINT_CANVAS_W * 5) {
+                graphics_fill_rect(x0, y0, x1 - x0, 1, 0xFFDDDDDD);
+                graphics_fill_rect(x0, y0, 1, y1 - y0, 0xFFDDDDDD);
             }
         }
     }
@@ -1944,30 +3475,61 @@ static void render_window(Window* w) {
         graphics_draw_string_scaled(cx+66, cy+128, "OPEN AI ASSISTANT", COL_BLACK, COL_BTN_FACE, 1);
     }
     else if (w->type == APP_NOTEPAD) {
-        draw_bevel_box(cx+2, cy+2, cw-4, ch-4, true);
-        graphics_fill_rect(cx+4, cy+4, cw-8, ch-8, COL_WHITE);
+        NotepadState* state = &w->state.notepad;
+        graphics_fill_rect(cx + 2, cy + 2, cw - 4, 38, 0xFFE0E0E0);
+        draw_string_bounded(cx + 8, cy + 10, cw - 160,
+                            state->filename,
+                            COL_BLACK, 0xFFE0E0E0, 1);
+        draw_string_bounded(
+            cx + 8, cy + 25, cw - 16, state->status,
+            text_contains_ci(state->status, "failed")
+                ? 0xFFAA0000
+                : state->dirty ? 0xFFAA5500 : 0xFF226622,
+            0xFFE0E0E0, 1);
+        draw_bevel_box(w->x + w->w - 70,
+                       w->y + WIN_CAPTION_H + 5, 58, 22, false);
+        graphics_draw_string_scaled(w->x + w->w - 58,
+                                    w->y + WIN_CAPTION_H + 12,
+                                    "SAVE", COL_BLACK, COL_BTN_FACE, 1);
+
+        int editor_y = cy + 42;
+        int editor_h = ch - 44;
+        draw_bevel_box(cx + 2, editor_y, cw - 4, editor_h, true);
+        graphics_fill_rect(cx + 4, editor_y + 2, cw - 8, editor_h - 4,
+                           COL_WHITE);
         int max_cols = (cw - 12) / 8;
-        int max_rows = (ch - 12) / 10;
+        int max_rows = (editor_h - 8) / 10;
+        if (max_cols < 1) max_cols = 1;
+        if (max_rows < 1) max_rows = 1;
+        int total_rows = wrapped_text_line_count(state->buffer, max_cols);
+        int first_row = total_rows > max_rows ? total_rows - max_rows : 0;
         int col = 0;
         int row = 0;
-        for (int i = 0; i < w->state.notepad.length && row < max_rows; i++) {
-            char c = w->state.notepad.buffer[i];
-            if (c == '\n' || col >= max_cols) {
+        for (int i = 0; i < state->length; i++) {
+            char c = state->buffer[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
                 row++;
                 col = 0;
-                if (c == '\n' || row >= max_rows) continue;
+                continue;
             }
-            graphics_draw_char(cx + 6 + col * 8, cy + 6 + row * 10,
-                               c, COL_BLACK, COL_WHITE);
-            col++;
-        }
-        if ((timer_get_ticks() / 15) % 2) {
             if (col >= max_cols) {
                 row++;
                 col = 0;
             }
-            if (row < max_rows)
-                graphics_fill_rect(cx + 6 + col * 8, cy + 6 + row * 10, 2, 10, COL_BLACK);
+            if (row >= first_row && row < first_row + max_rows) {
+                graphics_draw_char(cx + 6 + col * 8,
+                                   editor_y + 4 + (row - first_row) * 10,
+                                   c, COL_BLACK, COL_WHITE);
+            }
+            col++;
+        }
+        wrapped_text_cursor(state->buffer, max_cols, &row, &col);
+        if ((timer_get_ticks() / 15) % 2) {
+            if (row >= first_row && row < first_row + max_rows)
+                graphics_fill_rect(cx + 6 + col * 8,
+                                   editor_y + 4 + (row - first_row) * 10,
+                                   2, 10, COL_BLACK);
         }
     } 
     else if (w->type == APP_PAINT) {
@@ -1975,18 +3537,18 @@ static void render_window(Window* w) {
     }
     else if (w->type == APP_ABOUT) {
         graphics_draw_string_scaled(cx+20, cy+20, "NostaluxOS", COL_ACCENT, COL_WIN_BODY, 3);
-        graphics_draw_string_scaled(cx+20, cy+50, "Version 1.1", COL_BLACK, COL_WIN_BODY, 1);
-        graphics_draw_string_scaled(cx+20, cy+70, "(C) 2025 Retro Systems", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_draw_string_scaled(cx+20, cy+50, "Development build", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_draw_string_scaled(cx+20, cy+70, "Built by NostaluxOS contributors", COL_BLACK, COL_WIN_BODY, 1);
         
         draw_bevel_box(cx+10, cy+100, cw-20, 100, true);
         graphics_fill_rect(cx+12, cy+102, cw-24, 96, COL_WHITE);
         
         const char* credits[] = {
-            "Kernel: x86_64",
-            "GUI: Glass Window Manager",
-            "Features: Apps, Themes,", 
-            "Context Menu, Versions",
-            "Status: Active Development"
+            "Kernel: freestanding x86-64",
+            "Storage: ATA flat filesystem",
+            "Tasks: cooperative scheduler",
+            "Desktop: kernel-mode GUI",
+            "Status: active development"
         };
         for(int i=0; i<5; i++) {
             graphics_draw_string_scaled(cx+16, cy+106 + (i*14), credits[i], COL_BLACK, COL_WHITE, 1);
@@ -2149,23 +3711,69 @@ static void render_window(Window* w) {
                             state->status, 0xFF555555, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_BROWSER) {
-        draw_bevel_box(cx+2, cy+2, cw-40, 24, true);
-        graphics_fill_rect(cx+4, cy+4, cw-44, 20, COL_WHITE);
-        draw_string_bounded(cx+6, cy+8, cw-52, w->state.browser.url,
-                            COL_BLACK, COL_WHITE, 1);
-        draw_bevel_box(cx+cw-35, cy+2, 30, 24, false);
-        graphics_draw_string_scaled(cx+cw-28, cy+8, "GO", COL_BLACK, COL_BTN_FACE, 1);
-        
+        BrowserState* state = &w->state.browser;
+        int field_w = cw - 44;
+        uint32_t field_bg =
+            state->address_select_all ? 0xFF2255AA : COL_WHITE;
+        uint32_t field_fg =
+            state->address_select_all ? COL_WHITE : COL_BLACK;
+        draw_bevel_box(cx + 2, cy + 2, field_w, 24, true);
+        graphics_fill_rect(cx + 4, cy + 4, field_w - 4, 20, field_bg);
+        int address_chars = (field_w - 10) / 8;
+        int address_offset = state->address_len > address_chars
+                           ? state->address_len - address_chars : 0;
+        draw_string_bounded(cx + 7, cy + 9, field_w - 10,
+                            state->address + address_offset,
+                            field_fg, field_bg, 1);
+        if ((timer_get_ticks() / 15) % 2) {
+            int shown = state->address_len - address_offset;
+            graphics_fill_rect(cx + 7 + shown * 8, cy + 8,
+                               2, 11, field_fg);
+        }
+        draw_bevel_box(cx + cw - 38, cy + 2, 34, 24, false);
+        graphics_draw_string_scaled(cx + cw - 31, cy + 9, "GO",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+
         int content_y = cy + 30;
-        int content_h = ch - 32;
-        graphics_fill_rect(cx+2, content_y, cw-4, content_h, COL_WHITE);
-        graphics_draw_string_scaled(cx+10, content_y+10, "Nostalux Web Browser v1.0", 0xFF0000AA, COL_WHITE, 2);
-        graphics_draw_string_scaled(cx+10, content_y+40, "Status:", 0xFF555555, COL_WHITE, 1);
-        draw_string_bounded(cx+70, content_y+40, cw-82, w->state.browser.status,
-                            0xFF00AA00, COL_WHITE, 1);
-        draw_string_bounded(cx+10, content_y+70, cw-20,
-                            "Welcome to the future of browsing!",
-                            COL_BLACK, COL_WHITE, 1);
+        int content_h = ch - 60;
+        draw_bevel_box(cx + 2, content_y, cw - 4, content_h, true);
+        graphics_fill_rect(cx + 4, content_y + 2, cw - 8,
+                           content_h - 4, COL_WHITE);
+        int max_cols = browser_max_columns(w);
+        int visible_rows = browser_visible_rows(w);
+        int row = 0;
+        int column = 0;
+        for (int i = 0; state->content[i]; i++) {
+            char current = state->content[i];
+            if (current == '\r') continue;
+            if (current == '\n') {
+                row++;
+                column = 0;
+                continue;
+            }
+            if (column >= max_cols) {
+                row++;
+                column = 0;
+            }
+            if (row >= state->scroll &&
+                row < state->scroll + visible_rows) {
+                graphics_draw_char(cx + 10 + column * 8,
+                                   content_y + 6 +
+                                       (row - state->scroll) * 10,
+                                   current, COL_BLACK, COL_WHITE);
+            }
+            column++;
+        }
+
+        int button_y = cy + ch - 24;
+        draw_bevel_box(cx + 8, button_y, 42, 20, false);
+        graphics_draw_string_scaled(cx + 17, button_y + 6, "UP",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+        draw_bevel_box(cx + 56, button_y, 50, 20, false);
+        graphics_draw_string_scaled(cx + 63, button_y + 6, "DOWN",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+        draw_string_bounded(cx + 114, button_y + 6, cw - 122,
+                            state->status, 0xFF226622, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_TASKMGR) {
         int rows = taskmgr_visible_rows(w);
@@ -2203,9 +3811,12 @@ static void render_window(Window* w) {
             list_y += 20;
         }
 
-        draw_string_bounded(cx + 10, cy + ch - 38, cw - 20,
+        draw_string_bounded(cx + 10, cy + ch - 52, cw - 20,
                             "Desktop apps share the kernel/desktop task.",
                             0xFF555555, COL_WIN_BODY, 1);
+        draw_string_bounded(cx + 10, cy + ch - 38, cw - 20,
+                            w->state.taskmgr.status,
+                            0xFF225588, COL_WIN_BODY, 1);
 
         int button_y = cy + ch - 24;
         draw_bevel_box(cx + 10, button_y, 44, 20, false);
@@ -2213,6 +3824,9 @@ static void render_window(Window* w) {
                                     COL_BLACK, COL_BTN_FACE, 1);
         draw_bevel_box(cx + 60, button_y, 44, 20, false);
         graphics_draw_string_scaled(cx + 66, button_y + 6, "Next",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+        draw_bevel_box(cx + 110, button_y, 70, 20, false);
+        graphics_draw_string_scaled(cx + 116, button_y + 6, "End Task",
                                     COL_BLACK, COL_BTN_FACE, 1);
 
         char task_footer[64] = "Tasks ";
@@ -2227,7 +3841,7 @@ static void render_window(Window* w) {
         str_append(task_footer, sizeof(task_footer), " of ");
         uint64_to_str((uint64_t)total, task_number);
         str_append(task_footer, sizeof(task_footer), task_number);
-        draw_string_bounded(cx + 114, button_y + 6, cw - 124, task_footer,
+        draw_string_bounded(cx + 190, button_y + 6, cw - 200, task_footer,
                             0xFF555555, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_SYSMON) {
@@ -2259,7 +3873,7 @@ static void render_window(Window* w) {
             }
         }
 
-        char memory_label[64] = "Tracked RAM: ";
+        char memory_label[64] = "Kernel RAM: ";
         uint64_to_str((uint64_t)state->memory_used_kb, number);
         str_append(memory_label, sizeof(memory_label), number);
         str_append(memory_label, sizeof(memory_label), " / ");
@@ -2307,9 +3921,16 @@ static void render_window(Window* w) {
         graphics_draw_string_scaled(cx+20, cy+110,
                                     current_theme_idx == 0 ? "Ocean Glass" : "Retro Grey",
                                     COL_BLACK, COL_BTN_FACE, 1);
+        draw_string_bounded(cx + 10, cy + 150, cw - 20,
+                            w->state.settings.status,
+                            (text_contains_ci(w->state.settings.status, "failed") ||
+                             text_contains_ci(w->state.settings.status,
+                                              "session only"))
+                                ? 0xFFAA0000 : 0xFF226622,
+                            COL_WIN_BODY, 1);
     }
     else if (w->type == APP_RUN) {
-        graphics_draw_string_scaled(cx+12, cy+12, "Type an app command:", COL_BLACK, COL_WIN_BODY, 1);
+        graphics_draw_string_scaled(cx+12, cy+12, "App or shell command:", COL_BLACK, COL_WIN_BODY, 1);
         draw_bevel_box(cx+12, cy+32, cw-90, 26, true);
         graphics_fill_rect(cx+14, cy+34, cw-94, 22, COL_WHITE);
         draw_string_bounded(cx+18, cy+40, cw-104, w->state.run.cmd,
@@ -2317,32 +3938,67 @@ static void render_window(Window* w) {
         draw_bevel_box(cx+cw-66, cy+32, 54, 26, false);
         graphics_draw_string_scaled(cx+cw-53, cy+41, "RUN", COL_BLACK, COL_BTN_FACE, 1);
         draw_string_bounded(cx+12, cy+70, cw-24,
-                            "Try: ai, calc, term, paint, browser, mine, ttt, img",
+                            w->state.run.status[0]
+                                ? w->state.run.status
+                                : "Apps launch directly; other input runs in Terminal.",
                             0xFF555555, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_TERMINAL) {
+        TerminalState* state = &w->state.term;
         draw_bevel_box(cx+2, cy+2, cw-4, ch-4, true);
         graphics_fill_rect(cx+4, cy+4, cw-8, ch-8, COL_BLACK);
-        for(int i=0; i<6; i++)
-            draw_string_bounded(cx+6, cy+6+(i*10), cw-12,
-                                w->state.term.history[i], 0xFF00FF00, COL_BLACK, 1);
-        int input_y = cy+66;
-        graphics_draw_string_scaled(cx+6, input_y, w->state.term.prompt, 0xFF00FF00, COL_BLACK, 1);
-        int pw = kstrlen_local(w->state.term.prompt)*8;
+        int history_y = cy + 6;
+        int base_visible_lines = (ch - 26) / 10;
+        if (base_visible_lines < 1) base_visible_lines = 1;
+        if (base_visible_lines > GUI_TERM_LINES)
+            base_visible_lines = GUI_TERM_LINES;
+        int base_first = state->line_count > base_visible_lines
+                       ? state->line_count - base_visible_lines : 0;
+        bool has_hidden_history =
+            state->history_truncated || base_first > 0;
+        int history_notice_h = has_hidden_history ? 10 : 0;
+        if (has_hidden_history) {
+            draw_string_bounded(cx + 6, history_y, cw - 12,
+                                state->history_truncated
+                                    ? "[older terminal lines discarded]"
+                                    : "[more terminal lines above]",
+                                0xFFFFAA00, COL_BLACK, 1);
+        }
+        int visible_lines = (ch - 26 - history_notice_h) / 10;
+        if (visible_lines < 1) visible_lines = 1;
+        if (visible_lines > GUI_TERM_LINES) visible_lines = GUI_TERM_LINES;
+        int first = state->line_count > visible_lines
+                  ? state->line_count - visible_lines : 0;
+        int row = 0;
+        for (int i = first; i < state->line_count; i++, row++) {
+            draw_string_bounded(cx + 6,
+                                history_y + history_notice_h + row * 10,
+                                cw - 12,
+                                state->lines[i], 0xFF00FF00, COL_BLACK, 1);
+        }
+        int input_y = cy + ch - 16;
+        graphics_draw_string_scaled(cx+6, input_y, "$ ", 0xFF00FF00, COL_BLACK, 1);
+        int pw = 16;
         int input_chars = (cw - 12 - pw) / 8;
         if (input_chars < 1) input_chars = 1;
-        int input_offset = w->state.term.input_len > input_chars
-                         ? w->state.term.input_len - input_chars : 0;
+        int input_offset = state->input_len > input_chars
+                         ? state->input_len - input_chars : 0;
         draw_string_bounded(cx+6+pw, input_y, cw-12-pw,
-                            w->state.term.input + input_offset,
+                            state->input + input_offset,
                             COL_WHITE, COL_BLACK, 1);
         if ((timer_get_ticks()/15)%2) {
-            int shown = w->state.term.input_len - input_offset;
+            int shown = state->input_len - input_offset;
             graphics_fill_rect(cx+6+pw+(shown*8), input_y, 2, 8, 0xFF00FF00);
         }
     }
     else if (w->type == APP_CALC) {
-        char buf[16]; int_to_str(w->state.calc.current_val, buf);
+        char buf[16];
+        if (w->state.calc.error_code == CALC_ERROR_DIV_ZERO)
+            str_copy(buf, sizeof(buf), "DIV/0");
+        else if (w->state.calc.error_code == CALC_ERROR_OVERFLOW)
+            str_copy(buf, sizeof(buf), "OVERFLOW");
+        else
+            int_to_str(w->state.calc.current_val, buf);
         draw_bevel_box(cx+10, cy+10, cw-20, 24, true);
         graphics_fill_rect(cx+12, cy+12, cw-24, 20, COL_WHITE);
         graphics_draw_string_scaled(cx+cw-14-(kstrlen_local(buf)*8), cy+16, buf, COL_BLACK, COL_WHITE, 1);
@@ -2356,22 +4012,75 @@ static void render_window(Window* w) {
         }
     }
     else if (w->type == APP_FILES) {
+        FileManagerState* state = &w->state.files;
+        files_normalize(w);
         draw_bevel_box(cx+2, cy+2, cw-4, ch-4, true);
         graphics_fill_rect(cx+4, cy+4, cw-8, ch-8, COL_WHITE);
-        graphics_fill_rect(cx+4, cy+4, cw-8, 18, 0xFFCCCCCC);
-        graphics_draw_string_scaled(cx+8, cy+8, "Name", COL_BLACK, 0xFFCCCCCC, 1);
+        const char* toolbar_labels[] = {
+            "New", "Open", "Rename", "Delete", "Up", "Down"
+        };
+        int toolbar_x[] = {
+            cx + 6, cx + 48, cx + 94, cx + 152, cx + 206, cx + 242
+        };
+        int toolbar_w[] = {38, 42, 54, 50, 32, 42};
+        for (int i = 0; i < 6; i++) {
+            draw_bevel_box(toolbar_x[i], cy + 4, toolbar_w[i], 22, false);
+            graphics_draw_string_scaled(toolbar_x[i] + 5, cy + 11,
+                                        toolbar_labels[i],
+                                        COL_BLACK, COL_BTN_FACE, 1);
+        }
+
+        graphics_fill_rect(cx + 4, cy + 32, cw - 8, 18, 0xFFCCCCCC);
+        graphics_draw_string_scaled(cx + 8, cy + 37, "Name",
+                                    COL_BLACK, 0xFFCCCCCC, 1);
+        graphics_draw_string_scaled(cx + cw - 58, cy + 37, "Bytes",
+                                    COL_BLACK, 0xFFCCCCCC, 1);
         size_t count = fs_file_count();
-        for (size_t i=0; i<count; i++) {
-            const struct fs_file* f = fs_file_at(i); if(!f) continue;
-            int ry = cy+24 + i*18;
-            if (ry + 18 > w->y + w->h - 4) break;
-            bool sel = ((int)i == w->state.files.selected_index);
-            if (sel) graphics_fill_rect(cx+4, ry, cw-8, 18, 0xFF000080);
-            draw_string_bounded(cx+20, ry+4, cw-90, f->name,
-                                sel?COL_WHITE:COL_BLACK,
-                                sel?0xFF000080:COL_WHITE, 1);
-            char sz[16]; int_to_str((int)f->size, sz);
-            graphics_draw_string_scaled(cx+cw-60, ry+4, sz, sel?COL_WHITE:COL_BLACK, sel?0xFF000080:COL_WHITE, 1);
+        int rows = files_visible_rows(w);
+        for (int row_index = 0; row_index < rows; row_index++) {
+            int file_index = state->scroll_offset + row_index;
+            if (file_index >= (int)count) break;
+            const struct fs_file* file = fs_file_at((size_t)file_index);
+            if (!file) continue;
+            int row_y = cy + 52 + row_index * 18;
+            bool selected = file_index == state->selected_index;
+            uint32_t row_bg = selected ? 0xFF000080 : COL_WHITE;
+            if (selected)
+                graphics_fill_rect(cx + 4, row_y, cw - 8, 18, row_bg);
+            draw_string_bounded(cx + 10, row_y + 5, cw - 82, file->name,
+                                selected ? COL_WHITE : COL_BLACK,
+                                row_bg, 1);
+            char size_label[16];
+            int_to_str((int)file->size, size_label);
+            draw_string_bounded(cx + cw - 58, row_y + 5, 50, size_label,
+                                selected ? COL_WHITE : COL_BLACK,
+                                row_bg, 1);
+        }
+
+        int footer_y = cy + ch - 24;
+        if (state->renaming) {
+            uint32_t rename_bg =
+                state->rename_select_all ? 0xFF2255AA : COL_WHITE;
+            uint32_t rename_fg =
+                state->rename_select_all ? COL_WHITE : COL_BLACK;
+            draw_bevel_box(cx + 6, footer_y, 170, 20, true);
+            graphics_fill_rect(cx + 8, footer_y + 2, 166, 16, rename_bg);
+            draw_string_bounded(cx + 10, footer_y + 6, 160,
+                                state->rename_buffer,
+                                rename_fg, rename_bg, 1);
+            draw_string_bounded(cx + 184, footer_y + 6, cw - 192,
+                                "Enter saves; Esc cancels",
+                                0xFF555555, COL_WHITE, 1);
+        } else {
+            draw_string_bounded(cx + 8, footer_y + 6, cw - 80,
+                                state->status,
+                                0xFF225588, COL_WHITE, 1);
+            char page_label[48] = "Files ";
+            char number[16];
+            int_to_str((int)count, number);
+            str_append(page_label, sizeof(page_label), number);
+            draw_string_bounded(cx + cw - 72, footer_y + 6, 64,
+                                page_label, 0xFF555555, COL_WHITE, 1);
         }
     }
 
@@ -2461,6 +4170,30 @@ static void render_desktop(void) {
     }
 
     render_taskbar();
+
+    uint64_t notice_now = timer_get_ticks();
+    if (g_desktop_notice[0] && notice_now < g_desktop_notice_until) {
+        int max_notice_w = screen_w - 20;
+        if (max_notice_w >= 24) {
+            int notice_w = kstrlen_local(g_desktop_notice) * 8 + 20;
+            if (notice_w > max_notice_w) notice_w = max_notice_w;
+            if (notice_w < 80 && max_notice_w >= 80) notice_w = 80;
+            int notice_x = (screen_w - notice_w) / 2;
+            int notice_y = screen_h - TASKBAR_H - 32;
+            if (notice_y < 2) notice_y = 2;
+            graphics_fill_rect(notice_x + 2, notice_y + 2,
+                               notice_w, 24, 0xFF101010);
+            graphics_fill_rect(notice_x, notice_y,
+                               notice_w, 24, 0xFF303030);
+            graphics_fill_rect(notice_x, notice_y,
+                               notice_w, 2, COL_ACCENT);
+            draw_string_bounded(notice_x + 10, notice_y + 8,
+                                notice_w - 20, g_desktop_notice,
+                                COL_WHITE, 0xFF303030, 1);
+        }
+    } else if (g_desktop_notice[0]) {
+        g_desktop_notice[0] = 0;
+    }
     
     // Draw Context Menu on top of everything
     render_context_menu();
@@ -2608,6 +4341,7 @@ static void on_click(int x, int y) {
                     return;
                 }
                 if (w->type == APP_PAINT) handle_paint_click(w, x, y);
+                if (w->type == APP_NOTEPAD) handle_notepad_click(w, x, y);
                 if (w->type == APP_SETTINGS) handle_settings_click(w, x, y);
                 if (w->type == APP_FILES) handle_files_click(w, x, y);
                 if (w->type == APP_BROWSER) handle_browser_click(w, x, y);
@@ -2637,7 +4371,7 @@ static void on_click(int x, int y) {
     
     struct { int x, y; const char* n; AppType t; } icons[] = {
         {20, 20, "Terminal", APP_TERMINAL}, {20, 90, "Files", APP_FILES},
-        {20, 160, "Paint", APP_PAINT}, {20, 230, "Browser", APP_BROWSER},
+        {20, 160, "Paint", APP_PAINT}, {20, 230, "Local Browser", APP_BROWSER},
         {20, 300, "Calc", APP_CALC}, {20, 370, "Task Mgr", APP_TASKMGR},
         {20, 440, "Settings", APP_SETTINGS}, {100, 20, "Tic-Tac-Toe", APP_TICTACTOE},
         {100, 90, "ImageView", APP_IMAGEVIEW}, {100, 160, "About", APP_ABOUT},
@@ -2664,27 +4398,97 @@ void gui_demo_run(void) {
     start_menu_open = false;
     g_desktop_shown_mode = false;
     g_ctx_menu.active = false;
+    g_desktop_notice[0] = '\0';
+    g_desktop_notice_until = 0;
+    settings_load();
     create_window(APP_WELCOME, "Welcome", 350, 200);
 
-    while(g_gui_running) {
+    bool desktop_exit_ready = false;
+    while (!desktop_exit_ready) {
+      while(g_gui_running) {
         desktop_yield();
         char c = keyboard_poll_char();
-        if (c == 27) break; 
         Window* top = get_top_window();
+        if (c == 27) {
+            if (top && top->type == APP_FILES &&
+                top->state.files.renaming) {
+                top->state.files.renaming = false;
+                str_copy(top->state.files.status,
+                         sizeof(top->state.files.status),
+                         "Rename cancelled.");
+                c = 0;
+            } else {
+                break;
+            }
+        }
         if (c && top && top->focused) {
-            if(top->type == APP_TERMINAL) handle_terminal_input(top, c);
+            if (top->type == APP_FILES && top->state.files.renaming) {
+                FileManagerState* state = &top->state.files;
+                if (c == '\n') {
+                    files_commit_rename(top);
+                } else if (c == '\b') {
+                    if (state->rename_select_all) {
+                        state->rename_buffer[0] = 0;
+                        state->rename_length = 0;
+                        state->rename_select_all = false;
+                    } else if (state->rename_length > 0) {
+                        state->rename_buffer[--state->rename_length] = 0;
+                    }
+                } else if (c >= 33 && c <= 126 &&
+                           c != '/' && c != '\\' &&
+                           (state->rename_select_all ||
+                            state->rename_length <
+                                (int)sizeof(state->rename_buffer) - 1)) {
+                    if (state->rename_select_all) {
+                        state->rename_buffer[0] = 0;
+                        state->rename_length = 0;
+                        state->rename_select_all = false;
+                    }
+                    if (state->rename_length <
+                        (int)sizeof(state->rename_buffer) - 1) {
+                        state->rename_buffer[state->rename_length++] = c;
+                        state->rename_buffer[state->rename_length] = 0;
+                    }
+                }
+            }
+            else if(top->type == APP_TERMINAL) handle_terminal_input(top, c);
             else if(top->type == APP_BROWSER) handle_browser_input(top, c);
             else if(top->type == APP_ASSISTANT) handle_assistant_input(top, c);
             else if(top->type == APP_RUN) {
                 RunState* r = &top->state.run;
                 if (c == '\n') handle_run_command(top);
                 else if (c == '\b') { if(r->len>0) r->cmd[--r->len]=0; }
-                else if (r->len < 30) { r->cmd[r->len++]=c; r->cmd[r->len]=0; }
+                else if (c >= 32 && c <= 126 &&
+                         r->len < (int)sizeof(r->cmd) - 1) {
+                    r->cmd[r->len++]=c; r->cmd[r->len]=0;
+                }
             }
             else if (top->type == APP_NOTEPAD) {
                 NotepadState* ns = &top->state.notepad;
-                if (c == '\b') { if (ns->length > 0) ns->buffer[--ns->length] = 0; }
-                else if (c >= 32 && c <= 126 && ns->length < 510) { ns->buffer[ns->length++] = c; ns->buffer[ns->length] = 0; }
+                bool edited = false;
+                if (c == '\b') {
+                    if (ns->length > 0) {
+                        ns->buffer[--ns->length] = 0;
+                        ns->dirty = true;
+                        ns->discard_deadline = 0;
+                        cancel_exit_discard_confirmation();
+                        edited = true;
+                    }
+                } else if ((c == '\n' || (c >= 32 && c <= 126)) &&
+                           ns->length < (int)sizeof(ns->buffer) - 1) {
+                    ns->buffer[ns->length++] = c;
+                    ns->buffer[ns->length] = 0;
+                    ns->dirty = true;
+                    ns->discard_deadline = 0;
+                    cancel_exit_discard_confirmation();
+                    edited = true;
+                } else if (c == '\n' || (c >= 32 && c <= 126)) {
+                    str_copy(ns->status, sizeof(ns->status),
+                             "File full: maximum 1,023 bytes.");
+                }
+                if (edited)
+                    str_copy(ns->status, sizeof(ns->status),
+                             "Unsaved changes.");
             }
         }
 
@@ -2712,11 +4516,13 @@ void gui_demo_run(void) {
                 if (nh > max_h) nh = max_h;
                 top->w = nw;
                 top->h = nh;
-            } else if (top->type == APP_PAINT &&
-                       rect_contains(top->x + 6, top->y + WIN_CAPTION_H + 46,
-                                     top->w - 12, top->h - WIN_CAPTION_H - 52,
-                                     mouse.x, mouse.y)) {
-                handle_paint_click(top, mouse.x, mouse.y);
+            } else if (top->type == APP_PAINT) {
+                int canvas_x, canvas_y, canvas_w, canvas_h;
+                paint_canvas_rect(top, &canvas_x, &canvas_y,
+                                  &canvas_w, &canvas_h);
+                if (rect_contains(canvas_x, canvas_y, canvas_w, canvas_h,
+                                  mouse.x, mouse.y))
+                    handle_paint_click(top, mouse.x, mouse.y);
             }
         }
         
@@ -2735,7 +4541,7 @@ void gui_demo_run(void) {
             windows[i]->resizing = false;
         }
 
-        // Fixed: Added SysMon update logic
+        // Refresh live System Monitor samples while its window is open.
         for(int i=0; i<MAX_WINDOWS; i++) {
             if(windows[i] && windows[i]->type == APP_SYSMON) {
                  update_sysmon(windows[i]);
@@ -2744,9 +4550,20 @@ void gui_demo_run(void) {
 
         render_desktop();
         graphics_swap_buffer();
+      }
+      if (desktop_save_all()) {
+          desktop_exit_ready = true;
+      } else {
+          g_gui_running = true;
+      }
     }
     
-    while (windows[0]) close_window(0);
+    while (windows[0]) {
+        if (!close_window(0)) {
+            desktop_log("GUI: unexpected clean-window close failure");
+            break;
+        }
+    }
     graphics_disable_double_buffer();
     g_gui_running = false;
 }

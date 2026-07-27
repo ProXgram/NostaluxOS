@@ -27,6 +27,11 @@ struct shell_command {
     const char* name;
     void (*handler)(const char* args);
     const char* description;
+    unsigned int flags;
+};
+
+enum {
+    SHELL_COMMAND_CONSOLE_ONLY = 1u << 0,
 };
 
 static void shell_print_banner(void);
@@ -59,36 +64,38 @@ static void command_beep(const char* args);
 static void command_disktest(const char* args);
 static void command_banner(const char* args);
 static void command_gui(const char* args);
+static void command_palette(const char* args);
 
 static const struct shell_command COMMANDS[] = {
-    {"help", command_help, "Show this help message"},
-    {"about", command_about, "Learn more about " OS_NAME},
-    {"clear", command_clear, "Clear the screen"},
-    {"banner", command_banner, "Show moving banner screensaver"},
-    {"gui", command_gui, "Launch graphical desktop"},
-    {"time", command_time, "Show current RTC date/time"},
-    {"uptime", command_uptime, "Show time since boot"},  
-    {"sleep", command_sleep, "Pause for N seconds"},     
-    {"calc", command_calc, "Simple math (e.g. 'calc 10 + 5')"},
-    {"foreground", command_foreground, "Set text color"},
-    {"background", command_background, "Set background color"},
-    {"ls", command_ls, "List files and usage stats"},
-    {"cat", command_cat, "Print a file's text content"},
-    {"hexdump", command_hexdump, "View file content in hex"},
-    {"touch", command_touch, "Create an empty file"},
-    {"write", command_write, "Overwrite a file with new text"},
-    {"append", command_append, "Append text to a file"},
-    {"rm", command_rm, "Remove a file"},
-    {"history", command_history, "Show recent commands"},
-    {"sysinfo", command_sysinfo, "Display hardware info"},
-    {"memtest", command_memtest, "Run memory diagnostics"},
-    {"logs", command_logs, "Show system logs"},
-    {"echo", command_echo, "Display text back to you"},
-    {"snake", command_snake, "Play the Snake game"},
-    {"beep", command_beep, "Test PC Speaker"},
-    {"disktest", command_disktest, "Detect the primary ATA drive"},
-    {"reboot", command_reboot, "Restart the system"},
-    {"shutdown", command_shutdown, "Power off the system"},
+    {"help", command_help, "Show this help message", 0},
+    {"about", command_about, "Learn more about " OS_NAME, 0},
+    {"clear", command_clear, "Clear the screen", SHELL_COMMAND_CONSOLE_ONLY},
+    {"banner", command_banner, "Show moving banner screensaver", SHELL_COMMAND_CONSOLE_ONLY},
+    {"gui", command_gui, "Launch graphical desktop", SHELL_COMMAND_CONSOLE_ONLY},
+    {"time", command_time, "Show current RTC date/time", 0},
+    {"uptime", command_uptime, "Show time since boot", 0},
+    {"sleep", command_sleep, "Pause for N seconds", SHELL_COMMAND_CONSOLE_ONLY},
+    {"calc", command_calc, "Simple math (e.g. 'calc 10 + 5')", 0},
+    {"foreground", command_foreground, "Set text color", SHELL_COMMAND_CONSOLE_ONLY},
+    {"background", command_background, "Set background color", SHELL_COMMAND_CONSOLE_ONLY},
+    {"palette", command_palette, "Preview IBM PC color swatches", 0},
+    {"ls", command_ls, "List files and usage stats", 0},
+    {"cat", command_cat, "Print a file's text content", 0},
+    {"hexdump", command_hexdump, "View file content in hex", 0},
+    {"touch", command_touch, "Create an empty file", 0},
+    {"write", command_write, "Overwrite a file with new text", 0},
+    {"append", command_append, "Append text to a file", 0},
+    {"rm", command_rm, "Remove a file", 0},
+    {"history", command_history, "Show recent commands", 0},
+    {"sysinfo", command_sysinfo, "Display hardware info", 0},
+    {"memtest", command_memtest, "Test a reserved 64 KB RAM sample", 0},
+    {"logs", command_logs, "Show system logs", 0},
+    {"echo", command_echo, "Display text back to you", 0},
+    {"snake", command_snake, "Play the Snake game", SHELL_COMMAND_CONSOLE_ONLY},
+    {"beep", command_beep, "Test PC Speaker", SHELL_COMMAND_CONSOLE_ONLY},
+    {"disktest", command_disktest, "Detect the primary ATA drive", 0},
+    {"reboot", command_reboot, "Restart the system", SHELL_COMMAND_CONSOLE_ONLY},
+    {"shutdown", command_shutdown, "Power off the system", SHELL_COMMAND_CONSOLE_ONLY},
 };
 #define COMMAND_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
 #define INPUT_CAPACITY 128
@@ -208,7 +215,37 @@ static void command_help(const char* args) {
         kprintf("  %s", COMMANDS[i].name);
         size_t len = kstrlen(COMMANDS[i].name);
         while (len++ < 12) terminal_write_char(' ');
-        kprintf("- %s\n", COMMANDS[i].description);
+        kprintf("- %s", COMMANDS[i].description);
+        if (terminal_capture_active() &&
+            (COMMANDS[i].flags & SHELL_COMMAND_CONSOLE_ONLY) != 0) {
+            kprintf(" [console only]");
+        }
+        terminal_newline();
+    }
+}
+
+static void command_palette(const char* args) {
+    if (*kskip_spaces(args) != '\0') {
+        kprintf("Usage: palette\n");
+        return;
+    }
+
+    uint8_t old_fg = 0;
+    uint8_t old_bg = 0;
+    terminal_getcolors(&old_fg, &old_bg);
+    kprintf("IBM PC palette:\n");
+
+    for (unsigned int i = 0; i < 16; i++) {
+        if (terminal_capture_active()) {
+            kprintf("[%2u] %s\n", i, COLOR_NAMES[i]);
+            continue;
+        }
+
+        uint8_t swatch_fg = (i < 8) ? 15 : 0;
+        terminal_setcolors(swatch_fg, (uint8_t)i);
+        terminal_writestring("    ");
+        terminal_setcolors(old_fg, old_bg);
+        kprintf(" %2u - %s\n", i, COLOR_NAMES[i]);
     }
 }
 
@@ -245,8 +282,20 @@ static void command_ls(const char* args) {
 static void command_cat(const char* args) {
     const char* name = kskip_spaces(args);
     const struct fs_file* f = fs_find(name);
-    if (f) { terminal_write(f->data, f->size); terminal_newline(); }
-    else kprintf("File not found.\n");
+    if (!f) {
+        kprintf("File not found.\n");
+        return;
+    }
+    for (size_t i = 0; i < f->size; i++) {
+        unsigned char c = (unsigned char)f->data[i];
+        if (c == '\n' || c == '\r' || c == '\t') continue;
+        if (c < 32 || c > 126) {
+            kprintf("Binary file; use hexdump %s instead.\n", f->name);
+            return;
+        }
+    }
+    terminal_write(f->data, f->size);
+    terminal_newline();
 }
 
 static void command_hexdump(const char* args) {
@@ -262,8 +311,13 @@ static void command_hexdump(const char* args) {
 
 static void command_touch(const char* args) {
     const char* name = kskip_spaces(args);
-    if(fs_touch(name)) kprintf("Created %s\n", name);
-    else kprintf("Failed.\n");
+    bool existed = fs_find(name) != NULL;
+    if (fs_touch(name)) {
+        if (existed) kprintf("Already exists: %s\n", name);
+        else kprintf("Created %s\n", name);
+    } else {
+        kprintf("Failed.\n");
+    }
 }
 
 static void command_write(const char* args) {
@@ -418,11 +472,63 @@ static void execute_command(const char* input) {
 
     for (size_t j = 0; j < COMMAND_COUNT; j++) {
         if (kstrcmp(cmd_name, COMMANDS[j].name) == 0) {
+            if (terminal_capture_active() &&
+                (COMMANDS[j].flags & SHELL_COMMAND_CONSOLE_ONLY) != 0) {
+                kprintf("Command '%s' is unavailable in the desktop terminal; "
+                        "it requires exclusive console control or would "
+                        "block or stop the desktop.\n",
+                        COMMANDS[j].name);
+                return;
+            }
             COMMANDS[j].handler(args);
             return;
         }
     }
     kprintf("Unknown command.\n");
+}
+
+bool shell_execute_capture(const char* command_line,
+                           char* output,
+                           size_t output_capacity,
+                           size_t* output_length,
+                           bool* truncated) {
+    if (output_length != NULL) *output_length = 0;
+    if (truncated != NULL) *truncated = false;
+    if (command_line == NULL || output == NULL || output_capacity == 0) {
+        return false;
+    }
+
+    /*
+     * Match the interactive shell's input limit and copy before clearing the
+     * output buffer, so callers may safely reuse one buffer for input/output.
+     */
+    char input[INPUT_CAPACITY];
+    size_t input_length = 0;
+    while (input_length + 1 < sizeof(input) &&
+           command_line[input_length] != '\0') {
+        input[input_length] = command_line[input_length];
+        input_length++;
+    }
+    input[input_length] = '\0';
+    bool input_too_long = command_line[input_length] != '\0';
+
+    if (!terminal_capture_begin(output, output_capacity)) {
+        output[0] = '\0';
+        return false;
+    }
+
+    if (input_too_long) {
+        kprintf("Command line is too long (maximum %u characters).\n",
+                (unsigned int)(INPUT_CAPACITY - 1));
+    } else {
+        execute_command(input);
+    }
+
+    bool was_truncated = false;
+    size_t length = terminal_capture_end(&was_truncated);
+    if (output_length != NULL) *output_length = length;
+    if (truncated != NULL) *truncated = was_truncated;
+    return true;
 }
 
 void shell_run(void) {

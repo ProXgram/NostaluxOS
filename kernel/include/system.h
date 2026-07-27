@@ -3,6 +3,13 @@
 
 #include <stdint.h>
 
+/*
+ * Physical addresses below 8 MiB contain the loader, kernel image, stacks,
+ * page tables, and other boot-time structures. The heap starts immediately
+ * after this reserved region.
+ */
+#define SYSTEM_RESERVED_LOW_MEMORY_BYTES 0x00800000ull
+
 struct e820_entry {
     uint64_t base;
     uint64_t length;

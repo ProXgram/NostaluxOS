@@ -157,10 +157,92 @@ static void test_rejections(void) {
     expect_rejected(bmp);
 }
 
+static void test_encode_round_trip(void) {
+    const uint32_t pixels[6] = {
+        0x80FF0000u, 0x0000FF00u, 0xDEADBEEFu,
+        0xFF0000FFu, 0x00FFFFFFu, 0xCAFEBABEu,
+    };
+    uint8_t bmp[TEST_BMP_SIZE];
+    struct bmp_image image;
+    size_t encoded_size = 123u;
+
+    memset(bmp, 0xA5, sizeof(bmp));
+    assert(bmp_encode_rgb24(pixels, 2u, 2u, 3u, bmp, sizeof(bmp),
+                            &encoded_size));
+    assert(encoded_size == TEST_BMP_SIZE);
+    assert(bmp[0] == 'B' && bmp[1] == 'M');
+    assert(bmp[54] == 0xFFu && bmp[55] == 0x00u && bmp[56] == 0x00u);
+    assert(bmp[57] == 0xFFu && bmp[58] == 0xFFu && bmp[59] == 0xFFu);
+    assert(bmp[60] == 0u && bmp[61] == 0u);
+    assert(bmp[62] == 0x00u && bmp[63] == 0x00u && bmp[64] == 0xFFu);
+    assert(bmp[65] == 0x00u && bmp[66] == 0xFFu && bmp[67] == 0x00u);
+    assert(bmp[68] == 0u && bmp[69] == 0u);
+
+    assert(bmp_open(bmp, encoded_size, &image));
+    assert(!image.top_down);
+    expect_pixel(&image, 0u, 0u, 0xFFFF0000u);
+    expect_pixel(&image, 1u, 0u, 0xFF00FF00u);
+    expect_pixel(&image, 0u, 1u, 0xFF0000FFu);
+    expect_pixel(&image, 1u, 1u, 0xFFFFFFFFu);
+}
+
+static void test_encode_17_by_17(void) {
+    uint32_t pixels[17u * 17u];
+    uint8_t bmp[938u];
+    struct bmp_image image;
+    size_t encoded_size = 0;
+
+    for (size_t i = 0; i < sizeof(pixels) / sizeof(pixels[0]); i++) {
+        pixels[i] = (uint32_t)i * 0x010101u;
+    }
+    assert(bmp_encode_rgb24(pixels, 17u, 17u, 17u, bmp, sizeof(bmp),
+                            &encoded_size));
+    assert(encoded_size == 938u);
+    assert(encoded_size < 1024u);
+    assert(bmp_open(bmp, encoded_size, &image));
+    assert(image.width == 17u && image.height == 17u);
+    expect_pixel(&image, 0u, 0u, 0xFF000000u);
+}
+
+static void test_encode_rejections(void) {
+    uint32_t pixels[4] = {0};
+    uint8_t bmp[TEST_BMP_SIZE];
+    uint8_t original[TEST_BMP_SIZE];
+    size_t encoded_size = 99u;
+
+    memset(bmp, 0x5Au, sizeof(bmp));
+    memcpy(original, bmp, sizeof(bmp));
+    assert(!bmp_encode_rgb24(pixels, 2u, 2u, 2u, bmp,
+                             TEST_BMP_SIZE - 1u, &encoded_size));
+    assert(encoded_size == 0u);
+    assert(memcmp(bmp, original, sizeof(bmp)) == 0);
+
+    encoded_size = 99u;
+    assert(!bmp_encode_rgb24(NULL, 2u, 2u, 2u, bmp, sizeof(bmp),
+                             &encoded_size));
+    assert(encoded_size == 0u);
+    assert(!bmp_encode_rgb24(pixels, 2u, 2u, 2u, NULL, sizeof(bmp),
+                             &encoded_size));
+    assert(!bmp_encode_rgb24(pixels, 0u, 2u, 2u, bmp, sizeof(bmp),
+                             &encoded_size));
+    assert(!bmp_encode_rgb24(pixels, 2u, 0u, 2u, bmp, sizeof(bmp),
+                             &encoded_size));
+    assert(!bmp_encode_rgb24(pixels, 2u, 2u, 1u, bmp, sizeof(bmp),
+                             &encoded_size));
+    assert(!bmp_encode_rgb24(pixels, 2u, 2u, 2u, bmp, sizeof(bmp), NULL));
+    assert(!bmp_encode_rgb24(pixels, UINT32_MAX, 1u, UINT32_MAX, bmp,
+                             sizeof(bmp), &encoded_size));
+    assert(!bmp_encode_rgb24(pixels, 1u, UINT32_MAX, SIZE_MAX, bmp,
+                             sizeof(bmp), &encoded_size));
+}
+
 int main(void) {
     test_bottom_up();
     test_top_down();
     test_rejections();
+    test_encode_round_trip();
+    test_encode_17_by_17();
+    test_encode_rejections();
     puts("bmp tests passed");
     return 0;
 }

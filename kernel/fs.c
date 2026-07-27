@@ -263,6 +263,7 @@ static bool fs_is_valid_name(const char* name) {
 }
 
 static void fs_copy_name(struct fs_file* file, const char* name) {
+    if (file == NULL || name == NULL) return;
     size_t i = 0;
     while (name[i] != '\0' && i + 1 < FS_MAX_FILENAME) {
         file->name[i] = name[i];
@@ -562,6 +563,30 @@ bool fs_append(const char* name, const char* contents) {
     return true;
 }
 
+bool fs_rename(const char* old_name, const char* new_name) {
+    if (!fs_is_valid_name(old_name) || !fs_is_valid_name(new_name))
+        return false;
+
+    struct fs_file* file = fs_find_mutable(old_name);
+    if (file == NULL) return false;
+    if (kstrcmp(old_name, new_name) == 0) return true;
+    if (fs_find_mutable(new_name) != NULL) return false;
+
+    char previous_name[FS_MAX_FILENAME];
+    size_t i = 0;
+    while (file->name[i] != '\0' && i + 1 < sizeof(previous_name)) {
+        previous_name[i] = file->name[i];
+        i++;
+    }
+    previous_name[i] = '\0';
+    fs_copy_name(file, new_name);
+    if (!fs_sync_to_disk()) {
+        fs_copy_name(file, previous_name);
+        return false;
+    }
+    return true;
+}
+
 bool fs_remove(const char* name) {
     struct fs_file* file = fs_find_mutable(name);
     if (file == NULL) return false;
@@ -577,8 +602,11 @@ bool fs_remove(const char* name) {
 
 static void fs_self_test(void) {
     const char* scratch = "__fs_self_test__";
+    const char* renamed = "__fs_self_renamed__";
     const uint8_t binary[] = {0x42u, 0x00u, 0x4Du, 0xFFu};
     struct fs_file* f = fs_find_mutable(scratch);
+    if (f) fs_clear(f);
+    f = fs_find_mutable(renamed);
     if (f) fs_clear(f);
     
     if (!fs_write_bytes(scratch, binary, sizeof(binary))) {
@@ -596,7 +624,23 @@ static void fs_self_test(void) {
         return;
     }
     
-    if (!fs_remove(scratch)) {
+    if (!fs_rename(scratch, renamed) ||
+        fs_find_mutable(scratch) != NULL) {
+        syslog_write("FS: self-test (rename) failed");
+        return;
+    }
+
+    f = fs_find_mutable(renamed);
+    if (f == NULL || f->size != sizeof(binary) ||
+        (uint8_t)f->data[0] != binary[0] ||
+        (uint8_t)f->data[1] != binary[1] ||
+        (uint8_t)f->data[2] != binary[2] ||
+        (uint8_t)f->data[3] != binary[3]) {
+        syslog_write("FS: self-test (renamed read) failed");
+        return;
+    }
+
+    if (!fs_remove(renamed)) {
         syslog_write("FS: self-test (remove) failed");
         return;
     }

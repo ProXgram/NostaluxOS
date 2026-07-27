@@ -9,21 +9,30 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
   64-bit long mode.
 - **VBE framebuffer console** — the loader selects an 800x600, 32-bit VBE mode. The text console and desktop are
   rendered into that linear framebuffer; this is not a VGA text-mode interface.
-- **Interactive shell** — `help` lists commands for system information, colors, history, arithmetic, files, memory
-  diagnostics, games, sound, reboot, shutdown, and launching the GUI.
+- **Interactive shell** — `help` lists commands for system information, colors, history, arithmetic, files, a
+  non-destructive 64 KB memory sample, games, sound, reboot, shutdown, and launching the GUI.
 - **Persistent flat filesystem** — `ls`, `cat`, `hexdump`, `touch`, `write`, `append`, and `rm` operate on a small
   ATA-backed filesystem stored inside the raw disk image.
 - **Graphical desktop** — `gui` opens movable and resizable windows, a Start menu, taskbar, Files, Paint, Notepad,
   Calculator, settings, monitors, games, and other retro desktop apps.
-- **Kernel-backed diagnostics** — System Monitor graphs measured CPU busy time and tracked memory use, while Task
-  Manager enumerates the cooperative scheduler's real kernel tasks rather than treating windows as processes.
+- **Writable desktop apps** — Files creates, opens, renames, and deletes persistent files. Notepad edits and saves
+  text files, while Paint saves its 17x17 canvas as a real 24-bit BMP that Image Viewer can reopen.
+- **Shell-backed GUI Terminal** — desktop terminal commands go through the same dispatcher and handlers as the boot
+  shell. Commands that need exclusive console control or would stop the desktop are clearly reported as unavailable.
+- **Local Browser** — Browser opens real text files with `file:<name>`, lists the live filesystem at `about:files`,
+  and reports live kernel information at `about:system`. It explicitly rejects Internet URLs because there is no
+  network driver or TCP/IP stack.
+- **Kernel-backed diagnostics** — System Monitor graphs measured CPU busy-versus-idle time, E820-detected total RAM,
+  and tracked kernel/heap RAM use. Task Manager enumerates the cooperative scheduler's real kernel tasks instead of
+  presenting desktop windows as processes.
+- **Persistent desktop settings** — theme and wallpaper choices are stored in `desktop.cfg` on the ATA-backed
+  filesystem and restored when the desktop starts.
 - **Filesystem image viewer** — Image Viewer validates and renders uncompressed 24-bit BMP files stored in the
   ATA-backed filesystem. A small `nostalux.bmp` is installed automatically as a working example; BMPs must fit the
   filesystem's current 1,023-byte per-file limit.
-- **AI Assistant** — an offline rule-based helper answers common NostaluxOS questions and can launch apps from
-  requests such as `open calculator`.
-
-The Browser app is currently a visual demo; NostaluxOS does not yet include a network stack.
+- **AI Assistant** — a basic offline, rule-based intent matcher answers common NostaluxOS questions and can launch
+  apps from requests such as `open calculator`. It is intentionally small and deterministic, not a trained model or
+  network service.
 
 ## Requirements
 
@@ -50,7 +59,7 @@ This creates `build/NostaluxOS.img`, a raw disk image containing the bootloader,
 The conflict check reads the source tree directly, so the build works from a ZIP extraction or Downloads folder even
 when no `.git` directory is present.
 
-Run the host-side BMP validation tests with:
+Run all host-side validation tests with:
 
 ```sh
 make test
@@ -133,8 +142,15 @@ make QEMU_AUDIO_LINUX='-machine pcspk-audiodev=snd0 -audiodev none,id=snd0' run
 QEMU displays the boot banner and then the `nostalux>` shell prompt. Type `help` for the current command list and
 `gui` to launch the desktop.
 
-Open **AI Assistant** from the welcome window, desktop icon, Start menu, GUI Terminal (`ai`), or Run dialog (`ai` or
-`assistant`). Press `Esc` or choose **Exit Desktop** from Start to return to the shell.
+Open **AI Assistant** from the welcome window, desktop icon, Start menu, or Run dialog (`ai` or `assistant`). Press
+`Esc` or choose **Exit Desktop** from Start to return to the shell.
+
+In Files, **New** creates a persistent text file, **Open** sends text to Notepad or BMP data to Image Viewer, and
+**Rename** updates the ATA-backed filesystem. **Delete** requires a second click within three seconds before removing
+the selected file. Closing a modified Notepad or Paint window saves it.
+
+Browser is a local document viewer rather than a web browser. Try `about:home`, `about:files`, `about:system`, or
+`file:readme.txt`. Internet addresses remain unsupported and are rejected with an explanation.
 
 ## Cleaning
 
@@ -149,5 +165,5 @@ This removes the entire `build/` directory, including the disk image and any fil
 - `bootloader/` — 16-bit boot sector plus the protected-mode/long-mode transition stage
 - `kernel/` — freestanding 64-bit kernel sources, headers, assembly entry point, and linker script
 - `scripts/` — source-tree validation helpers used by the build
-- `tests/` — host-side parser tests run by `make test`
+- `tests/` — host-side validation tests run by `make test`
 - `Makefile` — build, image assembly, persistence, and QEMU launch orchestration

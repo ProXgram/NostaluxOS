@@ -37,6 +37,11 @@ static size_t terminal_rows;
 static size_t terminal_batch_depth;
 static size_t terminal_margin_top = 0; // Number of rows to skip drawing at the top
 static bool terminal_wrap_pending = false;
+static char* terminal_capture_buffer;
+static size_t terminal_capture_capacity;
+static size_t terminal_capture_length;
+static bool terminal_capture_truncated;
+static bool terminal_capture_enabled;
 
 static uint16_t g_history[HISTORY_LINES * 200];
 static size_t g_scroll_offset = 0;
@@ -67,6 +72,11 @@ void terminal_initialize(uint32_t width, uint32_t height) {
     terminal_batch_depth = 0;
     terminal_margin_top = 0;
     terminal_wrap_pending = false;
+    terminal_capture_buffer = NULL;
+    terminal_capture_capacity = 0;
+    terminal_capture_length = 0;
+    terminal_capture_truncated = false;
+    terminal_capture_enabled = false;
 
     terminal_clear();
 }
@@ -123,7 +133,9 @@ void terminal_begin_batch(void) {
 
 void terminal_end_batch(void) {
     if (terminal_batch_depth > 0) terminal_batch_depth--;
-    if (terminal_batch_depth == 0) terminal_refresh_screen();
+    if (terminal_batch_depth == 0 && !terminal_capture_enabled) {
+        terminal_refresh_screen();
+    }
 }
 
 void terminal_clear(void) {
@@ -173,6 +185,16 @@ static void scroll_buffer_if_needed(void) {
 }
 
 void terminal_write_char(char c) {
+    if (terminal_capture_enabled) {
+        if (terminal_capture_length + 1 < terminal_capture_capacity) {
+            terminal_capture_buffer[terminal_capture_length++] = c;
+            terminal_capture_buffer[terminal_capture_length] = '\0';
+        } else {
+            terminal_capture_truncated = true;
+        }
+        return;
+    }
+
     if (g_scroll_offset != 0) {
         g_scroll_offset = 0;
         terminal_refresh_screen();
@@ -250,6 +272,43 @@ void terminal_write_uint(unsigned int value) {
 
 void terminal_newline(void) {
     terminal_write_char('\n');
+}
+
+bool terminal_capture_begin(char* buffer, size_t capacity) {
+    if (terminal_capture_enabled || buffer == NULL || capacity == 0) {
+        return false;
+    }
+
+    buffer[0] = '\0';
+    terminal_capture_buffer = buffer;
+    terminal_capture_capacity = capacity;
+    terminal_capture_length = 0;
+    terminal_capture_truncated = false;
+    terminal_capture_enabled = true;
+    return true;
+}
+
+size_t terminal_capture_end(bool* truncated) {
+    if (!terminal_capture_enabled) {
+        if (truncated != NULL) *truncated = false;
+        return 0;
+    }
+
+    size_t length = terminal_capture_length;
+    bool was_truncated = terminal_capture_truncated;
+
+    terminal_capture_enabled = false;
+    terminal_capture_buffer = NULL;
+    terminal_capture_capacity = 0;
+    terminal_capture_length = 0;
+    terminal_capture_truncated = false;
+
+    if (truncated != NULL) *truncated = was_truncated;
+    return length;
+}
+
+bool terminal_capture_active(void) {
+    return terminal_capture_enabled;
 }
 
 void terminal_move_cursor_left(size_t count) {

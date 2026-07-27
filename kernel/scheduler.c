@@ -10,6 +10,19 @@ static uint64_t g_next_pid = 1;
 
 #define STACK_SIZE 16384
 
+static bool allocate_task_id(uint64_t* id) {
+    if (id == NULL || g_next_pid == 0) return false;
+
+    *id = g_next_pid;
+    if (g_next_pid == UINT64_MAX) {
+        // PID 0 is reserved as invalid; refuse further spawns after wrap.
+        g_next_pid = 0;
+    } else {
+        g_next_pid++;
+    }
+    return true;
+}
+
 static void copy_task_name(char destination[TASK_NAME_MAX], const char* source) {
     size_t index = 0;
 
@@ -22,21 +35,51 @@ static void copy_task_name(char destination[TASK_NAME_MAX], const char* source) 
     destination[index] = '\0';
 }
 
+static void destroy_task(Task* task) {
+    if (task == NULL) return;
+    kfree(task->kernel_stack);
+    kfree(task->user_stack);
+    kfree(task);
+}
+
 static void reap_dead_tasks(void) {
     if (g_head == NULL) return;
 
-    Task* task = g_head;
-    do {
+    /*
+     * The list is circular and has no immortal sentinel. If a future caller
+     * terminates the original bootstrap task while another task is current,
+     * promote the next live list node before doing the normal interior pass.
+     */
+    while (g_head != g_current_task && g_head->state == TASK_DEAD) {
+        Task* dead = g_head;
+        Task* next = (Task*)dead->next;
+        if (next == dead) {
+            g_head = NULL;
+            destroy_task(dead);
+            return;
+        }
+
+        Task* tail = next;
+        while (tail->next != dead) {
+            tail = (Task*)tail->next;
+        }
+        g_head = next;
+        tail->next = g_head;
+        destroy_task(dead);
+    }
+
+    Task* previous = g_head;
+    Task* task = (Task*)g_head->next;
+    while (task != g_head) {
         Task* next = (Task*)task->next;
-        if (next != g_head && next != g_current_task && next->state == TASK_DEAD) {
-            task->next = next->next;
-            kfree(next->kernel_stack);
-            kfree(next->user_stack);
-            kfree(next);
-            continue;
+        if (task != g_current_task && task->state == TASK_DEAD) {
+            previous->next = next;
+            destroy_task(task);
+        } else {
+            previous = task;
         }
         task = next;
-    } while (task != g_head);
+    }
 }
 
 void scheduler_init(void) {
@@ -46,7 +89,11 @@ void scheduler_init(void) {
         return;
     }
 
-    kmain_task->id = g_next_pid++;
+    if (!allocate_task_id(&kmain_task->id)) {
+        kfree(kmain_task);
+        syslog_write("Scheduler: PID allocation failed");
+        return;
+    }
     copy_task_name(kmain_task->name, "kernel/main");
     kmain_task->rsp = 0; 
     kmain_task->is_user = false;
@@ -64,7 +111,7 @@ void scheduler_init(void) {
 
 extern void task_return_trampoline(void);
 
-bool spawn_task(void (*entry_point)(void)) {
+bool spawn_named_task(const char* name, void (*entry_point)(void)) {
     if (entry_point == NULL || g_head == NULL) return false;
 
     Task* new_task = (Task*)kmalloc(sizeof(Task));
@@ -80,8 +127,14 @@ bool spawn_task(void (*entry_point)(void)) {
         return false;
     }
     
-    new_task->id = g_next_pid++;
-    copy_task_name(new_task->name, "kernel/task");
+    if (!allocate_task_id(&new_task->id)) {
+        kfree(stack);
+        kfree(new_task);
+        syslog_write("Scheduler: PID allocation failed");
+        return false;
+    }
+    copy_task_name(new_task->name,
+                   name != NULL && name[0] != '\0' ? name : "kernel/task");
     new_task->is_user = false;
     new_task->state = TASK_READY;
     new_task->kernel_stack = stack;
@@ -109,6 +162,10 @@ bool spawn_task(void (*entry_point)(void)) {
     new_task->next = g_head->next;
     g_head->next = new_task;
     return true;
+}
+
+bool spawn_task(void (*entry_point)(void)) {
+    return spawn_named_task("kernel/task", entry_point);
 }
 
 bool spawn_user_task(void (*entry_point)(void)) {
@@ -169,10 +226,28 @@ void scheduler_set_current_name(const char* name) {
                    name != NULL && name[0] != '\0' ? name : "kernel/task");
 }
 
+bool scheduler_terminate_task(uint64_t id) {
+    if (id == 0 || g_head == NULL) return false;
+
+    Task* task = g_head;
+    do {
+        if (task->id == id) {
+            if (task == g_current_task || task->state == TASK_DEAD) {
+                return false;
+            }
+            task->state = TASK_DEAD;
+            reap_dead_tasks();
+            return true;
+        }
+        task = (Task*)task->next;
+    } while (task != NULL && task != g_head);
+
+    return false;
+}
+
 void exit_current_task(void) {
-    // We cannot free the stack we are currently using.
-    // Mark as dead, and the scheduler will simply skip it.
-    // In a real OS, a separate "reaper" thread would free these.
+    // We cannot free the stack we are currently using. Mark it dead; the
+    // scheduler reclaims it after another task's stack becomes active.
     if (g_current_task) {
         g_current_task->state = TASK_DEAD;
     }
@@ -186,6 +261,8 @@ void exit_current_task(void) {
 
 void schedule(void) {
     if (!g_current_task) return;
+
+    reap_dead_tasks();
 
     Task* start_task = g_current_task;
     Task* next = (Task*)g_current_task->next;
