@@ -4,6 +4,24 @@ LD         ?= ld
 OBJCOPY    ?= objcopy
 HOST_CC    ?= cc
 
+HOST_ARCH ?= $(shell uname -m 2>/dev/null || echo unknown)
+ARM64_HOST := $(filter aarch64 arm64,$(HOST_ARCH))
+
+# NostaluxOS is an x86-64 guest even when it is built on an ARM64 host.
+# Debian/Ubuntu cross tools use this prefix; other toolchains can override it,
+# for example with CROSS_COMPILE=x86_64-elf-.
+ifeq ($(origin CROSS_COMPILE),undefined)
+ifneq ($(ARM64_HOST),)
+CROSS_COMPILE := x86_64-linux-gnu-
+else
+CROSS_COMPILE :=
+endif
+endif
+
+TARGET_CC      ?= $(if $(strip $(CROSS_COMPILE)),$(CROSS_COMPILE)gcc,$(CC))
+TARGET_LD      ?= $(if $(strip $(CROSS_COMPILE)),$(CROSS_COMPILE)ld,$(LD))
+TARGET_OBJCOPY ?= $(if $(strip $(CROSS_COMPILE)),$(CROSS_COMPILE)objcopy,$(OBJCOPY))
+
 CONFLICT_CHECK := ./scripts/check-conflicts.sh
 
 # Added -MMD -MP for automatic dependency tracking
@@ -29,6 +47,16 @@ DEPS := $(KERNEL_OBJS:.o=.d)
 QEMU ?= qemu-system-x86_64
 QEMU_NATIVE ?=
 
+# Cross-architecture virtualization is not possible with KVM/WHVP. QEMU's TCG
+# translates the x86-64 guest on ARM64 hosts.
+ifeq ($(origin QEMU_ACCEL),undefined)
+ifneq ($(ARM64_HOST),)
+QEMU_ACCEL := -accel tcg
+else
+QEMU_ACCEL :=
+endif
+endif
+
 # Interactive runs prefer a native Windows QEMU executable when one can be
 # discovered. Linux QEMU remains the portable fallback and powers headless runs.
 QEMU_AUDIO_LINUX ?= -machine pcspk-audiodev=snd0 -audiodev pa,id=snd0
@@ -51,17 +79,21 @@ define RUN_QEMU
 	if [ "$(HEADLESS)" = "1" ]; then \
 		if command -v "$(QEMU)" >/dev/null 2>&1; then \
 			echo "Running headless with $(QEMU)"; \
-			exec "$(QEMU)" $(QEMU_DISPLAY_HEADLESS) $(QEMU_AUDIO_HEADLESS) \
+			exec "$(QEMU)" $(QEMU_ACCEL) $(QEMU_DISPLAY_HEADLESS) $(QEMU_AUDIO_HEADLESS) \
 				-drive format=raw,file=$(OS_IMAGE); \
 		fi; \
 		echo "Error: $(QEMU) was not found. Set QEMU=/path/to/qemu-system-x86_64." >&2; \
 		exit 1; \
 	fi; \
 	native_qemu='$(QEMU_NATIVE)'; \
-	if [ -z "$$native_qemu" ]; then \
+	auto_native=1; \
+	if [ -n "$(ARM64_HOST)" ] && command -v "$(QEMU)" >/dev/null 2>&1; then \
+		auto_native=0; \
+	fi; \
+	if [ -z "$$native_qemu" ] && [ "$$auto_native" = "1" ]; then \
 		native_qemu=$$(command -v qemu-system-x86_64.exe 2>/dev/null || true); \
 	fi; \
-	if [ -z "$$native_qemu" ]; then \
+	if [ -z "$$native_qemu" ] && [ "$$auto_native" = "1" ]; then \
 		for candidate in \
 			"/mnt/c/Program Files/qemu/qemu-system-x86_64.exe" \
 			"/mnt/c/Program Files (x86)/qemu/qemu-system-x86_64.exe" \
@@ -75,24 +107,54 @@ define RUN_QEMU
 	fi; \
 	if [ -n "$$native_qemu" ] && [ -x "$$native_qemu" ]; then \
 		echo "Running with native Windows QEMU: $$native_qemu"; \
-		exec "$$native_qemu" $(1) $(QEMU_AUDIO_NATIVE) \
+		exec "$$native_qemu" $(QEMU_ACCEL) $(1) $(QEMU_AUDIO_NATIVE) \
 			-drive format=raw,file=$(OS_IMAGE); \
 	fi; \
 	if command -v "$(QEMU)" >/dev/null 2>&1; then \
-		echo "Native Windows QEMU not found; using $(QEMU)."; \
-		exec "$(QEMU)" $(1) $(QEMU_AUDIO_LINUX) \
+		if [ -n "$(ARM64_HOST)" ]; then \
+			echo "ARM64 host detected; emulating the x86-64 guest with $(QEMU) and TCG."; \
+		else \
+			echo "Native Windows QEMU not found; using $(QEMU)."; \
+		fi; \
+		exec "$(QEMU)" $(QEMU_ACCEL) $(1) $(QEMU_AUDIO_LINUX) \
 			-drive format=raw,file=$(OS_IMAGE); \
 	fi; \
 	echo "Error: no QEMU executable found. Install QEMU or set QEMU_NATIVE/QEMU." >&2; \
 	exit 1
 endef
 
-.PHONY: all clean test test-bmp test-terminal-capture test-shell-capture run run-windowed run-fullscreen check-conflicts
+.PHONY: all clean test test-bmp test-terminal-capture test-shell-capture run run-windowed run-fullscreen check-conflicts check-target-tools
 
-all: check-conflicts $(OS_IMAGE)
+all: check-conflicts check-target-tools $(OS_IMAGE)
 
 check-conflicts:
 	@$(CONFLICT_CHECK)
+
+check-target-tools:
+	@set -eu; \
+	missing=''; \
+	for tool in "$(firstword $(NASM))" "$(firstword $(TARGET_CC))" "$(firstword $(TARGET_LD))" "$(firstword $(TARGET_OBJCOPY))"; do \
+		if ! command -v "$$tool" >/dev/null 2>&1; then \
+			missing="$$missing $$tool"; \
+		fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "Error: missing x86-64 build tools:$$missing" >&2; \
+		if [ -n "$(ARM64_HOST)" ]; then \
+			echo "ARM64 host detected ($(HOST_ARCH)); NostaluxOS needs an x86-64 cross-toolchain." >&2; \
+			echo "On Debian/Ubuntu install: build-essential nasm gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu" >&2; \
+			echo "For another toolchain, set CROSS_COMPILE to its prefix (for example x86_64-elf-)." >&2; \
+		fi; \
+		exit 1; \
+	fi; \
+	target=$$($(TARGET_CC) -dumpmachine 2>/dev/null || true); \
+	case "$$target" in \
+		x86_64*|amd64*) ;; \
+		*) \
+			echo "Error: $(TARGET_CC) targets '$$target', but NostaluxOS requires an x86-64 compiler." >&2; \
+			echo "Set CROSS_COMPILE or TARGET_CC/TARGET_LD/TARGET_OBJCOPY to an x86-64 toolchain." >&2; \
+			exit 1 ;; \
+	esac
 
 test: test-bmp test-terminal-capture test-shell-capture
 
@@ -108,7 +170,7 @@ test-terminal-capture: | $(BUILD_DIR)
 	$(BUILD_DIR)/terminal_capture_test
 
 test-shell-capture: | $(BUILD_DIR)
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -DNOSTALUX_HOST_TEST -Ikernel/include \
 		tests/shell_capture_test.c kernel/shell.c kernel/kstdio.c \
 		kernel/kstring.c kernel/terminal.c -o $(BUILD_DIR)/shell_capture_test
 	$(BUILD_DIR)/shell_capture_test
@@ -118,13 +180,13 @@ $(BUILD_DIR):
 
 $(KERNEL_ELF): kernel/entry.asm $(KERNEL_OBJS) kernel/linker.ld | $(BUILD_DIR)
 	$(NASM) -f elf64 kernel/entry.asm -o $(BUILD_DIR)/entry.o
-	$(LD) -nostdlib -z max-page-size=0x1000 -T kernel/linker.ld -o $@ $(BUILD_DIR)/entry.o $(KERNEL_OBJS)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -T kernel/linker.ld -o $@ $(BUILD_DIR)/entry.o $(KERNEL_OBJS)
 
 $(BUILD_DIR)/%.o: kernel/%.c Makefile | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(TARGET_CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL_BIN): $(KERNEL_ELF) | $(BUILD_DIR)
-	$(OBJCOPY) -O binary $(KERNEL_ELF) $@
+	$(TARGET_OBJCOPY) -O binary $(KERNEL_ELF) $@
 
 $(STAGE2_BIN): bootloader/stage2.asm $(KERNEL_BIN) | $(BUILD_DIR)
 	@KERNEL_SIZE=$$(stat -c%s $(KERNEL_BIN)); \
@@ -172,13 +234,13 @@ $(OS_IMAGE): $(BOOT_BIN) $(PAYLOAD_BIN)
 clean:
 	rm -rf $(BUILD_DIR)
 
-run: check-conflicts $(OS_IMAGE)
+run: check-conflicts check-target-tools $(OS_IMAGE)
 	$(call RUN_QEMU,$(QEMU_DISPLAY_WINDOWED))
 
-run-windowed: check-conflicts $(OS_IMAGE)
+run-windowed: check-conflicts check-target-tools $(OS_IMAGE)
 	$(call RUN_QEMU,$(QEMU_DISPLAY_WINDOWED))
 
-run-fullscreen: check-conflicts $(OS_IMAGE)
+run-fullscreen: check-conflicts check-target-tools $(OS_IMAGE)
 	$(call RUN_QEMU,$(QEMU_DISPLAY_FULLSCREEN))
 
 -include $(DEPS)

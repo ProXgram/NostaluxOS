@@ -36,18 +36,50 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
 
 ## Requirements
 
-The supported build environment is an x86-64 Linux system or WSL with:
+The supported build environment is an x86-64 or ARM64 Linux system, including WSL, with:
 
 - GNU `make`
 - `nasm`
-- an x86-64 GNU C toolchain (`gcc`)
-- GNU binutils (`ld` and `objcopy`)
+- an x86-64 GNU C toolchain (`gcc` on x86-64, or an x86-64 cross-compiler on ARM64)
+- matching GNU binutils (`ld` and `objcopy`)
 - a POSIX shell and GNU coreutils, including `cat`, `stat`, `dd`, and `truncate`
 - QEMU (`qemu-system-x86_64`) if you want to run the image
 
 The kernel requires at least **9 MiB of guest RAM** and works better with **32 MiB or more**. QEMU's normal default
 memory allocation is sufficient. The virtual machine also needs a BIOS that provides an E820 physical-memory map and
 a VBE implementation that exposes the requested 800x600x32 mode.
+
+### ARM64 host support
+
+NostaluxOS remains an x86-64 BIOS operating system. On an `aarch64` or `arm64` Linux/WSL host, the Makefile
+automatically selects an x86-64 cross-toolchain and runs `qemu-system-x86_64` with QEMU's TCG software translator.
+The QEMU executable name describes the guest architecture, so it is also the correct executable on an ARM64 host.
+
+On Debian or Ubuntu ARM64, install the native build tools, x86-64 cross-toolchain, and QEMU frontend with:
+
+```sh
+sudo apt update
+sudo apt install build-essential nasm gcc-x86-64-linux-gnu \
+  binutils-x86-64-linux-gnu qemu-system-x86 qemu-system-gui
+```
+
+Then use the normal commands:
+
+```sh
+make
+make test
+make run
+```
+
+Software translation is slower than running on an x86-64 host, but the guest functionality is the same. If a
+toolchain uses another prefix, override the default, for example:
+
+```sh
+make CROSS_COMPILE=x86_64-elf-
+```
+
+This support covers ARM64 Linux and ARM64 WSL hosts. A native Apple Silicon/macOS launcher is not currently included
+because the build and interactive display path depend on GNU userland tools and QEMU's GTK frontend.
 
 ## Build
 

@@ -4,7 +4,9 @@
 
 #include "background.h"
 #include "fs.h"
+#ifndef NOSTALUX_HOST_TEST
 #include "io.h"
+#endif
 #include "keyboard.h"
 #include "kstring.h"
 #include "memtest.h"
@@ -72,14 +74,14 @@ static const struct shell_command COMMANDS[] = {
     {"clear", command_clear, "Clear the screen", SHELL_COMMAND_CONSOLE_ONLY},
     {"banner", command_banner, "Show moving banner screensaver", SHELL_COMMAND_CONSOLE_ONLY},
     {"gui", command_gui, "Launch graphical desktop", SHELL_COMMAND_CONSOLE_ONLY},
-    {"time", command_time, "Show current RTC date/time", 0},
+    {"time", command_time, "Show current RTC time", 0},
     {"uptime", command_uptime, "Show time since boot", 0},
     {"sleep", command_sleep, "Pause for N seconds", SHELL_COMMAND_CONSOLE_ONLY},
     {"calc", command_calc, "Simple math (e.g. 'calc 10 + 5')", 0},
     {"foreground", command_foreground, "Set text color", SHELL_COMMAND_CONSOLE_ONLY},
     {"background", command_background, "Set background color", SHELL_COMMAND_CONSOLE_ONLY},
     {"palette", command_palette, "Preview IBM PC color swatches", 0},
-    {"ls", command_ls, "List files and usage stats", 0},
+    {"ls", command_ls, "List filesystem files and sizes", 0},
     {"cat", command_cat, "Print a file's text content", 0},
     {"hexdump", command_hexdump, "View file content in hex", 0},
     {"touch", command_touch, "Create an empty file", 0},
@@ -414,16 +416,22 @@ static void command_disktest(const char* args) {
 
 static void command_reboot(const char* args) {
     (void)args;
+#ifndef NOSTALUX_HOST_TEST
     outb(0x64, 0xFE);
+#endif
 }
 
 static void command_shutdown(const char* args) {
     (void)args;
+#ifdef NOSTALUX_HOST_TEST
+    kprintf("Shutdown is unavailable in a host-side test.\n");
+#else
     kprintf("Shutting down...\n");
     outw(0x604, 0x2000); 
     outw(0xB004, 0x2000);
     outw(0x4004, 0x3400);
     for(;;) __asm__ volatile ("cli; hlt");
+#endif
 }
 
 static void command_banner(const char* args) {
