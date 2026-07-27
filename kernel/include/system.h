@@ -1,12 +1,13 @@
 #ifndef SYSTEM_H
 #define SYSTEM_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /*
- * Physical addresses below 8 MiB contain the loader, kernel image, stacks,
- * page tables, and other boot-time structures. The heap starts immediately
- * after this reserved region.
+ * The current fixed physical layout keeps the loader, kernel, stacks, page
+ * tables, and graphics backbuffer below 8 MiB. The heap starts immediately
+ * after this region.
  */
 #define SYSTEM_RESERVED_LOW_MEMORY_BYTES 0x00800000ull
 
@@ -30,12 +31,30 @@ struct BootInfo {
 
 struct system_profile {
     const char* architecture;
+    /* All physical RAM reported usable by the normalized E820 map. */
     uint32_t memory_total_kb;
+    /* Portion of usable RAM addressable by the current low identity map. */
+    uint32_t memory_mapped_kb;
+    /* Size of the RAM region managed by the kernel heap allocator. */
+    uint32_t memory_managed_kb;
+    /* Usable low RAM reserved by the fixed kernel/graphics layout. */
+    uint32_t memory_reserved_kb;
+    /* Heap allocations plus allocator metadata, excluding free payload. */
+    uint32_t memory_heap_committed_kb;
+    /* Reserved low RAM plus committed heap RAM. */
     uint32_t memory_used_kb;
 };
 
 void system_cache_boot_info(const struct BootInfo* boot_info);
-void system_set_total_memory(uint32_t total_kb);
+/*
+ * Configures RAM accounting from the normalized E820 map and heap layout.
+ * fixed_used_bytes must count only usable RAM reserved by the fixed layout;
+ * firmware/MMIO holes are not part of either total or used RAM.
+ */
+void system_configure_memory(uint64_t total_usable_bytes,
+                             uint64_t mapped_usable_bytes,
+                             uint64_t fixed_used_bytes,
+                             size_t heap_capacity_bytes);
 const struct BootInfo* system_boot_info(void);
 const struct system_profile* system_profile_info(void);
 

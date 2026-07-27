@@ -24,11 +24,22 @@ static struct BootInfo g_boot_info = {
 
 static struct system_profile g_profile = {
     .architecture = "x86_64",
-    .memory_total_kb = 64 * 1024,
-    .memory_used_kb = 512,
 };
 
-static uint32_t bytes_to_kib(uint64_t bytes) {
+static uint64_t g_total_usable_bytes = 0;
+static uint64_t g_mapped_usable_bytes = 0;
+static uint64_t g_fixed_used_bytes = 0;
+static size_t g_heap_capacity_bytes = 0;
+
+static uint32_t bytes_to_kib_floor(uint64_t bytes) {
+    const uint64_t kib = bytes / 1024u;
+    if (kib > UINT32_MAX) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)kib;
+}
+
+static uint32_t bytes_to_kib_ceil(uint64_t bytes) {
     uint64_t kib = bytes / 1024u;
     if (bytes % 1024u != 0) {
         kib++;
@@ -41,26 +52,43 @@ static uint32_t bytes_to_kib(uint64_t bytes) {
 
 static void refresh_memory_usage(void) {
     /*
-     * Count the complete low-memory kernel reservation rather than only the
-     * framebuffer. This covers the bootloader, kernel image, stacks, page
-     * tables, and static kernel storage below the 8 MiB heap boundary.
-     * Video memory is device memory and is therefore not charged as RAM.
+     * The heap allocator reports free payload bytes. Subtracting that from the
+     * full heap region counts live allocations and allocator block metadata,
+     * including the initial header, without pretending the untouched part of
+     * the heap is used.
      */
-    const uint64_t heap_bytes = (uint64_t)heap_used_space();
-    uint64_t used_bytes = SYSTEM_RESERVED_LOW_MEMORY_BYTES;
-    if (heap_bytes > UINT64_MAX - used_bytes) {
+    uint64_t heap_committed_bytes = 0;
+    if (g_heap_capacity_bytes != 0) {
+        const size_t heap_free_bytes = heap_free_space();
+        if (heap_free_bytes <= g_heap_capacity_bytes) {
+            heap_committed_bytes =
+                (uint64_t)(g_heap_capacity_bytes - heap_free_bytes);
+        }
+    }
+
+    uint64_t used_bytes = g_fixed_used_bytes;
+    if (heap_committed_bytes > UINT64_MAX - used_bytes) {
         used_bytes = UINT64_MAX;
     } else {
-        used_bytes += heap_bytes;
+        used_bytes += heap_committed_bytes;
     }
 
-    const uint64_t total_bytes = (uint64_t)g_profile.memory_total_kb * 1024u;
-    if (used_bytes > total_bytes) {
-        used_bytes = total_bytes;
+    if (used_bytes > g_total_usable_bytes) {
+        used_bytes = g_total_usable_bytes;
     }
 
-    uint32_t kib = bytes_to_kib(used_bytes);
-    g_profile.memory_used_kb = kib;
+    g_profile.memory_total_kb = bytes_to_kib_floor(g_total_usable_bytes);
+    g_profile.memory_mapped_kb = bytes_to_kib_floor(g_mapped_usable_bytes);
+    g_profile.memory_managed_kb =
+        bytes_to_kib_floor((uint64_t)g_heap_capacity_bytes);
+    g_profile.memory_reserved_kb =
+        bytes_to_kib_ceil(g_fixed_used_bytes);
+    g_profile.memory_heap_committed_kb =
+        bytes_to_kib_ceil(heap_committed_bytes);
+    g_profile.memory_used_kb = bytes_to_kib_ceil(used_bytes);
+    if (g_profile.memory_used_kb > g_profile.memory_total_kb) {
+        g_profile.memory_used_kb = g_profile.memory_total_kb;
+    }
 }
 
 void system_cache_boot_info(const struct BootInfo* boot_info) {
@@ -85,8 +113,20 @@ void system_cache_boot_info(const struct BootInfo* boot_info) {
     syslog_write("System: hardware descriptors cached");
 }
 
-void system_set_total_memory(uint32_t total_kb) {
-    g_profile.memory_total_kb = total_kb;
+void system_configure_memory(uint64_t total_usable_bytes,
+                             uint64_t mapped_usable_bytes,
+                             uint64_t fixed_used_bytes,
+                             size_t heap_capacity_bytes) {
+    g_total_usable_bytes = total_usable_bytes;
+    g_mapped_usable_bytes = mapped_usable_bytes;
+    if (g_mapped_usable_bytes > g_total_usable_bytes) {
+        g_mapped_usable_bytes = g_total_usable_bytes;
+    }
+    g_fixed_used_bytes = fixed_used_bytes;
+    if (g_fixed_used_bytes > g_total_usable_bytes) {
+        g_fixed_used_bytes = g_total_usable_bytes;
+    }
+    g_heap_capacity_bytes = heap_capacity_bytes;
     refresh_memory_usage();
 }
 

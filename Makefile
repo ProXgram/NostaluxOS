@@ -123,7 +123,9 @@ define RUN_QEMU
 	exit 1
 endef
 
-.PHONY: all clean test test-bmp test-terminal-capture test-shell-capture run run-windowed run-fullscreen check-conflicts check-target-tools
+.PHONY: all clean test test-bmp test-terminal-capture test-shell-capture \
+	test-fs-persistence test-memory-accounting run run-windowed \
+	run-fullscreen check-conflicts check-target-tools
 
 all: check-conflicts check-target-tools $(OS_IMAGE)
 
@@ -156,7 +158,8 @@ check-target-tools:
 			exit 1 ;; \
 	esac
 
-test: test-bmp test-terminal-capture test-shell-capture
+test: test-bmp test-terminal-capture test-shell-capture \
+	test-fs-persistence test-memory-accounting
 
 test-bmp: | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
@@ -174,6 +177,18 @@ test-shell-capture: | $(BUILD_DIR)
 		tests/shell_capture_test.c kernel/shell.c kernel/kstdio.c \
 		kernel/kstring.c kernel/terminal.c -o $(BUILD_DIR)/shell_capture_test
 	$(BUILD_DIR)/shell_capture_test
+
+test-fs-persistence: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -DNOSTALUX_HOST_TEST -Ikernel/include \
+		tests/fs_persistence_test.c kernel/fs.c kernel/kstring.c \
+		kernel/syslog.c -o $(BUILD_DIR)/fs_persistence_test
+	$(BUILD_DIR)/fs_persistence_test
+
+test-memory-accounting: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/memory_accounting_test.c kernel/memtest.c kernel/system.c \
+		-o $(BUILD_DIR)/memory_accounting_test
+	$(BUILD_DIR)/memory_accounting_test
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)

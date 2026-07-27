@@ -29,36 +29,22 @@ static void halt_boot(const char* message) {
     }
 }
 
-static void system_profile_maintenance_task(void) {
-    (void)system_profile_info();
-    syslog_write("Scheduler: profile maintenance task running");
-    uint64_t last_refresh = timer_get_ticks();
-
-    for (;;) {
-        const uint64_t now = timer_get_ticks();
-        if (now - last_refresh >= 25u) {
-            /*
-             * Refresh live heap-backed memory accounting four times per
-             * second. This is a real cooperative kernel workload, not a
-             * synthetic Task Manager entry.
-             */
-            (void)system_profile_info();
-            last_refresh = now;
-        }
-        schedule();
-    }
-}
-
 static void boot_sequence(const struct BootInfo* boot_info) {
     system_cache_boot_info(boot_info);
     const struct BootInfo* cached = system_boot_info();
 
     terminal_initialize(cached->width, cached->height);
 
-    // Detect usable memory before placing the heap. A fixed 16 MiB heap used
-    // to extend beyond RAM in low-memory virtual machines.
-    size_t memory_bytes = memtest_detect_upper_limit();
-    system_set_total_memory((uint32_t)(memory_bytes / 1024));
+    /*
+     * Normalize the complete E820 map for reporting, but place the heap only
+     * in the contiguous mapped range that contains its fixed 8 MiB base.
+     */
+    struct memtest_memory_info memory_info;
+    if (!memtest_detect_memory(&memory_info)) {
+        halt_boot("Fatal: a valid BIOS E820 memory map is required.");
+    }
+
+    size_t memory_bytes = memory_info.heap_upper_limit;
     if (memory_bytes <= HEAP_START_ADDR + 65536u) {
         halt_boot("Fatal: at least 9 MB of RAM is required.");
     }
@@ -69,6 +55,10 @@ static void boot_sequence(const struct BootInfo* boot_info) {
     if (heap_free_space() == 0) {
         halt_boot("Fatal: unable to initialize the kernel heap.");
     }
+    system_configure_memory(memory_info.physical_usable_bytes,
+                            memory_info.mapped_usable_bytes,
+                            memory_info.reserved_low_usable_bytes,
+                            heap_size);
 
     // Initialize timer and input after allocator state is valid.
     timer_init();
@@ -77,22 +67,11 @@ static void boot_sequence(const struct BootInfo* boot_info) {
 
     // Initialize the currently cooperative task scheduler.
     scheduler_init();
-    if (!spawn_named_task("kernel/profile-maint", system_profile_maintenance_task)) {
-        syslog_write("Scheduler: profile maintenance task unavailable");
-    }
 
     background_render();
     timer_set_callback(background_animate);
     
     fs_init();
-
-    /*
-     * Start every cooperative boot task once. The maintenance task yields
-     * straight back after its first real profile refresh, so shell startup
-     * remains synchronous.
-     */
-    schedule();
-    syslog_write("Scheduler: boot task handoff complete");
 }
 
 void kmain(const struct BootInfo* boot_info) {

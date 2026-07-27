@@ -3,7 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#ifndef NOSTALUX_HOST_TEST
 #include "io.h"
+#endif
 
 #define SYSLOG_CAPACITY 64
 #define SYSLOG_MESSAGE_LEN 80
@@ -36,9 +38,12 @@ void syslog_write(const char* message) {
         return;
     }
 
-    // Check current privilege level (CPL) from CS register
-    // If CPL is 3 (User Mode), we cannot execute 'outb' without GPF.
-    // We skip the debug port output in that case.
+#ifndef NOSTALUX_HOST_TEST
+    /*
+     * Check the current privilege level before using the x86 debug port.
+     * Host-side tests compile this module natively, including on ARM64, and
+     * exercise only the in-memory ring below.
+     */
     uint16_t cs;
     __asm__ volatile("mov %%cs, %0" : "=r"(cs));
     bool is_kernel = (cs & 3) == 0;
@@ -49,6 +54,7 @@ void syslog_write(const char* message) {
         }
         outb(0xE9, '\n');
     }
+#endif
 
     size_t index;
     if (g_count < SYSLOG_CAPACITY) {
@@ -72,4 +78,53 @@ const char* syslog_entry(size_t index) {
     }
     size_t actual = (g_start + index) % SYSLOG_CAPACITY;
     return g_entries[actual];
+}
+
+size_t syslog_copy_text(char* buffer, size_t capacity) {
+    if (buffer == NULL || capacity == 0) {
+        return 0;
+    }
+
+    size_t available = capacity - 1;
+    size_t first = g_count;
+    size_t required = 0;
+
+    /*
+     * A filesystem log file is smaller than the complete ring buffer. Keep
+     * the newest complete entries that fit rather than presenting stale boot
+     * messages while omitting the event that the user is investigating.
+     */
+    while (first > 0) {
+        const char* message = syslog_entry(first - 1);
+        size_t length = 0;
+        while (message != NULL && message[length] != '\0') length++;
+        if (length + 1 > available - required) break;
+        required += length + 1;
+        first--;
+    }
+
+    size_t written = 0;
+    for (size_t i = first; i < g_count; i++) {
+        const char* message = syslog_entry(i);
+        for (size_t j = 0;
+             message != NULL && message[j] != '\0' && written < available;
+             j++) {
+            buffer[written++] = message[j];
+        }
+        if (written < available) buffer[written++] = '\n';
+    }
+
+    /*
+     * Very small callers may not have room for one complete entry. They
+     * still receive a truthful, truncated copy of the newest message.
+     */
+    if (written == 0 && g_count != 0 && available != 0) {
+        const char* message = syslog_entry(g_count - 1);
+        while (message != NULL && *message != '\0' && written < available) {
+            buffer[written++] = *message++;
+        }
+    }
+
+    buffer[written] = '\0';
+    return written;
 }

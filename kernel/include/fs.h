@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Persistent record capacity; virtual read-only files may add public entries. */
 #define FS_MAX_FILES 32
 #define FS_MAX_FILENAME 32
 #define FS_MAX_FILE_SIZE 1024
@@ -15,7 +16,18 @@ struct fs_file {
     char data[FS_MAX_FILE_SIZE];
 };
 
+typedef enum {
+    FS_BACKEND_UNINITIALIZED = 0,
+    FS_BACKEND_PERSISTENT,
+    FS_BACKEND_VOLATILE_NO_DRIVE,
+    FS_BACKEND_VOLATILE_CORRUPT,
+    FS_BACKEND_VOLATILE_IO_ERROR,
+} fs_backend_status_t;
+
 void fs_init(void);
+fs_backend_status_t fs_backend_status(void);
+bool fs_backend_is_persistent(void);
+const char* fs_backend_status_text(void);
 size_t fs_file_count(void);
 const struct fs_file* fs_file_at(size_t index);
 const struct fs_file* fs_find(const char* name);

@@ -29,7 +29,11 @@ static const struct BootInfo boot_info = {
 static const struct system_profile profile = {
     .architecture = "test",
     .memory_total_kb = 131072,
-    .memory_used_kb = 4096,
+    .memory_mapped_kb = 65536,
+    .memory_managed_kb = 16384,
+    .memory_reserved_kb = 8192,
+    .memory_heap_committed_kb = 1024,
+    .memory_used_kb = 9216,
 };
 
 void graphics_init(void) {}
@@ -108,6 +112,13 @@ bool fs_append(const char* name, const char* contents) {
     (void)name; (void)contents; return false;
 }
 bool fs_remove(const char* name) { (void)name; return false; }
+fs_backend_status_t fs_backend_status(void) {
+    return FS_BACKEND_PERSISTENT;
+}
+bool fs_backend_is_persistent(void) { return true; }
+const char* fs_backend_status_text(void) {
+    return "Persistent ATA storage";
+}
 
 static void execute(const char* command, char* output, size_t capacity,
                     size_t* length, bool* truncated) {
@@ -130,6 +141,14 @@ static void test_real_dispatch(void) {
 
     execute("time", output, sizeof(output), &length, &truncated);
     assert(strcmp(output, "RTC Time: 12:34:56\n") == 0);
+
+    execute("sysinfo", output, sizeof(output), &length, &truncated);
+    assert(strstr(output, "Usable physical RAM: 131072 KB") != NULL);
+    assert(strstr(output, "Mapped usable RAM: 65536 KB") != NULL);
+    assert(strstr(output,
+                  "Kernel committed RAM: 9216 KB (8192 reserved + 1024 heap)")
+           != NULL);
+    assert(strstr(output, "Storage: Persistent ATA storage") != NULL);
 
     execute("does-not-exist", output, sizeof(output), &length, &truncated);
     assert(strcmp(output, "Unknown command.\n") == 0);
@@ -158,6 +177,10 @@ static void test_palette_and_help(void) {
     execute("help", output, sizeof(output), NULL, NULL);
     assert(strstr(output, "palette") != NULL);
     assert(strstr(output, "[console only]") != NULL);
+    assert(strstr(output, "Show current RTC time") != NULL);
+    assert(strstr(output, "Show current RTC date/time") == NULL);
+    assert(strstr(output, "List filesystem files and sizes") != NULL);
+    assert(strstr(output, "List files and usage stats") == NULL);
 }
 
 static void test_touch_reports_existing_file(void) {

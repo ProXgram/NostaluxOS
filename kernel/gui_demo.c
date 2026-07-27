@@ -197,6 +197,7 @@ typedef struct {
     int content_len;
     char status[64];
     int scroll;
+    uint64_t last_refresh_tick;
     bool address_select_all;
 } BrowserState;
 typedef struct {
@@ -266,6 +267,10 @@ typedef struct {
     struct timer_cpu_counters previous_cpu;
     uint32_t memory_used_kb;
     uint32_t memory_total_kb;
+    uint32_t memory_mapped_kb;
+    uint32_t memory_managed_kb;
+    uint32_t memory_reserved_kb;
+    uint32_t memory_heap_committed_kb;
     int cpu_percent;
     bool has_previous_cpu;
 } SysMonState;
@@ -579,6 +584,45 @@ static bool file_is_text(const struct fs_file* file) {
         if (c < 32 || c > 126) return false;
     }
     return true;
+}
+
+static const char* storage_short_label(void) {
+    switch (fs_backend_status()) {
+        case FS_BACKEND_PERSISTENT:
+            return "persistent ATA";
+        case FS_BACKEND_VOLATILE_NO_DRIVE:
+            return "volatile (no ATA)";
+        case FS_BACKEND_VOLATILE_CORRUPT:
+            return "volatile (disk preserved)";
+        case FS_BACKEND_VOLATILE_IO_ERROR:
+            return "volatile (I/O error)";
+        case FS_BACKEND_UNINITIALIZED:
+        default:
+            return "not initialized";
+    }
+}
+
+static const char* storage_compact_label(void) {
+    switch (fs_backend_status()) {
+        case FS_BACKEND_PERSISTENT:
+            return "ATA persistent";
+        case FS_BACKEND_VOLATILE_NO_DRIVE:
+            return "RAM only/no ATA";
+        case FS_BACKEND_VOLATILE_CORRUPT:
+            return "RAM/disk preserved";
+        case FS_BACKEND_VOLATILE_IO_ERROR:
+            return "RAM only/I-O error";
+        case FS_BACKEND_UNINITIALIZED:
+        default:
+            return "not initialized";
+    }
+}
+
+static bool browser_address_is_dynamic(const char* address) {
+    return kstrcmp(address, "about:files") == 0 ||
+           kstrcmp(address, "about:system") == 0 ||
+           kstrcmp(address, "system.log") == 0 ||
+           kstrcmp(address, "file:system.log") == 0;
 }
 
 static int file_index_by_name(const char* name) {
@@ -1223,7 +1267,10 @@ static bool notepad_save(Window* w) {
     }
     state->dirty = false;
     state->discard_deadline = 0;
-    str_copy(state->status, sizeof(state->status), "Saved to filesystem.");
+    str_copy(state->status, sizeof(state->status),
+             fs_backend_is_persistent()
+                 ? "Saved to persistent storage."
+                 : "Saved for this session only.");
     return true;
 }
 
@@ -1253,7 +1300,10 @@ static bool paint_save(Window* w) {
     }
     state->dirty = false;
     state->discard_deadline = 0;
-    str_copy(state->status, sizeof(state->status), "Saved 17x17 BMP.");
+    str_copy(state->status, sizeof(state->status),
+             fs_backend_is_persistent()
+                 ? "Saved persistent 17x17 BMP."
+                 : "Saved 17x17 BMP for this session.");
     return true;
 }
 
@@ -1368,8 +1418,8 @@ static Window* create_window(AppType type, const char* title, int w, int h) {
         win->state.settings.wallpaper_enabled = g_wallpaper_enabled;
         win->state.settings.theme_id = current_theme_idx;
         str_copy(win->state.settings.status,
-                 sizeof(win->state.settings.status),
-                 "Changes persist automatically.");
+                  sizeof(win->state.settings.status),
+                  "Change wallpaper or theme.");
     } else if (type == APP_BROWSER) {
         win->min_w = 360; win->min_h = 180;
         str_copy(win->state.browser.address,
@@ -1382,13 +1432,14 @@ static Window* create_window(AppType type, const char* title, int w, int h) {
         win->state.taskmgr.selected_pid = 0;
         win->state.taskmgr.page_offset = 0;
         str_copy(win->state.taskmgr.status,
-                 sizeof(win->state.taskmgr.status), "Select a non-current task to end it.");
+                  sizeof(win->state.taskmgr.status),
+                  "Showing genuine cooperative kernel tasks.");
     } else if (type == APP_FILES) {
         win->min_w = 310; win->min_h = 180;
         win->state.files.selected_index = -1;
         win->state.files.scroll_offset = 0;
         str_copy(win->state.files.status,
-                 sizeof(win->state.files.status), "Filesystem is live.");
+                  sizeof(win->state.files.status), "Ready.");
     } else if (type == APP_NOTEPAD) {
         win->min_w = 260; win->min_h = 180;
         str_copy(win->state.notepad.status,
@@ -1464,6 +1515,11 @@ static Window* create_notepad_file(void) {
 }
 
 static Window* open_image_file(const char* filename) {
+    const struct fs_file* file = fs_find(filename);
+    struct bmp_image image;
+    if (!file || !bmp_open(file->data, file->size, &image))
+        return NULL;
+
     Window* win = create_window(APP_IMAGEVIEW, "Image Viewer", 440, 360);
     if (!win) return NULL;
     if (!imageview_open_named(win, filename)) {
@@ -1471,6 +1527,32 @@ static Window* open_image_file(const char* filename) {
         return NULL;
     }
     str_copy(win->title, sizeof(win->title), filename);
+    return win;
+}
+
+static Window* open_browser_file(const char* filename) {
+    char address[FS_MAX_FILENAME + 6] = "file:";
+    str_append(address, sizeof(address), filename);
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window* existing = windows[i];
+        if (existing && existing->type == APP_BROWSER &&
+            kstrcmp(existing->state.browser.address, address) == 0) {
+            existing->minimized = false;
+            browser_load(existing);
+            int focused_index = focus_window(i);
+            return focused_index >= 0 ? windows[focused_index] : existing;
+        }
+    }
+
+    Window* win = create_window(APP_BROWSER, "Local Browser", 500, 400);
+    if (!win) return NULL;
+    str_copy(win->state.browser.address,
+             sizeof(win->state.browser.address), address);
+    win->state.browser.address_len =
+        kstrlen_local(win->state.browser.address);
+    win->state.browser.address_select_all = false;
+    browser_load(win);
     return win;
 }
 
@@ -1699,18 +1781,28 @@ static int browser_visible_rows(const Window* w) {
     return rows < 1 ? 1 : rows;
 }
 
+static int browser_max_scroll(const Window* w, const BrowserState* state) {
+    int logical_rows =
+        wrapped_content_line_count(state->content, browser_max_columns(w));
+    int visible_rows = browser_visible_rows(w);
+    return logical_rows > visible_rows ? logical_rows - visible_rows : 0;
+}
+
 static void browser_load(Window* w) {
     BrowserState* state = &w->state.browser;
     const char* address = state->address;
     state->scroll = 0;
     state->content[0] = 0;
     state->content_len = 0;
+    state->last_refresh_tick = timer_get_ticks();
 
     if (kstrcmp(address, "about:home") == 0 || address[0] == 0) {
         browser_set_content(state,
             "Nostalux Local Browser\n\n"
             "This browser opens real files from the Nostalux filesystem.\n"
             "Try file:readme.txt, file:motd.txt, about:files, or about:system.\n"
+            "System, file-index, and system.log pages refresh automatically.\n"
+            "Use Refresh to reload any page immediately.\n"
             "Internet URLs are rejected because no network driver is installed.");
         str_copy(state->status, sizeof(state->status), "Built-in home page.");
         return;
@@ -1718,6 +1810,9 @@ static void browser_load(Window* w) {
 
     if (kstrcmp(address, "about:files") == 0) {
         browser_set_content(state, "Filesystem files\n\n");
+        browser_append_content(state, "Storage: ");
+        browser_append_content(state, fs_backend_status_text());
+        browser_append_content(state, "\n\n");
         size_t count = fs_file_count();
         bool complete = true;
         for (size_t i = 0; i < count; i++) {
@@ -1737,8 +1832,8 @@ static void browser_load(Window* w) {
             browser_append_content(state, "\n");
         }
         str_copy(state->status, sizeof(state->status),
-                 complete ? "Live filesystem index."
-                          : "Index shortened to fit the page.");
+                 complete ? "Auto-refreshing filesystem index."
+                          : "Auto-refreshing shortened index.");
         return;
     }
 
@@ -1752,17 +1847,29 @@ static void browser_load(Window* w) {
         browser_append_content(state, "x");
         int_to_str((int)boot->height, number);
         browser_append_content(state, number);
-        browser_append_content(state, "\nDetected RAM: ");
+        browser_append_content(state, "\nPhysical usable RAM: ");
         uint64_to_str(profile->memory_total_kb, number);
         browser_append_content(state, number);
-        browser_append_content(state, " KB\nKernel RAM in use: ");
+        browser_append_content(state, " KB\nMapped usable RAM: ");
+        uint64_to_str(profile->memory_mapped_kb, number);
+        browser_append_content(state, number);
+        browser_append_content(state, " KB\nKernel committed RAM: ");
         uint64_to_str(profile->memory_used_kb, number);
+        browser_append_content(state, number);
+        browser_append_content(state, " KB\n  Reserved low RAM: ");
+        uint64_to_str(profile->memory_reserved_kb, number);
+        browser_append_content(state, number);
+        browser_append_content(state, " KB\n  Heap committed: ");
+        uint64_to_str(profile->memory_heap_committed_kb, number);
         browser_append_content(state, number);
         browser_append_content(state, " KB\nUptime: ");
         uint64_to_str(timer_get_uptime(), number);
         browser_append_content(state, number);
-        browser_append_content(state, " seconds\n");
-        str_copy(state->status, sizeof(state->status), "Live kernel information.");
+        browser_append_content(state, " seconds\nStorage: ");
+        browser_append_content(state, fs_backend_status_text());
+        browser_append_content(state, "\n");
+        str_copy(state->status, sizeof(state->status),
+                 "Auto-refreshing kernel information.");
         return;
     }
 
@@ -1830,7 +1937,7 @@ static bool imageview_open_named(Window* w, const char* name) {
         str_copy(state->status, sizeof(state->status),
                  "Invalid or unsupported 24-bit BMP.");
     }
-    return true;
+    return state->valid;
 }
 
 static void imageview_load(Window* w, int direction) {
@@ -2007,14 +2114,23 @@ static void assistant_submit(Window* w) {
         str_append(details, sizeof(details), " MB");
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI, details);
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
-            "The OS is a freestanding hobby kernel with its own shell, GUI, scheduler, and ATA-backed files.");
+            "The OS is a freestanding hobby kernel with its own shell, GUI, cooperative scheduler, and filesystem.");
+        char storage_reply[64] = "Current storage: ";
+        str_append(storage_reply, sizeof(storage_reply), storage_short_label());
+        str_append(storage_reply, sizeof(storage_reply), ".");
+        assistant_add_wrapped(state, ASSISTANT_ROLE_AI, storage_reply);
     } else if (text_contains_ci(prompt, "command") || text_contains_ci(prompt, "shell") ||
                text_contains_ci(prompt, "console")) {
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
             "At the boot shell, type help. Useful commands include gui, ls, cat, write, calc, time, sysinfo, snake, and shutdown.");
     } else if (text_contains_ci(prompt, "file") || text_contains_ci(prompt, "save")) {
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
-            "Use Files to browse. In the boot shell, ls, cat, touch, write, append, and rm manage the persistent flat filesystem.");
+            "Use Files to browse. Shell commands ls, cat, touch, write, append, and rm manage the flat filesystem.");
+        assistant_add_wrapped(
+            state, ASSISTANT_ROLE_AI,
+            fs_backend_is_persistent()
+                ? "Storage is persistent on the ATA disk."
+                : "Storage is volatile; changes last for this session only.");
     } else if (text_contains_ci(prompt, "internet") || text_contains_ci(prompt, "online") ||
                text_contains_ci(prompt, "network")) {
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
@@ -2187,8 +2303,10 @@ static void handle_notepad_click(Window* w, int x, int y) {
 static void settings_report_result(bool saved) {
     bool editor_blocked =
         !saved && open_file_has_unsaved_changes("desktop.cfg");
+    bool persistent = fs_backend_is_persistent();
     const char* status =
-        saved ? "Saved to desktop.cfg."
+        saved ? (persistent ? "Saved to persistent desktop.cfg."
+                            : "Saved for this session only.")
               : editor_blocked
                     ? "Session only: desktop.cfg has unsaved edits."
                     : "Session only: desktop.cfg save failed.";
@@ -2202,7 +2320,8 @@ static void settings_report_result(bool saved) {
                  sizeof(settings->state.settings.status), status);
     }
     desktop_notify(
-        saved ? "Desktop settings saved."
+        saved ? (persistent ? "Desktop settings saved persistently."
+                            : "Desktop settings saved for this session.")
               : editor_blocked
                     ? "Save or close desktop.cfg in Notepad first."
                     : "Desktop settings changed for this session only.");
@@ -2396,13 +2515,26 @@ static void files_open_selected(Window* w) {
 
     char filename[FS_MAX_FILENAME];
     str_copy(filename, sizeof(filename), file->name);
-    if (filename_is_bmp(filename)) {
-        if (open_image_file(filename))
+    if (kstrcmp(filename, "system.log") == 0) {
+        if (open_browser_file(filename)) {
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "Opened live read-only system.log.");
+        } else {
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "Local Browser could not be opened.");
+        }
+    } else if (filename_is_bmp(filename)) {
+        struct bmp_image image;
+        if (!bmp_open(file->data, file->size, &image)) {
+            str_copy(w->state.files.status, sizeof(w->state.files.status),
+                     "Invalid or unsupported 24-bit BMP.");
+        } else if (open_image_file(filename)) {
             str_copy(w->state.files.status, sizeof(w->state.files.status),
                      "Opened in Image Viewer.");
-        else
+        } else {
             str_copy(w->state.files.status, sizeof(w->state.files.status),
-                     "BMP could not be opened.");
+                     "Image Viewer could not be opened.");
+        }
     } else if (file_is_text(file)) {
         if (open_notepad_file(filename))
             str_copy(w->state.files.status, sizeof(w->state.files.status),
@@ -2429,7 +2561,9 @@ static void files_create_text(Window* w) {
              sizeof(w->state.files.selected_name),
              note->state.notepad.filename);
     str_copy(w->state.files.status, sizeof(w->state.files.status),
-             "Created a persistent text file.");
+             fs_backend_is_persistent()
+                 ? "Created in persistent storage."
+                 : "Created for this session only.");
     files_normalize(w);
 }
 
@@ -2448,6 +2582,12 @@ static void files_delete_selected(Window* w) {
     }
     char filename[FS_MAX_FILENAME];
     str_copy(filename, sizeof(filename), file->name);
+    if (kstrcmp(filename, "system.log") == 0) {
+        files_cancel_delete_confirmation(&w->state.files);
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "system.log is live and read-only.");
+        return;
+    }
     if (open_file_has_unsaved_changes(filename)) {
         files_cancel_delete_confirmation(&w->state.files);
         str_copy(w->state.files.status, sizeof(w->state.files.status),
@@ -2475,7 +2615,9 @@ static void files_delete_selected(Window* w) {
         w->state.files.selected_name[0] = 0;
         w->state.files.renaming = false;
         str_copy(w->state.files.status, sizeof(w->state.files.status),
-                 "File deleted from persistent storage.");
+                 fs_backend_is_persistent()
+                     ? "Deleted from persistent storage."
+                     : "Deleted for this session only.");
         files_normalize(w);
     } else {
         str_copy(w->state.files.status, sizeof(w->state.files.status),
@@ -2488,6 +2630,11 @@ static void files_begin_rename(Window* w) {
     if (!file) {
         str_copy(w->state.files.status, sizeof(w->state.files.status),
                  "Select a file first.");
+        return;
+    }
+    if (kstrcmp(file->name, "system.log") == 0) {
+        str_copy(w->state.files.status, sizeof(w->state.files.status),
+                 "system.log is live and read-only.");
         return;
     }
     str_copy(w->state.files.rename_buffer,
@@ -2518,7 +2665,9 @@ static void files_commit_rename(Window* w) {
         str_copy(w->state.files.selected_name,
                  sizeof(w->state.files.selected_name), new_name);
         str_copy(w->state.files.status, sizeof(w->state.files.status),
-                 "File renamed on persistent storage.");
+                 fs_backend_is_persistent()
+                     ? "Renamed on persistent storage."
+                     : "Renamed for this session only.");
     } else {
         str_copy(w->state.files.status, sizeof(w->state.files.status),
                  "Rename failed: name may be invalid or in use.");
@@ -2695,13 +2844,11 @@ static void handle_browser_click(Window* w, int x, int y) {
     } else if (rect_contains(cx + 8, button_y, 42, 20, x, y)) {
         if (state->scroll > 0) state->scroll--;
     } else if (rect_contains(cx + 56, button_y, 50, 20, x, y)) {
-        int max_cols = browser_max_columns(w);
-        int visible_rows = browser_visible_rows(w);
-        int logical_rows =
-            wrapped_content_line_count(state->content, max_cols);
-        int max_scroll = logical_rows > visible_rows
-                       ? logical_rows - visible_rows : 0;
+        int max_scroll = browser_max_scroll(w, state);
         if (state->scroll < max_scroll) state->scroll++;
+    } else if (rect_contains(cx + 112, button_y, 66, 20, x, y)) {
+        state->address_select_all = false;
+        browser_load(w);
     }
 }
 
@@ -3023,17 +3170,22 @@ static void update_sysmon(Window* w) {
 
     const struct system_profile* profile = system_profile_info();
     uint32_t total_kb = profile->memory_total_kb;
+    uint32_t mapped_kb = profile->memory_mapped_kb;
     uint32_t used_kb = profile->memory_used_kb;
     int memory_percent = 0;
-    if (total_kb > 0) {
+    if (mapped_kb > 0) {
         uint64_t scaled = (uint64_t)used_kb * 100u;
-        memory_percent = (int)(scaled / total_kb);
+        memory_percent = (int)(scaled / mapped_kb);
         if (memory_percent > 100) memory_percent = 100;
     }
 
     s->cpu_percent = cpu_percent;
     s->memory_used_kb = used_kb;
     s->memory_total_kb = total_kb;
+    s->memory_mapped_kb = mapped_kb;
+    s->memory_managed_kb = profile->memory_managed_kb;
+    s->memory_reserved_kb = profile->memory_reserved_kb;
+    s->memory_heap_committed_kb = profile->memory_heap_committed_kb;
     s->cpu_hist[s->head] = cpu_percent;
     s->mem_hist[s->head] = memory_percent;
     s->previous_cpu = current;
@@ -3051,7 +3203,7 @@ static void reconcile_filesystem_windows(const char* files_status) {
             files_normalize(w);
             str_copy(w->state.files.status, sizeof(w->state.files.status),
                      files_status ? files_status
-                                  : "Refreshed live filesystem listing.");
+                                  : "Refreshed current filesystem listing.");
         } else if (w->type == APP_BROWSER) {
             browser_load(w);
         } else if (w->type == APP_IMAGEVIEW) {
@@ -3105,7 +3257,7 @@ static void reconcile_filesystem_windows(const char* files_status) {
 
 static void desktop_refresh(void) {
     settings_load();
-    reconcile_filesystem_windows("Refreshed live filesystem listing.");
+    reconcile_filesystem_windows("Refreshed current filesystem listing.");
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window* w = windows[i];
         if (!w) continue;
@@ -3543,9 +3695,12 @@ static void render_window(Window* w) {
         draw_bevel_box(cx+10, cy+100, cw-20, 100, true);
         graphics_fill_rect(cx+12, cy+102, cw-24, 96, COL_WHITE);
         
+        char storage_credit[64] = "Storage: ";
+        str_append(storage_credit, sizeof(storage_credit),
+                   storage_short_label());
         const char* credits[] = {
             "Kernel: freestanding x86-64",
-            "Storage: ATA flat filesystem",
+            storage_credit,
             "Tasks: cooperative scheduler",
             "Desktop: kernel-mode GUI",
             "Status: active development"
@@ -3712,6 +3867,16 @@ static void render_window(Window* w) {
     }
     else if (w->type == APP_BROWSER) {
         BrowserState* state = &w->state.browser;
+        uint64_t browser_now = timer_get_ticks();
+        if (browser_address_is_dynamic(state->address) &&
+            browser_now - state->last_refresh_tick >= 100u) {
+            int previous_scroll = state->scroll;
+            browser_load(w);
+            int max_scroll = browser_max_scroll(w, state);
+            if (previous_scroll < 0) previous_scroll = 0;
+            state->scroll =
+                previous_scroll > max_scroll ? max_scroll : previous_scroll;
+        }
         int field_w = cw - 44;
         uint32_t field_bg =
             state->address_select_all ? 0xFF2255AA : COL_WHITE;
@@ -3772,7 +3937,10 @@ static void render_window(Window* w) {
         draw_bevel_box(cx + 56, button_y, 50, 20, false);
         graphics_draw_string_scaled(cx + 63, button_y + 6, "DOWN",
                                     COL_BLACK, COL_BTN_FACE, 1);
-        draw_string_bounded(cx + 114, button_y + 6, cw - 122,
+        draw_bevel_box(cx + 112, button_y, 66, 20, false);
+        graphics_draw_string_scaled(cx + 117, button_y + 6, "REFRESH",
+                                    COL_BLACK, COL_BTN_FACE, 1);
+        draw_string_bounded(cx + 184, button_y + 6, cw - 192,
                             state->status, 0xFF226622, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_TASKMGR) {
@@ -3812,7 +3980,9 @@ static void render_window(Window* w) {
         }
 
         draw_string_bounded(cx + 10, cy + ch - 52, cw - 20,
-                            "Desktop apps share the kernel/desktop task.",
+                            total <= 1
+                                ? "No background tasks; current kernel task only."
+                                : "Desktop apps share the kernel/desktop task.",
                             0xFF555555, COL_WIN_BODY, 1);
         draw_string_bounded(cx + 10, cy + ch - 38, cw - 20,
                             w->state.taskmgr.status,
@@ -3856,7 +4026,7 @@ static void render_window(Window* w) {
         int graph_x = cx + 10;
         int graph_y = cy + 24;
         int graph_w = cw - 20;
-        int graph_h = 70;
+        int graph_h = 60;
         graphics_fill_rect(graph_x, graph_y, graph_w, graph_h, COL_BLACK);
         int graph_step = graph_w / SYSMON_HIST;
         if (graph_step < 2) graph_step = 2;
@@ -3873,30 +4043,75 @@ static void render_window(Window* w) {
             }
         }
 
-        char memory_label[64] = "Kernel RAM: ";
-        uint64_to_str((uint64_t)state->memory_used_kb, number);
-        str_append(memory_label, sizeof(memory_label), number);
-        str_append(memory_label, sizeof(memory_label), " / ");
+        char physical_label[48] = "Physical usable: ";
         uint64_to_str((uint64_t)state->memory_total_kb, number);
-        str_append(memory_label, sizeof(memory_label), number);
-        str_append(memory_label, sizeof(memory_label), " KB  ");
+        str_append(physical_label, sizeof(physical_label), number);
+        str_append(physical_label, sizeof(physical_label), " KB");
+        draw_string_bounded(cx + 10, cy + 92, cw - 20, physical_label,
+                            0xFF555555, COL_WIN_BODY, 1);
+
+        char reserved_label[48] = "Fixed reserved: ";
+        uint64_to_str((uint64_t)state->memory_reserved_kb, number);
+        str_append(reserved_label, sizeof(reserved_label), number);
+        str_append(reserved_label, sizeof(reserved_label), " KB");
+        draw_string_bounded(cx + 10, cy + 106, cw - 20, reserved_label,
+                            0xFF555555, COL_WIN_BODY, 1);
+
+        char heap_capacity_label[48] = "Heap capacity: ";
+        uint64_to_str((uint64_t)state->memory_managed_kb, number);
+        str_append(heap_capacity_label, sizeof(heap_capacity_label), number);
+        str_append(heap_capacity_label, sizeof(heap_capacity_label), " KB");
+        draw_string_bounded(cx + 10, cy + 120, cw - 20,
+                            heap_capacity_label,
+                            0xFF555555, COL_WIN_BODY, 1);
+
+        int heap_percent = 0;
+        if (state->memory_managed_kb > 0) {
+            heap_percent = (int)(
+                ((uint64_t)state->memory_heap_committed_kb * 100u) /
+                state->memory_managed_kb);
+            if (heap_percent > 100) heap_percent = 100;
+        }
+        char heap_commit_label[64] = "Heap commit: ";
+        uint64_to_str((uint64_t)state->memory_heap_committed_kb, number);
+        str_append(heap_commit_label, sizeof(heap_commit_label), number);
+        str_append(heap_commit_label, sizeof(heap_commit_label), " KB (");
+        int_to_str(heap_percent, number);
+        str_append(heap_commit_label, sizeof(heap_commit_label), number);
+        str_append(heap_commit_label, sizeof(heap_commit_label), "% of cap)");
+        draw_string_bounded(cx + 10, cy + 134, cw - 20,
+                            heap_commit_label,
+                            0xFF555555, COL_WIN_BODY, 1);
+
+        char mapped_label[64] = "Mapped commit: ";
+        uint64_to_str((uint64_t)state->memory_used_kb, number);
+        str_append(mapped_label, sizeof(mapped_label), number);
+        str_append(mapped_label, sizeof(mapped_label), "/");
+        uint64_to_str((uint64_t)state->memory_mapped_kb, number);
+        str_append(mapped_label, sizeof(mapped_label), number);
+        str_append(mapped_label, sizeof(mapped_label), " KB ");
         int_to_str(state->mem_hist[state->head], number);
-        str_append(memory_label, sizeof(memory_label), number);
-        str_append(memory_label, sizeof(memory_label), "%");
-        draw_string_bounded(cx + 10, cy + 104, cw - 20, memory_label,
+        str_append(mapped_label, sizeof(mapped_label), number);
+        str_append(mapped_label, sizeof(mapped_label), "%");
+        draw_string_bounded(cx + 10, cy + 148, cw - 20, mapped_label,
                             COL_BLACK, COL_WIN_BODY, 1);
 
-        int memory_graph_y = cy + 120;
-        graphics_fill_rect(graph_x, memory_graph_y, graph_w, graph_h, COL_BLACK);
+        int memory_graph_y = cy + 162;
+        int memory_graph_h = ch - 190;
+        if (memory_graph_h > 70) memory_graph_h = 70;
+        if (memory_graph_h < 18) memory_graph_h = 18;
+        graphics_fill_rect(graph_x, memory_graph_y, graph_w,
+                           memory_graph_h, COL_BLACK);
         for (int i = 0; i < SYSMON_HIST; i++) {
             int idx = (state->head - i + SYSMON_HIST) % SYSMON_HIST;
             int val = state->mem_hist[idx];
             if (val > 100) val = 100;
-            int bar_h = (val * graph_h) / 100;
+            int bar_h = (val * memory_graph_h) / 100;
             if (val > 0 && bar_h == 0) bar_h = 1;
             int bx = graph_x + graph_w - graph_step * (i + 1);
             if (bx >= graph_x) {
-                graphics_fill_rect(bx, memory_graph_y + graph_h - bar_h,
+                graphics_fill_rect(bx,
+                                   memory_graph_y + memory_graph_h - bar_h,
                                    graph_step - 1, bar_h, 0xFF3399FF);
             }
         }
@@ -3914,14 +4129,22 @@ static void render_window(Window* w) {
         graphics_draw_string_scaled(cx+10, cy+10, "Desktop Wallpaper:", COL_BLACK, COL_WIN_BODY, 1);
         bool on = w->state.settings.wallpaper_enabled;
         draw_bevel_box(cx+10, cy+30, 140, 30, on);
-        const char* lbl = on ? "Enabled (Random)" : "Disabled (Blue)";
+        const char* lbl = on ? "Enabled (Random)" : "Disabled (Theme)";
         graphics_draw_string_scaled(cx+20, cy+40, lbl, COL_BLACK, COL_BTN_FACE, 1);
         graphics_draw_string_scaled(cx+10, cy+80, "System Theme:", COL_BLACK, COL_WIN_BODY, 1);
         draw_bevel_box(cx+10, cy+100, 140, 30, false);
         graphics_draw_string_scaled(cx+20, cy+110,
                                     current_theme_idx == 0 ? "Ocean Glass" : "Retro Grey",
                                     COL_BLACK, COL_BTN_FACE, 1);
-        draw_string_bounded(cx + 10, cy + 150, cw - 20,
+        char storage_label[48] = "Storage: ";
+        str_append(storage_label, sizeof(storage_label),
+                   storage_compact_label());
+        draw_string_bounded(cx + 10, cy + 136, cw - 20,
+                            storage_label,
+                            fs_backend_is_persistent()
+                                ? 0xFF226622 : 0xFFAA0000,
+                            COL_WIN_BODY, 1);
+        draw_string_bounded(cx + 10, cy + 154, cw - 20,
                             w->state.settings.status,
                             (text_contains_ci(w->state.settings.status, "failed") ||
                              text_contains_ci(w->state.settings.status,
@@ -4033,6 +4256,11 @@ static void render_window(Window* w) {
         graphics_fill_rect(cx + 4, cy + 32, cw - 8, 18, 0xFFCCCCCC);
         graphics_draw_string_scaled(cx + 8, cy + 37, "Name",
                                     COL_BLACK, 0xFFCCCCCC, 1);
+        draw_string_bounded(cx + 64, cy + 37, cw - 130,
+                            storage_compact_label(),
+                            fs_backend_is_persistent()
+                                ? 0xFF226622 : 0xFFAA0000,
+                            0xFFCCCCCC, 1);
         graphics_draw_string_scaled(cx + cw - 58, cy + 37, "Bytes",
                                     COL_BLACK, 0xFFCCCCCC, 1);
         size_t count = fs_file_count();

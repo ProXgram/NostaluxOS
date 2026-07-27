@@ -380,7 +380,13 @@ static void command_sysinfo(const char* args) {
     (void)args;
     const struct BootInfo* boot = system_boot_info();
     const struct system_profile* prof = system_profile_info();
-    kprintf("Res: %ux%u | Mem: %uKB\n", boot->width, boot->height, prof->memory_total_kb);
+    kprintf("Resolution: %ux%u\n", boot->width, boot->height);
+    kprintf("Usable physical RAM: %u KB\n", prof->memory_total_kb);
+    kprintf("Mapped usable RAM: %u KB\n", prof->memory_mapped_kb);
+    kprintf("Kernel committed RAM: %u KB (%u reserved + %u heap)\n",
+            prof->memory_used_kb, prof->memory_reserved_kb,
+            prof->memory_heap_committed_kb);
+    kprintf("Storage: %s\n", fs_backend_status_text());
 }
 
 static void command_memtest(const char* args) {
