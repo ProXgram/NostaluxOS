@@ -14,6 +14,8 @@ typedef struct {
 void mouse_init(void);
 void mouse_handle_interrupt(void);
 MouseState mouse_get_state(void);
+/* True when QEMU VMMouse absolute host/guest coordinate sync is active. */
+bool mouse_is_absolute(void);
 
 // Sensitivity controls
 void mouse_set_sensitivity(int sense);

@@ -3,6 +3,7 @@
 #include "interrupts.h"
 #include "graphics.h"
 #include "syslog.h"
+#include "vmmouse_decode.h"
 
 #define MOUSE_PORT_DATA    0x60
 #define MOUSE_PORT_STATUS  0x64
@@ -11,13 +12,140 @@
 #define MOUSE_RESEND       0xFE
 #define MOUSE_MAX_RETRIES  3
 
+#define VMMOUSE_PORT             0x5658u
+#define VMMOUSE_MAGIC            0x564D5868u
+#define VMMOUSE_CMD_DATA         39u
+#define VMMOUSE_CMD_STATUS       40u
+#define VMMOUSE_CMD_COMMAND      41u
+#define VMMOUSE_READ_ID          0x45414552u
+#define VMMOUSE_DISABLE          0x000000F5u
+#define VMMOUSE_REQUEST_ABSOLUTE 0x53424152u
+#define VMMOUSE_VERSION          0x3442554Au
+#define VMMOUSE_STATUS_ERROR     0xFFFF0000u
+#define VMMOUSE_PACKET_WORDS     4u
+#define VMMOUSE_MAX_IRQ_PACKETS  16u
+
+struct vmmouse_result {
+    uint32_t eax;
+    uint32_t ebx;
+    uint32_t ecx;
+    uint32_t edx;
+};
+
 static uint8_t g_mouse_cycle = 0;
 static uint8_t g_mouse_byte[3];
-static int     g_mouse_x = 0;
-static int     g_mouse_y = 0;
-static bool    g_left_btn = false;
-static bool    g_right_btn = false;
-static int     g_sensitivity = 1;
+/*
+ * Packet state is published by IRQ12 and sampled by foreground GUI/syscall
+ * code. Keep the shared fields volatile and take snapshots with interrupts
+ * masked so one MouseState can never combine coordinates/buttons from two
+ * different packets.
+ */
+static volatile int  g_mouse_x = 0;
+static volatile int  g_mouse_y = 0;
+static volatile bool g_left_btn = false;
+static volatile bool g_right_btn = false;
+static volatile int  g_sensitivity = 1;
+static volatile bool g_mouse_absolute = false;
+
+/*
+ * QEMU's default PC machine exposes the VMware-compatible VMMouse through the
+ * VMPort backdoor. The device returns up to four data words through EAX..EDX
+ * when the guest executes an INL with the protocol registers populated.
+ */
+static struct vmmouse_result vmmouse_call(uint32_t command,
+                                         uint32_t argument) {
+    struct vmmouse_result result = {
+        .eax = VMMOUSE_MAGIC,
+        .ebx = argument,
+        .ecx = command,
+        .edx = VMMOUSE_PORT,
+    };
+
+    __asm__ volatile(
+        "inl %%dx, %%eax"
+        : "+a"(result.eax), "+b"(result.ebx),
+          "+c"(result.ecx), "+d"(result.edx)
+        :
+        : "memory"
+    );
+
+    return result;
+}
+
+static uint32_t vmmouse_status(void) {
+    return vmmouse_call(VMMOUSE_CMD_STATUS, 0).eax;
+}
+
+static void vmmouse_set_mode(uint32_t mode) {
+    (void)vmmouse_call(VMMOUSE_CMD_COMMAND, mode);
+}
+
+static bool vmmouse_status_is_error(uint32_t status) {
+    return status == 0xFFFFu ||
+           (status & VMMOUSE_STATUS_ERROR) == VMMOUSE_STATUS_ERROR;
+}
+
+static bool vmmouse_probe_absolute(void) {
+    /*
+     * READ_ID enables the protocol and queues one version word. Strictly
+     * validate that response before asking QEMU to report absolute events.
+     */
+    vmmouse_set_mode(VMMOUSE_READ_ID);
+
+    uint32_t queued_words = vmmouse_status();
+    if (vmmouse_status_is_error(queued_words) || queued_words != 1u) {
+        vmmouse_set_mode(VMMOUSE_DISABLE);
+        return false;
+    }
+
+    struct vmmouse_result version = vmmouse_call(VMMOUSE_CMD_DATA, 1u);
+    if (version.eax != VMMOUSE_VERSION) {
+        vmmouse_set_mode(VMMOUSE_DISABLE);
+        return false;
+    }
+
+    vmmouse_set_mode(VMMOUSE_REQUEST_ABSOLUTE);
+    return true;
+}
+
+static void vmmouse_drain_absolute_packets(void) {
+    for (unsigned int packet = 0;
+         packet < VMMOUSE_MAX_IRQ_PACKETS;
+         packet++) {
+        uint32_t queued_words = vmmouse_status();
+        if (vmmouse_status_is_error(queued_words)) {
+            /*
+             * If a hypervisor withdraws VMPort at runtime, disable the
+             * extension and let subsequent IRQ bytes resynchronize on the
+             * ordinary relative PS/2 packet path.
+             */
+            vmmouse_set_mode(VMMOUSE_DISABLE);
+            g_mouse_absolute = false;
+            g_mouse_cycle = 0;
+            return;
+        }
+        if (queued_words < VMMOUSE_PACKET_WORDS) {
+            return;
+        }
+
+        struct vmmouse_result event =
+            vmmouse_call(VMMOUSE_CMD_DATA, VMMOUSE_PACKET_WORDS);
+        int width = graphics_get_width();
+        int height = graphics_get_height();
+        MouseState next = vmmouse_decode_event(event.eax, event.ebx,
+                                                event.ecx, width, height);
+
+        /*
+         * IRQ gates keep maskable interrupts disabled here. Foreground readers
+         * also mask interrupts while copying, so these four stores publish one
+         * coherent absolute event even though MouseState spans several words.
+         */
+        g_mouse_x = next.x;
+        g_mouse_y = next.y;
+        g_left_btn = next.left_button;
+        g_right_btn = next.right_button;
+    }
+}
 
 static int mouse_decode_delta(uint8_t flags, uint8_t movement,
                               uint8_t sign_mask, uint8_t overflow_mask) {
@@ -83,6 +211,7 @@ void mouse_init(void) {
 
     // Disable interrupts during setup, but preserve the caller's IF state.
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_rflags) :: "memory");
+    g_mouse_absolute = false;
 
     // 1. Enable Mouse Port (Command 0xA8)
     if (!mouse_wait(false)) {
@@ -140,15 +269,25 @@ void mouse_init(void) {
     g_left_btn = false;
     g_right_btn = false;
 
+    /*
+     * Prefer true host/guest coordinate synchronization when QEMU's default
+     * VMMouse responds. Real hardware and VMs without VMPort remain on the
+     * standard relative PS/2 packet path.
+     */
+    g_mouse_absolute = vmmouse_probe_absolute();
+
     // Unmask IRQ 12 (Slave PIC line 4)
     interrupts_enable_irq(12);
     
     mouse_restore_interrupts(saved_rflags);
-    syslog_write("Mouse: PS/2 initialized");
+    syslog_write(g_mouse_absolute
+                     ? "Mouse: QEMU VMMouse absolute pointer initialized"
+                     : "Mouse: PS/2 relative pointer initialized");
     return;
 
 fail:
     g_mouse_cycle = 0;
+    g_mouse_absolute = false;
     mouse_restore_interrupts(saved_rflags);
     syslog_write(failure ? failure : "Mouse: PS/2 initialization failed");
 }
@@ -161,6 +300,17 @@ void mouse_handle_interrupt(void) {
 
     // Read the data
     uint8_t b = inb(MOUSE_PORT_DATA);
+
+    if (g_mouse_absolute) {
+        /*
+         * VMMouse raises a synthetic PS/2 event to signal queued VMPort data.
+         * Reading the byte acknowledges the controller; coordinates come from
+         * the four-word absolute packets instead.
+         */
+        (void)b;
+        vmmouse_drain_absolute_packets();
+        return;
+    }
 
     switch(g_mouse_cycle) {
         case 0:
@@ -219,10 +369,19 @@ void mouse_handle_interrupt(void) {
 
 MouseState mouse_get_state(void) {
     MouseState s;
+
+    uint64_t saved_rflags;
+    __asm__ volatile("pushfq; popq %0; cli"
+                     : "=r"(saved_rflags)
+                     :
+                     : "memory");
+
     s.x = g_mouse_x;
     s.y = g_mouse_y;
     s.left_button = g_left_btn;
     s.right_button = g_right_btn;
+
+    mouse_restore_interrupts(saved_rflags);
     return s;
 }
 
@@ -233,4 +392,8 @@ void mouse_set_sensitivity(int sense) {
 
 int mouse_get_sensitivity(void) {
     return g_sensitivity;
+}
+
+bool mouse_is_absolute(void) {
+    return g_mouse_absolute;
 }

@@ -32,17 +32,17 @@ struct BootInfo {
 struct system_profile {
     const char* architecture;
     /* All physical RAM reported usable by the normalized E820 map. */
-    uint32_t memory_total_kb;
+    uint64_t memory_total_kb;
     /* Portion of usable RAM addressable by the current low identity map. */
-    uint32_t memory_mapped_kb;
+    uint64_t memory_mapped_kb;
     /* Size of the RAM region managed by the kernel heap allocator. */
-    uint32_t memory_managed_kb;
+    uint64_t memory_managed_kb;
     /* Usable low RAM reserved by the fixed kernel/graphics layout. */
-    uint32_t memory_reserved_kb;
+    uint64_t memory_reserved_kb;
     /* Heap allocations plus allocator metadata, excluding free payload. */
-    uint32_t memory_heap_committed_kb;
+    uint64_t memory_heap_committed_kb;
     /* Reserved low RAM plus committed heap RAM. */
-    uint32_t memory_used_kb;
+    uint64_t memory_used_kb;
 };
 
 void system_cache_boot_info(const struct BootInfo* boot_info);

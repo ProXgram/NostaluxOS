@@ -9,8 +9,12 @@
 #include <string.h>
 
 #define TEST_SECTOR_SIZE 512u
-#define TEST_DISK_SECTORS 4096u
-#define TEST_FS_STORAGE_LBA 2048u
+#ifndef FS_STORAGE_LBA
+#define FS_STORAGE_LBA 2048u
+#endif
+#define TEST_DISK_SECTORS (FS_STORAGE_LBA + 2048u)
+#define TEST_FS_STORAGE_LBA FS_STORAGE_LBA
+#define TEST_FS_DISK_VERSION 4u
 #define TEST_FS_RECORD_BYTES \
     (1u + FS_MAX_FILENAME + 4u + FS_MAX_FILE_SIZE)
 #define TEST_FS_TABLE_BYTES (TEST_FS_RECORD_BYTES * FS_MAX_FILES)
@@ -24,6 +28,7 @@ static const uint8_t TEST_SELF_TEST_PAYLOAD[] = {
 
 static uint8_t g_disk[TEST_DISK_SECTORS * TEST_SECTOR_SIZE];
 static bool g_drive_available;
+static bool g_init_error;
 static bool g_fail_reads;
 static bool g_fail_writes;
 static uint32_t g_fail_read_lba;
@@ -31,9 +36,11 @@ static uint32_t g_fail_write_lba;
 static size_t g_read_calls;
 static size_t g_write_calls;
 static size_t g_drop_writes_after;
+static uint32_t g_copy_then_uncertain_lba;
 
-bool ata_init(void) {
-    return g_drive_available;
+ata_init_result_t ata_init(void) {
+    if (!g_drive_available) return ATA_INIT_NO_DEVICE;
+    return g_init_error ? ATA_INIT_ERROR : ATA_INIT_READY;
 }
 
 bool ata_read(uint32_t lba, uint8_t count, uint8_t* buffer) {
@@ -49,27 +56,33 @@ bool ata_read(uint32_t lba, uint8_t count, uint8_t* buffer) {
     return true;
 }
 
-bool ata_write(uint32_t lba, uint8_t count, const uint8_t* buffer) {
+ata_write_result_t ata_write(
+    uint32_t lba, uint8_t count, const uint8_t* buffer) {
     g_write_calls++;
     if (!g_drive_available || g_fail_writes || buffer == NULL ||
         count == 0 || lba + count > TEST_DISK_SECTORS) {
-        return false;
+        return ATA_WRITE_FAILED;
     }
     if (g_fail_write_lba >= lba &&
         g_fail_write_lba < lba + (uint32_t)count) {
-        return false;
+        return ATA_WRITE_FAILED;
     }
     if (g_write_calls > g_drop_writes_after) {
-        return true;
+        return ATA_WRITE_COMPLETE;
     }
     memcpy(&g_disk[lba * TEST_SECTOR_SIZE], buffer,
            (size_t)count * TEST_SECTOR_SIZE);
-    return true;
+    if (g_copy_then_uncertain_lba >= lba &&
+        g_copy_then_uncertain_lba < lba + (uint32_t)count) {
+        return ATA_WRITE_UNCERTAIN;
+    }
+    return ATA_WRITE_COMPLETE;
 }
 
 static void reset_storage(void) {
     memset(g_disk, 0, sizeof(g_disk));
     g_drive_available = true;
+    g_init_error = false;
     g_fail_reads = false;
     g_fail_writes = false;
     g_fail_read_lba = UINT32_MAX;
@@ -77,6 +90,7 @@ static void reset_storage(void) {
     g_read_calls = 0;
     g_write_calls = 0;
     g_drop_writes_after = (size_t)-1;
+    g_copy_then_uncertain_lba = UINT32_MAX;
     syslog_init();
 }
 
@@ -86,7 +100,8 @@ struct test_fs_header {
     uint32_t table_bytes;
     uint32_t checksum;
     uint32_t generation;
-    uint8_t reserved[TEST_SECTOR_SIZE - 20u];
+    uint32_t header_checksum;
+    uint8_t reserved[TEST_SECTOR_SIZE - 24u];
 } __attribute__((packed));
 
 struct test_fs_record {
@@ -111,6 +126,23 @@ static uint32_t test_checksum(const void* data, size_t length) {
     return value;
 }
 
+static uint32_t test_header_checksum(const struct test_fs_header* header) {
+    const uint8_t* bytes = (const uint8_t*)header;
+    const size_t checksum_offset =
+        offsetof(struct test_fs_header, header_checksum);
+    uint32_t value = 2166136261u;
+    for (size_t i = 0; i < sizeof(*header); i++) {
+        uint8_t byte =
+            i >= checksum_offset &&
+                    i < checksum_offset + sizeof(header->header_checksum)
+                ? 0u
+                : bytes[i];
+        value ^= byte;
+        value *= 16777619u;
+    }
+    return value;
+}
+
 static uint32_t test_slot_header_lba(uint8_t slot) {
     return TEST_FS_STORAGE_LBA + (uint32_t)slot * TEST_FS_SLOT_SECTORS;
 }
@@ -127,9 +159,14 @@ static uint8_t* test_table(uint8_t slot) {
 }
 
 static void update_slot_checksum(uint8_t slot) {
-    test_header(slot)->checksum =
+    struct test_fs_header* header = test_header(slot);
+    header->checksum =
         test_checksum(test_table(slot),
                       TEST_FS_TABLE_SECTORS * TEST_SECTOR_SIZE);
+    if (header->version == TEST_FS_DISK_VERSION) {
+        header->header_checksum = 0u;
+        header->header_checksum = test_header_checksum(header);
+    }
 }
 
 static size_t rename_file_on_disk(
@@ -222,11 +259,13 @@ static void fill_all_slots_without_system_log(void) {
 static void reset_io_observation(void) {
     g_read_calls = 0;
     g_write_calls = 0;
+    g_init_error = false;
     g_fail_reads = false;
     g_fail_writes = false;
     g_fail_read_lba = UINT32_MAX;
     g_fail_write_lba = UINT32_MAX;
     g_drop_writes_after = (size_t)-1;
+    g_copy_then_uncertain_lba = UINT32_MAX;
     syslog_init();
 }
 
@@ -362,6 +401,220 @@ static void test_valid_older_slot_preserves_corrupt_newer_slot(void) {
     assert(*corrupt_byte == preserved);
 }
 
+static void test_generation_corruption_cannot_reorder_slots(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("newest-only.txt", "integrity-protected newest slot"));
+
+    uint8_t true_newest = newest_slot();
+    uint8_t older = (uint8_t)(true_newest ^ 1u);
+    uint32_t true_generation = test_header(true_newest)->generation;
+    test_header(older)->generation = true_generation + 2u;
+    assert(test_header(older)->header_checksum !=
+           test_header_checksum(test_header(older)));
+
+    reset_io_observation();
+    fs_init();
+
+    /*
+     * The tampered older header is corrupt, not "newer". The authentic slot
+     * is recovered read-only so no subsequent mutation can overwrite it.
+     */
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_CORRUPT);
+    assert(strcmp(fs_find("newest-only.txt")->data,
+                  "integrity-protected newest slot") == 0);
+    assert(g_write_calls == 0);
+    assert(fs_write("session.txt", "volatile recovery"));
+    assert(g_write_calls == 0);
+}
+
+static void test_legacy_headers_migrate_to_integrity_metadata(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("legacy-data.txt", "preserve during migration"));
+
+    /*
+     * Identical legacy snapshots are unambiguous and can be upgraded without
+     * trusting their generation fields that lack integrity protection.
+     */
+    uint8_t source = newest_slot();
+    uint8_t duplicate = (uint8_t)(source ^ 1u);
+    memcpy(test_table(duplicate), test_table(source),
+           TEST_FS_TABLE_SECTORS * TEST_SECTOR_SIZE);
+    test_header(duplicate)->checksum = test_header(source)->checksum;
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        test_header(slot)->version = 3u;
+        test_header(slot)->header_checksum = 0u;
+    }
+
+    reset_io_observation();
+    fs_init();
+
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("legacy-data.txt")->data,
+                  "preserve during migration") == 0);
+    assert(g_write_calls == 2u);
+    uint8_t migrated = newest_slot();
+    assert(test_header(migrated)->version == TEST_FS_DISK_VERSION);
+    assert(test_header(migrated)->header_checksum ==
+           test_header_checksum(test_header(migrated)));
+    assert(log_contains(
+        "upgraded to integrity-protected commit metadata"));
+
+    uint8_t remaining_legacy = (uint8_t)(migrated ^ 1u);
+    test_header(remaining_legacy)->generation =
+        test_header(migrated)->generation + 100u;
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("legacy-data.txt")->data,
+                  "preserve during migration") == 0);
+    assert(g_write_calls == 0u);
+    assert(fs_write("post-migration.txt", "v4 remains authoritative"));
+    assert(test_header(remaining_legacy)->version ==
+           TEST_FS_DISK_VERSION);
+}
+
+static void test_ordinary_legacy_volume_requires_confirmed_upgrade(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("ordinary-v3.txt", "selected recovery snapshot"));
+
+    uint8_t selected_legacy = newest_slot();
+    uint8_t rollback_legacy = (uint8_t)(selected_legacy ^ 1u);
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        test_header(slot)->version = 3u;
+        test_header(slot)->header_checksum = 0u;
+    }
+
+    reset_io_observation();
+    fs_init();
+
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_CORRUPT);
+    assert(fs_legacy_upgrade_status() == FS_LEGACY_UPGRADE_AVAILABLE);
+    assert(strstr(fs_legacy_upgrade_status_text(), "available") != NULL);
+    assert(strstr(fs_backend_status_text(), "fsupgrade") != NULL);
+    assert(strcmp(fs_find("ordinary-v3.txt")->data,
+                  "selected recovery snapshot") == 0);
+    assert(g_write_calls == 0u);
+
+    assert(fs_upgrade_legacy_snapshot("yes") ==
+           FS_LEGACY_UPGRADE_CONFIRMATION_REQUIRED);
+    assert(fs_upgrade_legacy_snapshot(NULL) ==
+           FS_LEGACY_UPGRADE_CONFIRMATION_REQUIRED);
+    assert(g_write_calls == 0u);
+
+    reset_io_observation();
+    assert(fs_upgrade_legacy_snapshot(FS_LEGACY_UPGRADE_CONFIRMATION) ==
+           FS_LEGACY_UPGRADE_SUCCEEDED);
+    assert(fs_backend_is_persistent());
+    assert(fs_legacy_upgrade_status() == FS_LEGACY_UPGRADE_UNAVAILABLE);
+    assert(g_write_calls == 2u);
+    /*
+     * A confirmed upgrade verifies the table before publishing its header,
+     * then verifies the complete committed slot. ATA "complete" is not
+     * accepted as a substitute for on-disk read-back.
+     */
+    assert(g_read_calls >=
+           (size_t)(TEST_FS_TABLE_SECTORS * 2u + 1u));
+    assert(test_header(rollback_legacy)->version == TEST_FS_DISK_VERSION);
+    assert(test_header(rollback_legacy)->header_checksum ==
+           test_header_checksum(test_header(rollback_legacy)));
+    assert(memcmp(test_table(rollback_legacy), test_table(selected_legacy),
+                  TEST_FS_TABLE_SECTORS * TEST_SECTOR_SIZE) == 0);
+    /* Keep the selected legacy commit intact as the immediate fallback. */
+    assert(test_header(selected_legacy)->version == 3u);
+    assert(log_contains("explicitly upgraded recovered legacy snapshot"));
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("ordinary-v3.txt")->data,
+                  "selected recovery snapshot") == 0);
+    assert(fs_legacy_upgrade_status() == FS_LEGACY_UPGRADE_UNAVAILABLE);
+}
+
+static void test_unverified_legacy_upgrade_requires_reboot(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("upgrade-readback.txt", "committed before read fault"));
+
+    uint8_t selected_legacy = newest_slot();
+    uint8_t target_slot = (uint8_t)(selected_legacy ^ 1u);
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        test_header(slot)->version = 3u;
+        test_header(slot)->header_checksum = 0u;
+    }
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_legacy_upgrade_status() == FS_LEGACY_UPGRADE_AVAILABLE);
+
+    reset_io_observation();
+    g_fail_read_lba = test_slot_header_lba(target_slot);
+    assert(fs_upgrade_legacy_snapshot(FS_LEGACY_UPGRADE_CONFIRMATION) ==
+           FS_LEGACY_UPGRADE_UNCERTAIN);
+    assert(!fs_backend_is_persistent());
+    assert(fs_legacy_upgrade_status() ==
+           FS_LEGACY_UPGRADE_OUTCOME_UNCERTAIN);
+    assert(strstr(fs_backend_status_text(), "reboot") != NULL);
+    assert(fs_upgrade_legacy_snapshot(FS_LEGACY_UPGRADE_CONFIRMATION) ==
+           FS_LEGACY_UPGRADE_NOT_AVAILABLE);
+    assert(g_write_calls == 2u);
+
+    /*
+     * The read failed after the v4 header write. A clean reboot re-inspects
+     * both slots instead of issuing another blind upgrade write.
+     */
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(test_header(target_slot)->version == TEST_FS_DISK_VERSION);
+    assert(strcmp(fs_find("upgrade-readback.txt")->data,
+                  "committed before read fault") == 0);
+}
+
+static void test_different_legacy_snapshots_do_not_trust_generation(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("newest-only.txt", "legacy newest snapshot"));
+
+    uint8_t true_newest = newest_slot();
+    uint8_t older = (uint8_t)(true_newest ^ 1u);
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        test_header(slot)->version = 3u;
+        test_header(slot)->header_checksum = 0u;
+    }
+    test_header(older)->generation =
+        test_header(true_newest)->generation + 2u;
+
+    uint8_t newest_header_before[TEST_SECTOR_SIZE];
+    uint8_t older_header_before[TEST_SECTOR_SIZE];
+    memcpy(newest_header_before, test_header(true_newest),
+           sizeof(newest_header_before));
+    memcpy(older_header_before, test_header(older),
+           sizeof(older_header_before));
+
+    reset_io_observation();
+    fs_init();
+
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_CORRUPT);
+    assert(fs_legacy_upgrade_status() == FS_LEGACY_UPGRADE_AVAILABLE);
+    assert(g_write_calls == 0u);
+    assert(log_contains("generation order is untrusted"));
+    assert(memcmp(newest_header_before, test_header(true_newest),
+                  sizeof(newest_header_before)) == 0);
+    assert(memcmp(older_header_before, test_header(older),
+                  sizeof(older_header_before)) == 0);
+
+    assert(fs_write("session-only.txt", "do not overwrite either slot"));
+    assert(g_write_calls == 0u);
+    assert(memcmp(newest_header_before, test_header(true_newest),
+                  sizeof(newest_header_before)) == 0);
+    assert(memcmp(older_header_before, test_header(older),
+                  sizeof(older_header_before)) == 0);
+}
+
 static void test_valid_slot_preserves_unsupported_alternate_header(void) {
     reset_storage();
     fs_init();
@@ -392,6 +645,18 @@ static void test_unavailable_backends_stay_volatile(void) {
     fs_init();
     assert(fs_backend_status() == FS_BACKEND_VOLATILE_IO_ERROR);
     assert(fs_write("session.txt", "read failure"));
+    assert(g_write_calls == 0);
+}
+
+static void test_initialization_error_is_not_reported_as_no_drive(void) {
+    reset_storage();
+    g_init_error = true;
+
+    fs_init();
+
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_IO_ERROR);
+    assert(log_contains("storage I/O error"));
+    assert(!log_contains("no ATA drive"));
     assert(g_write_calls == 0);
 }
 
@@ -794,6 +1059,60 @@ static void test_public_mutations_roll_back_on_sync_failure(void) {
     }
 }
 
+static void test_uncertain_header_write_is_reconciled(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("stable.txt", "original"));
+
+    uint8_t target_slot = (uint8_t)(newest_slot() ^ 1u);
+    reset_io_observation();
+    g_copy_then_uncertain_lba = test_slot_header_lba(target_slot);
+
+    assert(fs_write("stable.txt", "copy reached disk"));
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("stable.txt")->data,
+                  "copy reached disk") == 0);
+    assert(g_write_calls == 2u);
+    assert(log_contains("reconciled uncertain commit header"));
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("stable.txt")->data,
+                  "copy reached disk") == 0);
+}
+
+static void test_indeterminate_commit_retains_mutation_in_memory(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("stable.txt", "original"));
+
+    uint8_t target_slot = (uint8_t)(newest_slot() ^ 1u);
+    uint32_t target_lba = test_slot_header_lba(target_slot);
+    reset_io_observation();
+    g_copy_then_uncertain_lba = target_lba;
+    g_fail_read_lba = target_lba;
+
+    assert(fs_write("stable.txt", "uncertain but retained"));
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_IO_ERROR);
+    assert(strcmp(fs_find("stable.txt")->data,
+                  "uncertain but retained") == 0);
+    assert(log_contains("mutation retained on a volatile volume"));
+    assert(g_write_calls == 2u);
+
+    size_t writes_after_uncertainty = g_write_calls;
+    assert(fs_append("stable.txt", " in RAM"));
+    assert(g_write_calls == writes_after_uncertainty);
+    assert(strcmp(fs_find("stable.txt")->data,
+                  "uncertain but retained in RAM") == 0);
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("stable.txt")->data,
+                  "uncertain but retained") == 0);
+}
+
 static void test_syslog_text_snapshot(void) {
     syslog_init();
     syslog_write("alpha");
@@ -810,8 +1129,14 @@ int main(void) {
     test_zero_headers_with_data_are_not_formatted();
     test_blank_headers_prioritize_table_io_over_corruption();
     test_valid_older_slot_preserves_corrupt_newer_slot();
+    test_generation_corruption_cannot_reorder_slots();
+    test_legacy_headers_migrate_to_integrity_metadata();
+    test_ordinary_legacy_volume_requires_confirmed_upgrade();
+    test_unverified_legacy_upgrade_requires_reboot();
+    test_different_legacy_snapshots_do_not_trust_generation();
     test_valid_slot_preserves_unsupported_alternate_header();
     test_unavailable_backends_stay_volatile();
+    test_initialization_error_is_not_reported_as_no_drive();
     test_partial_header_read_recovers_without_writes();
     test_physical_system_log_is_preserved_on_trusted_volume();
     test_physical_system_log_uses_collision_free_recovery_name();
@@ -824,6 +1149,8 @@ int main(void) {
     test_legacy_reserved_name_user_files_are_preserved();
     test_full_volume_gets_one_virtual_system_log();
     test_public_mutations_roll_back_on_sync_failure();
+    test_uncertain_header_write_is_reconciled();
+    test_indeterminate_commit_retains_mutation_in_memory();
     test_syslog_text_snapshot();
     puts("filesystem persistence tests passed");
     return 0;

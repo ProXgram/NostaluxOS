@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+/*
+ * Historical kernel-call numbers. They are retained only as source
+ * compatibility constants and are never accepted through the DPL3 gate.
+ */
 enum syscall_id {
     SYSCALL_YIELD = 0,
     SYSCALL_EXIT = 1,
@@ -14,11 +18,8 @@ enum syscall_id {
     SYSCALL_GET_TIME = 8,
 };
 
-// This ABI is reserved for a future isolated user mode. No DPL3 IDT gate is
-// installed while all mappings are supervisor-only; the dispatcher remains a
-// normal C entry point so its number/result contract can be tested safely.
-// Unknown syscall IDs return this value in RAX.
-#define SYSCALL_RESULT_UNSUPPORTED UINT64_MAX
+/* Unknown, legacy, and not-yet-implemented app services return this value. */
+#define SYSCALL_RESULT_UNSUPPORTED ((uint64_t)(int64_t)-2)
 
 // Register order must match the pushes in entry.asm:isr_syscall.
 struct syscall_regs {

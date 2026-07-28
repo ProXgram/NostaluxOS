@@ -10,10 +10,26 @@
 static volatile uint64_t g_ticks = 0;
 static int g_freq_hz = 100;
 static timer_callback_t g_callback = NULL;
+static volatile bool g_callback_due = false;
 static uint64_t g_cpu_start_cycles = 0;
 static volatile uint64_t g_cpu_idle_cycles = 0;
 static volatile uint64_t g_cpu_idle_start = 0;
 static volatile bool g_cpu_idle_waiting = false;
+
+static uint64_t timer_save_and_disable_interrupts(void) {
+    uint64_t saved_rflags;
+    __asm__ volatile("pushfq; popq %0; cli"
+                     : "=r"(saved_rflags)
+                     :
+                     : "memory");
+    return saved_rflags;
+}
+
+static void timer_restore_interrupts(uint64_t saved_rflags) {
+    if ((saved_rflags & (1ULL << 9)) != 0) {
+        __asm__ volatile("sti" ::: "memory");
+    }
+}
 
 static uint64_t read_tsc_serialized(void) {
     uint32_t low;
@@ -48,24 +64,58 @@ void timer_phase(int hz) {
 }
 
 void timer_set_callback(timer_callback_t callback) {
+    uint64_t saved_rflags = timer_save_and_disable_interrupts();
     g_callback = callback;
+    /*
+     * Do not deliver a callback request accumulated for a previous owner.
+     * The newly installed callback starts on the next four-tick boundary.
+     */
+    g_callback_due = false;
+    timer_restore_interrupts(saved_rflags);
 }
 
 void timer_handler(void) {
     g_ticks++;
-    
-    if (g_callback != NULL && (g_ticks % 4 == 0)) {
-        g_callback();
+
+    /*
+     * IRQ0 only publishes work. Framebuffer drawing and any future callback
+     * work run from timer_poll() after the interrupt handler has returned.
+     */
+    if (g_ticks % 4 == 0) {
+        g_callback_due = true;
+    }
+}
+
+void timer_poll(void) {
+    timer_callback_t callback = NULL;
+    uint64_t saved_rflags = timer_save_and_disable_interrupts();
+
+    if (g_callback_due) {
+        g_callback_due = false;
+        callback = g_callback;
     }
 
+    timer_restore_interrupts(saved_rflags);
+
+    if (callback != NULL) {
+        callback();
+    }
 }
 
 void timer_wait(int ticks) {
     if (ticks <= 0) return;
     uint64_t end = g_ticks + (uint64_t)ticks;
+    uint64_t observed_tick = g_ticks;
+
     while (g_ticks < end) {
+        uint64_t current_tick = g_ticks;
+        if (current_tick != observed_tick) {
+            observed_tick = current_tick;
+            timer_poll();
+        }
         __asm__ volatile("pause");
     }
+    timer_poll();
 }
 
 void timer_idle_wait(void) {
@@ -83,14 +133,20 @@ void timer_idle_wait(void) {
     /*
      * Normal IRQ handlers close the idle interval at entry so their work is
      * counted as busy. This fallback covers an unusual wake source that does
-     * not pass through the PIC handlers.
+     * not pass through the PIC handlers. Mask interrupts while testing and
+     * closing the interval so a late PIC IRQ cannot close it between those
+     * operations and double-count the same idle time.
      */
+    uint64_t saved_rflags = timer_save_and_disable_interrupts();
     if (g_cpu_idle_waiting) {
         uint64_t end = read_tsc_serialized();
         uint64_t start = g_cpu_idle_start;
         if (end >= start) g_cpu_idle_cycles += end - start;
         g_cpu_idle_waiting = false;
     }
+    timer_restore_interrupts(saved_rflags);
+
+    timer_poll();
 }
 
 void timer_interrupt_entry(void) {
@@ -115,13 +171,29 @@ uint64_t timer_get_uptime(void) {
     return g_freq_hz > 0 ? g_ticks / (uint64_t)g_freq_hz : 0;
 }
 
+uint64_t timer_get_milliseconds(void) {
+    const uint64_t ticks = g_ticks;
+    const uint64_t frequency =
+        g_freq_hz > 0 ? (uint64_t)g_freq_hz : 1u;
+    const uint64_t seconds = ticks / frequency;
+    const uint64_t remainder = ticks % frequency;
+    if (seconds > UINT64_MAX / 1000u) return UINT64_MAX;
+    return seconds * 1000u + (remainder * 1000u) / frequency;
+}
+
 void timer_init(void) {
-    timer_phase(100);
+    /*
+     * IRQ0 remains masked by interrupts_init() until all timer-visible state
+     * and the PIT divisor are ready. Reset BIOS-era ticks before unmasking it.
+     */
+    g_ticks = 0;
     g_callback = NULL;
+    g_callback_due = false;
     g_cpu_idle_cycles = 0;
     g_cpu_idle_start = 0;
     g_cpu_idle_waiting = false;
     g_cpu_start_cycles = read_tsc_serialized();
+    timer_phase(100);
     interrupts_enable_irq(0);
     syslog_write("PIT: System timer initialized");
 }

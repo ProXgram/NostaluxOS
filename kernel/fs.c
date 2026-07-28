@@ -5,11 +5,14 @@
 #include "syslog.h"
 #include "ata.h"
 
-#define FS_STORAGE_LBA 2048
+#ifndef FS_STORAGE_LBA
+#define FS_STORAGE_LBA 2048u
+#endif
 #define FS_MAGIC_VAL   0xBA5EBA11
 #define FS_LEGACY_DISK_VERSION 1u
 #define FS_GENERATION_DISK_VERSION 2u
-#define FS_DISK_VERSION 3u
+#define FS_CONTENT_DISK_VERSION 3u
+#define FS_DISK_VERSION 4u
 #define FS_SLOT_COUNT 2u
 #define FS_DISK_RECORD_BYTES (1u + FS_MAX_FILENAME + 4u + FS_MAX_FILE_SIZE)
 #define FS_DISK_TABLE_BYTES (FS_DISK_RECORD_BYTES * FS_MAX_FILES)
@@ -25,7 +28,12 @@ struct fs_disk_header {
     uint32_t table_bytes;
     uint32_t checksum;
     uint32_t generation;
-    uint8_t reserved[512 - 20];
+    /*
+     * Version 4 covers every ordering field above with an integrity checksum.
+     * In versions 1-3 these bytes were part of the zero-filled reserved area.
+     */
+    uint32_t header_checksum;
+    uint8_t reserved[512 - 24];
 } __attribute__((packed));
 
 struct fs_disk_record {
@@ -50,6 +58,8 @@ static uint8_t g_active_slot = FS_SLOT_COUNT;
 static uint32_t g_active_generation = 0;
 static uint32_t g_loaded_version = 0;
 static fs_backend_status_t g_backend_status = FS_BACKEND_UNINITIALIZED;
+static fs_legacy_upgrade_status_t g_legacy_upgrade_status =
+    FS_LEGACY_UPGRADE_UNAVAILABLE;
 static bool g_self_test_active = false;
 static struct fs_file g_virtual_system_log;
 static bool g_system_log_is_virtual = false;
@@ -73,10 +83,30 @@ enum fs_slot_load_result {
     FS_SLOT_IO_ERROR,
 };
 
+enum fs_sync_result {
+    FS_SYNC_COMMITTED,
+    FS_SYNC_FAILED,
+    FS_SYNC_UNCERTAIN,
+};
+
+enum fs_reconcile_result {
+    FS_RECONCILE_MATCH,
+    FS_RECONCILE_MISMATCH,
+    FS_RECONCILE_IO_ERROR,
+};
+
+enum fs_compare_result {
+    FS_COMPARE_EQUAL,
+    FS_COMPARE_DIFFERENT,
+    FS_COMPARE_IO_ERROR,
+};
+
 static bool fs_is_valid_name(const char* name);
 static struct fs_file* fs_find_mutable(const char* name);
 static bool fs_seed_file(const char* name, const char* contents);
 static void fs_refresh_system_log(void);
+static uint32_t fs_checksum(const void* data, size_t length);
+static uint32_t fs_header_checksum(const struct fs_disk_header* header);
 
 static enum fs_disk_load_result fs_loaded_result(
     bool saw_io_error, bool saw_corruption) {
@@ -90,11 +120,22 @@ static uint32_t fs_slot_header_lba(uint8_t slot) {
 }
 
 static bool fs_header_is_valid(const struct fs_disk_header* header) {
-    return header->magic == FS_MAGIC_VAL &&
-           (header->version == FS_LEGACY_DISK_VERSION ||
-            header->version == FS_GENERATION_DISK_VERSION ||
-            header->version == FS_DISK_VERSION) &&
-           header->table_bytes == FS_DISK_TABLE_BYTES;
+    if (header->magic != FS_MAGIC_VAL ||
+        (header->version != FS_LEGACY_DISK_VERSION &&
+         header->version != FS_GENERATION_DISK_VERSION &&
+         header->version != FS_CONTENT_DISK_VERSION &&
+         header->version != FS_DISK_VERSION) ||
+        header->table_bytes != FS_DISK_TABLE_BYTES) {
+        return false;
+    }
+
+    /*
+     * Legacy headers remain readable for an in-place migration. Their
+     * generation was not integrity-protected, so once any v4 slot exists it
+     * is always preferred over a legacy slot.
+     */
+    return header->version != FS_DISK_VERSION ||
+           header->header_checksum == fs_header_checksum(header);
 }
 
 static bool fs_header_is_blank(const struct fs_disk_header* header) {
@@ -130,6 +171,33 @@ static uint32_t fs_checksum(const void* data, size_t length) {
         value *= 16777619u;
     }
     return value;
+}
+
+static uint32_t fs_header_checksum(const struct fs_disk_header* header) {
+    const uint8_t* bytes = (const uint8_t*)header;
+    const size_t checksum_offset =
+        offsetof(struct fs_disk_header, header_checksum);
+    uint32_t value = 2166136261u;
+    for (size_t i = 0; i < sizeof(*header); i++) {
+        uint8_t byte =
+            i >= checksum_offset &&
+                    i < checksum_offset + sizeof(header->header_checksum)
+                ? 0u
+                : bytes[i];
+        value ^= byte;
+        value *= 16777619u;
+    }
+    return value;
+}
+
+static bool fs_bytes_equal(
+    const void* lhs_data, const void* rhs_data, size_t length) {
+    const uint8_t* lhs = (const uint8_t*)lhs_data;
+    const uint8_t* rhs = (const uint8_t*)rhs_data;
+    for (size_t i = 0; i < length; i++) {
+        if (lhs[i] != rhs[i]) return false;
+    }
+    return true;
 }
 
 static void fs_serialize(void) {
@@ -227,11 +295,76 @@ static enum fs_slot_load_result fs_load_slot(
     return FS_SLOT_LOADED;
 }
 
-// Helper to persist data to the disk
-static bool fs_sync_to_disk(void) {
-    if (!ata_init()) {
-        syslog_write("FS: Disk sync failed (no ATA drive)");
-        return false;
+static enum fs_reconcile_result fs_reconcile_table(uint32_t target_lba) {
+    uint8_t observed[512];
+    const uint8_t* expected = (const uint8_t*)&g_disk_table;
+    for (uint32_t sector = 0; sector < FS_DISK_TABLE_SECTORS; sector++) {
+        if (!ata_read(target_lba + 1u + sector, 1u, observed)) {
+            return FS_RECONCILE_IO_ERROR;
+        }
+        if (!fs_bytes_equal(
+                observed, expected + sector * sizeof(observed),
+                sizeof(observed))) {
+            return FS_RECONCILE_MISMATCH;
+        }
+    }
+    return FS_RECONCILE_MATCH;
+}
+
+static enum fs_reconcile_result fs_reconcile_slot(
+    uint32_t target_lba, const struct fs_disk_header* expected_header) {
+    struct fs_disk_header observed_header;
+    if (!ata_read(target_lba, 1u, (uint8_t*)&observed_header)) {
+        return FS_RECONCILE_IO_ERROR;
+    }
+    if (!fs_bytes_equal(
+            &observed_header, expected_header, sizeof(observed_header))) {
+        return FS_RECONCILE_MISMATCH;
+    }
+    return fs_reconcile_table(target_lba);
+}
+
+static enum fs_compare_result fs_compare_slot_tables(
+    uint8_t first_slot, uint8_t second_slot) {
+    uint8_t first_sector[512];
+    uint8_t second_sector[512];
+    const uint32_t first_lba = fs_slot_header_lba(first_slot) + 1u;
+    const uint32_t second_lba = fs_slot_header_lba(second_slot) + 1u;
+
+    for (uint32_t sector = 0; sector < FS_DISK_TABLE_SECTORS; sector++) {
+        if (!ata_read(first_lba + sector, 1u, first_sector) ||
+            !ata_read(second_lba + sector, 1u, second_sector)) {
+            return FS_COMPARE_IO_ERROR;
+        }
+        if (!fs_bytes_equal(first_sector, second_sector,
+                            sizeof(first_sector))) {
+            return FS_COMPARE_DIFFERENT;
+        }
+    }
+    return FS_COMPARE_EQUAL;
+}
+
+static void fs_accept_commit(
+    uint8_t target_slot, uint32_t next_generation) {
+    g_active_slot = target_slot;
+    g_active_generation = next_generation;
+    g_loaded_version = FS_DISK_VERSION;
+}
+
+/*
+ * Persist a complete table first and make it visible with one header sector.
+ * Explicit legacy recovery requires exact read-back even when ATA reports both
+ * writes as complete; normal commits still reconcile every uncertain write.
+ */
+static enum fs_sync_result fs_sync_to_disk_verified(
+    bool require_verified_readback) {
+    ata_init_result_t init_result = ata_init();
+    if (init_result != ATA_INIT_READY) {
+        syslog_write(
+            init_result == ATA_INIT_NO_DEVICE
+                ? "FS: Disk sync failed (no ATA drive)"
+                : "FS: Disk sync failed (ATA initialization error)");
+        return FS_SYNC_FAILED;
     }
 
     uint8_t target_slot =
@@ -240,10 +373,30 @@ static bool fs_sync_to_disk(void) {
     uint32_t next_generation = g_active_generation + 1u;
 
     fs_serialize();
-    if (!ata_write(target_lba + 1u, (uint8_t)FS_DISK_TABLE_SECTORS,
-                   (const uint8_t*)&g_disk_table)) {
+    ata_write_result_t table_write =
+        ata_write(target_lba + 1u, (uint8_t)FS_DISK_TABLE_SECTORS,
+                  (const uint8_t*)&g_disk_table);
+    if (table_write == ATA_WRITE_FAILED) {
         syslog_write("FS: Disk sync failed (write data)");
-        return false;
+        return FS_SYNC_FAILED;
+    }
+    if (table_write == ATA_WRITE_UNCERTAIN ||
+        require_verified_readback) {
+        enum fs_reconcile_result reconciliation =
+            fs_reconcile_table(target_lba);
+        if (reconciliation == FS_RECONCILE_IO_ERROR) {
+            syslog_write(
+                "FS: data write status is uncertain and read-back failed");
+            return FS_SYNC_UNCERTAIN;
+        }
+        if (reconciliation == FS_RECONCILE_MISMATCH) {
+            syslog_write(
+                "FS: Disk sync failed (data read-back mismatch)");
+            return FS_SYNC_FAILED;
+        }
+        if (table_write == ATA_WRITE_UNCERTAIN) {
+            syslog_write("FS: reconciled uncertain data write");
+        }
     }
 
     struct fs_disk_header header = {
@@ -252,22 +405,51 @@ static bool fs_sync_to_disk(void) {
         .table_bytes = FS_DISK_TABLE_BYTES,
         .checksum = fs_checksum(&g_disk_table, sizeof(g_disk_table)),
         .generation = next_generation,
+        .header_checksum = 0u,
         .reserved = {0},
     };
-    if (!ata_write(target_lba, 1, (const uint8_t*)&header)) {
+    header.header_checksum = fs_header_checksum(&header);
+
+    ata_write_result_t header_write =
+        ata_write(target_lba, 1u, (const uint8_t*)&header);
+    if (header_write == ATA_WRITE_FAILED) {
         syslog_write("FS: Disk sync failed (commit header)");
-        return false;
+        return FS_SYNC_FAILED;
+    }
+    if (header_write == ATA_WRITE_UNCERTAIN ||
+        require_verified_readback) {
+        enum fs_reconcile_result reconciliation =
+            fs_reconcile_slot(target_lba, &header);
+        if (reconciliation == FS_RECONCILE_IO_ERROR) {
+            syslog_write(
+                "FS: commit status is uncertain and read-back failed");
+            return FS_SYNC_UNCERTAIN;
+        }
+        if (reconciliation == FS_RECONCILE_MISMATCH) {
+            syslog_write(
+                "FS: Disk sync failed (commit read-back mismatch)");
+            return FS_SYNC_FAILED;
+        }
+        if (header_write == ATA_WRITE_UNCERTAIN) {
+            syslog_write("FS: reconciled uncertain commit header");
+        }
     }
 
-    g_active_slot = target_slot;
-    g_active_generation = next_generation;
-    g_loaded_version = FS_DISK_VERSION;
-    return true;
+    fs_accept_commit(target_slot, next_generation);
+    return FS_SYNC_COMMITTED;
+}
+
+static enum fs_sync_result fs_sync_to_disk(void) {
+    return fs_sync_to_disk_verified(false);
 }
 
 // Inspect and load storage without ever formatting it as a side effect.
 static enum fs_disk_load_result fs_load_from_disk(void) {
-    if (!ata_init()) return FS_DISK_NO_DRIVE;
+    g_legacy_upgrade_status = FS_LEGACY_UPGRADE_UNAVAILABLE;
+
+    ata_init_result_t init_result = ata_init();
+    if (init_result == ATA_INIT_NO_DEVICE) return FS_DISK_NO_DRIVE;
+    if (init_result != ATA_INIT_READY) return FS_DISK_IO_ERROR;
 
     g_active_slot = FS_SLOT_COUNT;
     g_active_generation = 0;
@@ -289,12 +471,40 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
         }
     }
 
+    /*
+     * Versions 1-3 checksum their tables but do not integrity-protect the
+     * generation field. If both legacy snapshots are valid yet different, no
+     * ordering rule can prove which one is newest. We may load the legacy
+     * generation winner as a recovery view, but must mark it corrupt/volatile
+     * so neither snapshot is overwritten. Identical copies are safe to
+     * migrate automatically.
+     */
+    bool legacy_order_is_ambiguous = false;
+    if (valid[0] && valid[1] &&
+        headers[0].version != FS_DISK_VERSION &&
+        headers[1].version != FS_DISK_VERSION) {
+        enum fs_compare_result comparison = fs_compare_slot_tables(0u, 1u);
+        if (comparison == FS_COMPARE_IO_ERROR) {
+            saw_io_error = true;
+        } else if (comparison == FS_COMPARE_DIFFERENT) {
+            legacy_order_is_ambiguous = true;
+            syslog_write(
+                "FS: legacy snapshots differ; generation order is untrusted");
+        }
+    }
+
     uint8_t first = 0;
     uint8_t second = 1;
+    bool first_integrity_protected =
+        valid[0] && headers[0].version == FS_DISK_VERSION;
+    bool second_integrity_protected =
+        valid[1] && headers[1].version == FS_DISK_VERSION;
     if (valid[1] &&
         (!valid[0] ||
-         fs_generation_is_newer(fs_header_generation(&headers[1]),
-                                fs_header_generation(&headers[0])))) {
+         (second_integrity_protected && !first_integrity_protected) ||
+         (second_integrity_protected == first_integrity_protected &&
+          fs_generation_is_newer(fs_header_generation(&headers[1]),
+                                 fs_header_generation(&headers[0]))))) {
         first = 1;
         second = 0;
     }
@@ -304,8 +514,12 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
         enum fs_slot_load_result result =
             fs_load_slot(first, &headers[first]);
         if (result == FS_SLOT_LOADED) {
+            if (legacy_order_is_ambiguous) {
+                g_legacy_upgrade_status = FS_LEGACY_UPGRADE_AVAILABLE;
+            }
             return fs_loaded_result(
-                saw_io_error, saw_nonblank_invalid_header);
+                saw_io_error,
+                saw_nonblank_invalid_header || legacy_order_is_ambiguous);
         }
         if (result == FS_SLOT_CORRUPT) saw_corrupt_slot = true;
         else saw_io_error = true;
@@ -315,9 +529,13 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
             fs_load_slot(second, &headers[second]);
         if (result == FS_SLOT_LOADED) {
             syslog_write("FS: recovered previous committed slot");
+            if (legacy_order_is_ambiguous) {
+                g_legacy_upgrade_status = FS_LEGACY_UPGRADE_AVAILABLE;
+            }
             return fs_loaded_result(
                 saw_io_error,
-                saw_corrupt_slot || saw_nonblank_invalid_header);
+                saw_corrupt_slot || saw_nonblank_invalid_header ||
+                    legacy_order_is_ambiguous);
         }
         if (result == FS_SLOT_CORRUPT) saw_corrupt_slot = true;
         else saw_io_error = true;
@@ -354,9 +572,21 @@ static bool fs_commit_changes(void) {
          */
         return true;
     }
-    if (fs_sync_to_disk()) return true;
+    enum fs_sync_result result = fs_sync_to_disk();
+    if (result == FS_SYNC_COMMITTED) return true;
 
     g_backend_status = FS_BACKEND_VOLATILE_IO_ERROR;
+    if (result == FS_SYNC_UNCERTAIN) {
+        /*
+         * The header may already expose this exact mutation on disk. Keep the
+         * same mutation in RAM and stop all further disk writes; rolling it
+         * back here could make the running view contradict the next boot.
+         */
+        syslog_write(
+            "FS: commit outcome uncertain; mutation retained on a volatile volume");
+        return true;
+    }
+
     syslog_write("FS: persistence failed; continuing on a volatile volume");
     return false;
 }
@@ -689,14 +919,16 @@ void fs_init(void) {
         }
 
         bool added_default_bmp = false;
-        if (trusted && mounted_version < FS_DISK_VERSION &&
+        if (trusted && mounted_version < FS_CONTENT_DISK_VERSION &&
             fs_find_mutable("nostalux.bmp") == NULL) {
             added_default_bmp = fs_seed_default_bmp();
         }
+        bool needs_integrity_protected_header =
+            trusted && mounted_version < FS_DISK_VERSION;
 
         bool metadata_changed =
             quarantined_test_files || quarantined_system_log ||
-            added_default_bmp;
+            added_default_bmp || needs_integrity_protected_header;
         if (trusted && metadata_changed) {
             if (fs_commit_changes()) {
                 if (quarantined_test_files) {
@@ -710,6 +942,11 @@ void fs_init(void) {
                 if (added_default_bmp) {
                     syslog_write("FS: installed default BMP image");
                 }
+                if (needs_integrity_protected_header &&
+                    fs_backend_is_persistent()) {
+                    syslog_write(
+                        "FS: upgraded to integrity-protected commit metadata");
+                }
             } else {
                 if (added_default_bmp) {
                     struct fs_file* image =
@@ -720,6 +957,11 @@ void fs_init(void) {
                     "FS: metadata recovery is available for this session only");
             }
         } else if (!trusted) {
+            if (g_legacy_upgrade_status == FS_LEGACY_UPGRADE_AVAILABLE) {
+                syslog_write(
+                    "FS: explicit legacy snapshot upgrade available; "
+                    "run fsupgrade for details");
+            }
             if (quarantined_test_files) {
                 syslog_write(
                     "FS: self-test recovery name is session-only");
@@ -761,14 +1003,16 @@ void fs_init(void) {
 
     if (load_result == FS_DISK_BLANK) {
         syslog_write("FS: blank storage detected; mounted fresh volume");
-        if (fs_sync_to_disk()) {
+        enum fs_sync_result format_result = fs_sync_to_disk();
+        if (format_result == FS_SYNC_COMMITTED) {
             g_backend_status = FS_BACKEND_PERSISTENT;
             syslog_write("FS: filesystem formatted and saved");
             fs_self_test();
         } else {
             g_backend_status = FS_BACKEND_VOLATILE_IO_ERROR;
-            syslog_write(
-                "FS: format failed; continuing on a volatile volume");
+            syslog_write(format_result == FS_SYNC_UNCERTAIN
+                             ? "FS: format outcome uncertain; continuing on a volatile volume"
+                             : "FS: format failed; continuing on a volatile volume");
         }
         return;
     }
@@ -802,6 +1046,13 @@ const char* fs_backend_status_text(void) {
         case FS_BACKEND_VOLATILE_NO_DRIVE:
             return "Volatile memory (no ATA drive)";
         case FS_BACKEND_VOLATILE_CORRUPT:
+            if (g_legacy_upgrade_status == FS_LEGACY_UPGRADE_AVAILABLE) {
+                return "Volatile memory (legacy snapshots differ; run fsupgrade)";
+            }
+            if (g_legacy_upgrade_status ==
+                FS_LEGACY_UPGRADE_OUTCOME_UNCERTAIN) {
+                return "Volatile memory (legacy upgrade unverified; reboot)";
+            }
             return "Volatile memory (corrupt disk preserved)";
         case FS_BACKEND_VOLATILE_IO_ERROR:
             return "Volatile memory (storage I/O error)";
@@ -809,6 +1060,57 @@ const char* fs_backend_status_text(void) {
         default:
             return "Filesystem not initialized";
     }
+}
+
+fs_legacy_upgrade_status_t fs_legacy_upgrade_status(void) {
+    return g_legacy_upgrade_status;
+}
+
+const char* fs_legacy_upgrade_status_text(void) {
+    switch (g_legacy_upgrade_status) {
+        case FS_LEGACY_UPGRADE_AVAILABLE:
+            return "Legacy snapshots differ; explicit recovery upgrade available";
+        case FS_LEGACY_UPGRADE_OUTCOME_UNCERTAIN:
+            return "Legacy upgrade outcome is unverified; reboot before retrying";
+        case FS_LEGACY_UPGRADE_UNAVAILABLE:
+        default:
+            return "No legacy recovery upgrade is available";
+    }
+}
+
+fs_legacy_upgrade_result_t fs_upgrade_legacy_snapshot(
+    const char* confirmation) {
+    if (g_legacy_upgrade_status != FS_LEGACY_UPGRADE_AVAILABLE ||
+        g_backend_status != FS_BACKEND_VOLATILE_CORRUPT ||
+        g_active_slot >= FS_SLOT_COUNT ||
+        g_loaded_version >= FS_DISK_VERSION) {
+        return FS_LEGACY_UPGRADE_NOT_AVAILABLE;
+    }
+    if (confirmation == NULL ||
+        kstrcmp(confirmation, FS_LEGACY_UPGRADE_CONFIRMATION) != 0) {
+        return FS_LEGACY_UPGRADE_CONFIRMATION_REQUIRED;
+    }
+
+    enum fs_sync_result result = fs_sync_to_disk_verified(true);
+    if (result == FS_SYNC_COMMITTED) {
+        g_backend_status = FS_BACKEND_PERSISTENT;
+        g_legacy_upgrade_status = FS_LEGACY_UPGRADE_UNAVAILABLE;
+        syslog_write(
+            "FS: explicitly upgraded recovered legacy snapshot to "
+            "verified v4 metadata");
+        return FS_LEGACY_UPGRADE_SUCCEEDED;
+    }
+    if (result == FS_SYNC_UNCERTAIN) {
+        g_legacy_upgrade_status = FS_LEGACY_UPGRADE_OUTCOME_UNCERTAIN;
+        syslog_write(
+            "FS: legacy upgrade outcome could not be verified; reboot required");
+        return FS_LEGACY_UPGRADE_UNCERTAIN;
+    }
+
+    syslog_write(
+        "FS: legacy upgrade failed; selected legacy snapshot remains mounted "
+        "read-only");
+    return FS_LEGACY_UPGRADE_FAILED;
 }
 
 size_t fs_file_count(void) {

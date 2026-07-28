@@ -94,11 +94,11 @@ static bool ata_valid_request(uint32_t lba, uint8_t count, const void* buffer) {
     return final_lba <= 0x0FFFFFFFull;
 }
 
-bool ata_init(void) {
+ata_init_result_t ata_init(void) {
     uint8_t status = inb(ATA_STATUS);
     if (status == 0xFF) {
         // Floating bus, no drive
-        return false;
+        return ATA_INIT_NO_DEVICE;
     }
 
     ata_select_drive();
@@ -111,18 +111,21 @@ bool ata_init(void) {
     outb(ATA_COMMAND, CMD_IDENTIFY);
     
     status = inb(ATA_STATUS);
-    if (status == 0) return false;
+    if (status == 0) return ATA_INIT_NO_DEVICE;
 
-    if (!ata_wait_not_busy()) return false;
+    if (!ata_wait_not_busy()) return ATA_INIT_ERROR;
 
     // A non-zero signature here indicates an ATAPI rather than ATA device.
-    if (inb(ATA_LBA_MID) != 0 || inb(ATA_LBA_HIGH) != 0) return false;
-    if (!ata_wait_drq()) return false;
+    if (inb(ATA_LBA_MID) != 0 || inb(ATA_LBA_HIGH) != 0) {
+        syslog_write("ATA: Unsupported non-ATA device");
+        return ATA_INIT_ERROR;
+    }
+    if (!ata_wait_drq()) return ATA_INIT_ERROR;
     
     // Read Identify data
     uint16_t tmp[256];
     insw(ATA_DATA, tmp, 256);
-    return ata_wait_not_busy();
+    return ata_wait_not_busy() ? ATA_INIT_READY : ATA_INIT_ERROR;
 }
 
 bool ata_read(uint32_t lba, uint8_t count, uint8_t* buffer) {
@@ -143,9 +146,10 @@ bool ata_read(uint32_t lba, uint8_t count, uint8_t* buffer) {
     return ata_wait_not_busy();
 }
 
-bool ata_write(uint32_t lba, uint8_t count, const uint8_t* buffer) {
-    if (!ata_valid_request(lba, count, buffer)) return false;
-    if (!ata_wait_not_busy()) return false;
+ata_write_result_t ata_write(
+    uint32_t lba, uint8_t count, const uint8_t* buffer) {
+    if (!ata_valid_request(lba, count, buffer)) return ATA_WRITE_FAILED;
+    if (!ata_wait_not_busy()) return ATA_WRITE_FAILED;
 
     ata_select_lba(lba);
     outb(ATA_SECTOR_CNT, count);
@@ -154,12 +158,18 @@ bool ata_write(uint32_t lba, uint8_t count, const uint8_t* buffer) {
     outb(ATA_LBA_HIGH, (uint8_t)(lba >> 16));
     outb(ATA_COMMAND, CMD_WRITE_PIO);
 
+    bool transferred = false;
     for (uint16_t i = 0; i < count; i++) {
-        if (!ata_wait_drq()) return false;
+        if (!ata_wait_drq()) {
+            return transferred ? ATA_WRITE_UNCERTAIN : ATA_WRITE_FAILED;
+        }
         outsw(ATA_DATA, buffer + (i * 512), 256);
+        transferred = true;
     }
 
-    if (!ata_wait_not_busy()) return false;
+    if (!ata_wait_not_busy()) return ATA_WRITE_UNCERTAIN;
     outb(ATA_COMMAND, CMD_CACHE_FLUSH);
-    return ata_wait_not_busy();
+    return ata_wait_not_busy()
+               ? ATA_WRITE_COMPLETE
+               : ATA_WRITE_UNCERTAIN;
 }

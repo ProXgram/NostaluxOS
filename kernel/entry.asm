@@ -5,6 +5,7 @@ section .text
     global _start
     global context_switch
     global task_return_trampoline
+    global enter_user_mode
     global isr_syscall
     
     extern kmain
@@ -42,8 +43,6 @@ _start:
     call gdt_init
     call interrupts_init
 
-    sti
-
     mov rdi, r12
     call kmain
 
@@ -51,8 +50,12 @@ _start:
     hlt
     jmp .hang
 
-; void context_switch(uint64_t* old_sp_ptr, uint64_t new_sp)
+; void context_switch(uint64_t* old_sp_ptr, uint64_t new_sp,
+;                     uint64_t saved_rflags)
 context_switch:
+    ; schedule() captured RFLAGS before entering its CLI-protected CR3/task
+    ; transition. Store that exact value in this task's context.
+    push rdx
     push rbx
     push rbp
     push r12
@@ -69,6 +72,7 @@ context_switch:
     pop r12
     pop rbp
     pop rbx
+    popfq
     ret
 
 ; A task entry is reached via RET with a synthetic return address on its stack.
@@ -80,6 +84,22 @@ task_return_trampoline:
     cli
     hlt
     jmp .task_hang
+
+; _Noreturn void enter_user_mode(uint64_t entry_point, uint64_t user_stack_top)
+enter_user_mode:
+    cli
+    mov ax, 0x1b             ; User data selector (GDT 0x18 | RPL3)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push qword 0x1b          ; SS
+    push rsi                 ; RSP
+    push qword 0x202         ; RFLAGS: reserved bit + IF
+    push qword 0x23          ; CS (GDT 0x20 | RPL3)
+    push rdi                 ; RIP
+    iretq
 
 ; ---------------------------------------------
 ; System Call Entry Point (INT 0x80)
@@ -107,15 +127,17 @@ isr_syscall:
     ; 2. Pass stack pointer (regs) to C function
     mov rdi, rsp 
 
-    ; The ring-3 interrupt frame plus the fourteen pushes above leave RSP at
-    ; 8 mod 16. Align the caller stack as required by the SysV x86-64 ABI
-    ; without changing the register-frame pointer passed in RDI.
-    sub rsp, 8
+    ; Preserve the register-frame address in a callee-saved register and align
+    ; dynamically. Ring 3 normally arrives at 8 mod 16 here, while an
+    ; accidental CPL0 INT 0x80 has a shorter hardware frame; both paths now
+    ; satisfy the SysV x86-64 call boundary.
+    mov r12, rsp
+    and rsp, -16
     
     ; 3. Call Kernel Dispatcher
     ; uint64_t syscall_dispatcher(struct syscall_regs* regs)
     call syscall_dispatcher
-    add rsp, 8
+    mov rsp, r12
     
     ; 4. Restore User State
     pop rbx

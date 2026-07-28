@@ -10,7 +10,7 @@ PATTERN='^(<<<<<<<|=======|>>>>>>>)'
 # Search the checked-out files directly instead of relying on Git metadata.
 # This keeps builds from ZIP archives and folders under Downloads working.
 conflicts=$(
-    find bootloader kernel \
+    find bootloader kernel apps tests \
         -type f \
         \( -name '*.asm' -o -name '*.c' -o -name '*.h' -o -name '*.ld' \) \
         -exec grep -Hn -E "$PATTERN" {} + 2>/dev/null || true

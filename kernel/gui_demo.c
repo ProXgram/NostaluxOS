@@ -265,12 +265,12 @@ typedef struct {
     int head;
     uint64_t last_sample_tick;
     struct timer_cpu_counters previous_cpu;
-    uint32_t memory_used_kb;
-    uint32_t memory_total_kb;
-    uint32_t memory_mapped_kb;
-    uint32_t memory_managed_kb;
-    uint32_t memory_reserved_kb;
-    uint32_t memory_heap_committed_kb;
+    uint64_t memory_used_kb;
+    uint64_t memory_total_kb;
+    uint64_t memory_mapped_kb;
+    uint64_t memory_managed_kb;
+    uint64_t memory_reserved_kb;
+    uint64_t memory_heap_committed_kb;
     int cpu_percent;
     bool has_previous_cpu;
 } SysMonState;
@@ -1433,7 +1433,7 @@ static Window* create_window(AppType type, const char* title, int w, int h) {
         win->state.taskmgr.page_offset = 0;
         str_copy(win->state.taskmgr.status,
                   sizeof(win->state.taskmgr.status),
-                  "Showing genuine cooperative kernel tasks.");
+                  "Showing genuine scheduler tasks and isolated apps.");
     } else if (type == APP_FILES) {
         win->min_w = 310; win->min_h = 180;
         win->state.files.selected_index = -1;
@@ -2109,12 +2109,12 @@ static void assistant_submit(Window* w) {
         int_to_str((int)boot->height, number);
         str_append(details, sizeof(details), number);
         str_append(details, sizeof(details), " | RAM ");
-        int_to_str((int)(profile->memory_total_kb / 1024), number);
+        uint64_to_str(profile->memory_total_kb / 1024u, number);
         str_append(details, sizeof(details), number);
         str_append(details, sizeof(details), " MB");
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI, details);
         assistant_add_wrapped(state, ASSISTANT_ROLE_AI,
-            "The OS is a freestanding hobby kernel with its own shell, GUI, cooperative scheduler, and filesystem.");
+            "The OS is a freestanding hobby kernel with its own shell, GUI, hybrid scheduler, and filesystem.");
         char storage_reply[64] = "Current storage: ";
         str_append(storage_reply, sizeof(storage_reply), storage_short_label());
         str_append(storage_reply, sizeof(storage_reply), ".");
@@ -3169,9 +3169,9 @@ static void update_sysmon(Window* w) {
     }
 
     const struct system_profile* profile = system_profile_info();
-    uint32_t total_kb = profile->memory_total_kb;
-    uint32_t mapped_kb = profile->memory_mapped_kb;
-    uint32_t used_kb = profile->memory_used_kb;
+    uint64_t total_kb = profile->memory_total_kb;
+    uint64_t mapped_kb = profile->memory_mapped_kb;
+    uint64_t used_kb = profile->memory_used_kb;
     int memory_percent = 0;
     if (mapped_kb > 0) {
         uint64_t scaled = (uint64_t)used_kb * 100u;
@@ -3701,7 +3701,7 @@ static void render_window(Window* w) {
         const char* credits[] = {
             "Kernel: freestanding x86-64",
             storage_credit,
-            "Tasks: cooperative scheduler",
+            "Tasks: kernel cooperative, apps preemptive",
             "Desktop: kernel-mode GUI",
             "Status: active development"
         };

@@ -24,6 +24,9 @@
 #include "gui_demo.h" // Includes the GUI entry point
 #include "rtc.h"
 #include "scheduler.h"
+#include "app_catalog.h"
+#include "app_process.h"
+#include "app_runtime.h"
 
 struct shell_command {
     const char* name;
@@ -64,6 +67,10 @@ static void command_sleep(const char* args);
 static void command_snake(const char* args);
 static void command_beep(const char* args);
 static void command_disktest(const char* args);
+static void command_fsupgrade(const char* args);
+static void command_apps(const char* args);
+static void command_app(const char* args);
+static void command_appkill(const char* args);
 static void command_banner(const char* args);
 static void command_gui(const char* args);
 static void command_palette(const char* args);
@@ -74,6 +81,9 @@ static const struct shell_command COMMANDS[] = {
     {"clear", command_clear, "Clear the screen", SHELL_COMMAND_CONSOLE_ONLY},
     {"banner", command_banner, "Show moving banner screensaver", SHELL_COMMAND_CONSOLE_ONLY},
     {"gui", command_gui, "Launch graphical desktop", SHELL_COMMAND_CONSOLE_ONLY},
+    {"apps", command_apps, "List separate ELF applications and process history", 0},
+    {"app", command_app, "Run an ELF app (for example 'app hello')", 0},
+    {"appkill", command_appkill, "Stop a running ELF app by process ID", 0},
     {"time", command_time, "Show current RTC time", 0},
     {"uptime", command_uptime, "Show time since boot", 0},
     {"sleep", command_sleep, "Pause for N seconds", SHELL_COMMAND_CONSOLE_ONLY},
@@ -96,6 +106,7 @@ static const struct shell_command COMMANDS[] = {
     {"snake", command_snake, "Play the Snake game", SHELL_COMMAND_CONSOLE_ONLY},
     {"beep", command_beep, "Test PC Speaker", SHELL_COMMAND_CONSOLE_ONLY},
     {"disktest", command_disktest, "Detect the primary ATA drive", 0},
+    {"fsupgrade", command_fsupgrade, "Inspect or confirm a legacy filesystem upgrade", 0},
     {"reboot", command_reboot, "Restart the system", SHELL_COMMAND_CONSOLE_ONLY},
     {"shutdown", command_shutdown, "Power off the system", SHELL_COMMAND_CONSOLE_ONLY},
 };
@@ -381,11 +392,14 @@ static void command_sysinfo(const char* args) {
     const struct BootInfo* boot = system_boot_info();
     const struct system_profile* prof = system_profile_info();
     kprintf("Resolution: %ux%u\n", boot->width, boot->height);
-    kprintf("Usable physical RAM: %u KB\n", prof->memory_total_kb);
-    kprintf("Mapped usable RAM: %u KB\n", prof->memory_mapped_kb);
-    kprintf("Kernel committed RAM: %u KB (%u reserved + %u heap)\n",
-            prof->memory_used_kb, prof->memory_reserved_kb,
-            prof->memory_heap_committed_kb);
+    kprintf("Usable physical RAM: %llu KB\n",
+            (unsigned long long)prof->memory_total_kb);
+    kprintf("Mapped usable RAM: %llu KB\n",
+            (unsigned long long)prof->memory_mapped_kb);
+    kprintf("Kernel committed RAM: %llu KB (%llu reserved + %llu heap)\n",
+            (unsigned long long)prof->memory_used_kb,
+            (unsigned long long)prof->memory_reserved_kb,
+            (unsigned long long)prof->memory_heap_committed_kb);
     kprintf("Storage: %s\n", fs_backend_status_text());
 }
 
@@ -416,8 +430,206 @@ static void command_beep(const char* args) {
 
 static void command_disktest(const char* args) {
     (void)args;
-    if(ata_init()) kprintf("ATA Init OK.\n");
-    else kprintf("ATA Init Failed.\n");
+    ata_init_result_t result = ata_init();
+    if (result == ATA_INIT_READY) {
+        kprintf("ATA Init OK.\n");
+    } else if (result == ATA_INIT_NO_DEVICE) {
+        kprintf("ATA Init Failed: no ATA device.\n");
+    } else {
+        kprintf("ATA Init Failed: controller or device error.\n");
+    }
+}
+
+static void command_fsupgrade(const char* args) {
+    const char* confirmation = kskip_spaces(args);
+    fs_legacy_upgrade_status_t status = fs_legacy_upgrade_status();
+
+    if (*confirmation == '\0') {
+        kprintf("Legacy filesystem upgrade: %s.\n",
+                fs_legacy_upgrade_status_text());
+        if (status == FS_LEGACY_UPGRADE_AVAILABLE) {
+            kprintf(
+                "Two legacy snapshots differ, so their generation order "
+                "is not integrity-protected.\n"
+                "The currently mounted recovery view was selected by the "
+                "legacy generation field.\n"
+                "Review its files first. The other snapshot will not be "
+                "merged, and no disk changes\n"
+                "have been made. To preserve this view as a verified v4 "
+                "commit, run exactly:\n"
+                "  fsupgrade " FS_LEGACY_UPGRADE_CONFIRMATION "\n");
+        }
+        return;
+    }
+
+    fs_legacy_upgrade_result_t result =
+        fs_upgrade_legacy_snapshot(confirmation);
+    switch (result) {
+        case FS_LEGACY_UPGRADE_SUCCEEDED:
+            kprintf(
+                "Legacy recovery view committed and read back as filesystem "
+                "v4.\n");
+            break;
+        case FS_LEGACY_UPGRADE_CONFIRMATION_REQUIRED:
+            kprintf(
+                "Confirmation did not match. No disk changes were requested.\n"
+                "Run 'fsupgrade' to review the warning and exact command.\n");
+            break;
+        case FS_LEGACY_UPGRADE_FAILED:
+            kprintf(
+                "Legacy upgrade failed. The mounted view remains session-only; "
+                "the selected\nlegacy snapshot was not replaced.\n");
+            break;
+        case FS_LEGACY_UPGRADE_UNCERTAIN:
+            kprintf(
+                "Legacy upgrade could not be verified. Do not retry in this "
+                "session; reboot\n"
+                "so Nostalux can inspect the on-disk commit safely.\n");
+            break;
+        case FS_LEGACY_UPGRADE_NOT_AVAILABLE:
+        default:
+            kprintf("No legacy recovery upgrade is currently available.\n");
+            break;
+    }
+}
+
+static const char* app_process_state_text(enum app_process_state state) {
+    switch (state) {
+        case APP_PROCESS_LOADED: return "loaded";
+        case APP_PROCESS_STARTING: return "starting";
+        case APP_PROCESS_RUNNING: return "running";
+        case APP_PROCESS_EXITED: return "exited";
+        case APP_PROCESS_FAULTED: return "faulted";
+        case APP_PROCESS_UNUSED:
+        default:
+            return "unused";
+    }
+}
+
+static void command_apps(const char* args) {
+    if (*kskip_spaces(args) != '\0') {
+        kprintf("Usage: apps\n");
+        return;
+    }
+
+    size_t catalog_count = app_catalog_count();
+    kprintf("ELF applications (%zu):\n", catalog_count);
+    for (size_t index = 0; index < catalog_count; index++) {
+        const struct app_catalog_entry* entry = app_catalog_at(index);
+        if (entry == NULL) continue;
+        kprintf("  %s - %s\n",
+                entry->manifest.id,
+                entry->manifest.display_name);
+        kprintf("    %s\n", entry->manifest.description);
+    }
+    if (catalog_count == 0) {
+        kprintf("  No validated embedded applications are available.\n");
+    } else {
+        kprintf("Run one with: app <id>\n");
+    }
+
+    size_t process_count = app_process_count();
+    kprintf("Process history (%zu):\n", process_count);
+    for (size_t index = 0; index < process_count; index++) {
+        struct app_process_info process;
+        if (!app_process_snapshot(index, &process)) continue;
+        kprintf("  #%llu %s: %s",
+                (unsigned long long)process.process_id,
+                process.app_id,
+                app_process_state_text(process.state));
+        if (process.state == APP_PROCESS_EXITED) {
+            kprintf(" (code %lld)", (long long)process.exit_code);
+        } else if (process.state == APP_PROCESS_FAULTED) {
+            kprintf(" (vector %u at %llx)",
+                    (unsigned int)process.fault.vector,
+                    (unsigned long long)process.fault.instruction_pointer);
+        }
+        kprintf("\n");
+    }
+    if (process_count == 0) {
+        kprintf("  No application processes have run.\n");
+    }
+}
+
+static void command_app(const char* args) {
+    const char* cursor = kskip_spaces(args);
+    char app_id[APP_ID_CAPACITY];
+    size_t length = 0;
+    while (cursor[length] != '\0' &&
+           cursor[length] != ' ' &&
+           cursor[length] != '\t' &&
+           length + 1u < sizeof(app_id)) {
+        app_id[length] = cursor[length];
+        length++;
+    }
+    app_id[length] = '\0';
+    if (length == 0 ||
+        *kskip_spaces(cursor + length) != '\0') {
+        kprintf("Usage: app <id>\n");
+        return;
+    }
+
+    enum app_runtime_launch_result result =
+        app_runtime_run_catalog_id(app_id);
+    if (result == APP_RUNTIME_LAUNCH_OK) {
+        kprintf("App '%s' exited normally.\n", app_id);
+    } else if (result == APP_RUNTIME_LAUNCH_APP_FAULTED) {
+        kprintf(
+            "App '%s' faulted in ring 3 and was isolated; "
+            "the OS is still running.\n",
+            app_id);
+    } else if (result == APP_RUNTIME_LAUNCH_DISPATCH_BUDGET) {
+        kprintf(
+            "App '%s' is still running in the background.\n"
+            "Use 'apps' to find its process ID, then 'appkill <process-id>'.\n",
+            app_id);
+    } else {
+        kprintf("App '%s' was not completed: %s.\n",
+                app_id, app_runtime_launch_result_text(result));
+    }
+}
+
+static bool parse_process_id(const char** cursor,
+                             uint64_t* out_process_id) {
+    if (cursor == NULL || *cursor == NULL ||
+        out_process_id == NULL) {
+        return false;
+    }
+
+    const char* input = kskip_spaces(*cursor);
+    if (*input < '0' || *input > '9') return false;
+
+    uint64_t value = 0;
+    while (*input >= '0' && *input <= '9') {
+        const uint64_t digit = (uint64_t)(*input - '0');
+        if (value > (UINT64_MAX - digit) / 10u) {
+            return false;
+        }
+        value = value * 10u + digit;
+        input++;
+    }
+
+    *cursor = input;
+    *out_process_id = value;
+    return value != 0;
+}
+
+static void command_appkill(const char* args) {
+    const char* cursor = kskip_spaces(args);
+    uint64_t process_id = 0;
+    if (!parse_process_id(&cursor, &process_id) ||
+        *kskip_spaces(cursor) != '\0') {
+        kprintf("Usage: appkill <process-id>\n");
+        return;
+    }
+
+    if (scheduler_terminate_app_process(process_id)) {
+        kprintf("Stopped app process #%llu.\n",
+                (unsigned long long)process_id);
+    } else {
+        kprintf("No running app process #%llu.\n",
+                (unsigned long long)process_id);
+    }
 }
 
 static void command_reboot(const char* args) {
@@ -545,6 +757,14 @@ bool shell_execute_capture(const char* command_line,
     return true;
 }
 
+static void shell_idle(void) {
+    /*
+     * Kernel tasks still yield cooperatively. Ring-3 apps receive a timer
+     * quantum once dispatched, so even a non-yielding app returns here.
+     */
+    schedule();
+}
+
 void shell_run(void) {
     scheduler_set_current_name("kernel/shell");
     char input[INPUT_CAPACITY];
@@ -553,7 +773,7 @@ void shell_run(void) {
 
     for (;;) {
         shell_print_prompt();
-        keyboard_read_line_ex(input, sizeof(input), NULL);
+        keyboard_read_line_ex(input, sizeof(input), shell_idle);
         execute_command(input);
     }
 }

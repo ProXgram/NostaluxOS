@@ -183,6 +183,18 @@ int main(void) {
     assert(profile->memory_used_kb ==
            expected_reserved / 1024u + 5u);
 
+    /*
+     * The public profile must preserve totals beyond the old uint32 KiB
+     * ceiling (just under 4 TiB) instead of silently saturating.
+     */
+    const uint64_t huge_total = (UINT64_C(5) << 40) + 8192u;
+    system_configure_memory(huge_total, huge_total,
+                            expected_reserved, heap_capacity);
+    profile = system_profile_info();
+    assert(profile->memory_total_kb == huge_total / 1024u);
+    assert(profile->memory_mapped_kb == huge_total / 1024u);
+    assert(profile->memory_total_kb > UINT32_MAX);
+
     assert_map_bounds_rejected(&boot);
 
     assert(munmap(mapped, TEST_MAP_BYTES) == 0);

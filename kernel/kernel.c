@@ -16,6 +16,9 @@
 #include "scheduler.h"
 #include "gui_demo.h"
 #include "kstdio.h"
+#include "app_catalog.h"
+#include "app_process.h"
+#include "app_runtime.h"
 
 #define HEAP_START_ADDR  SYSTEM_RESERVED_LOW_MEMORY_BYTES
 #define HEAP_TARGET_SIZE (16ull * 1024ull * 1024ull)
@@ -65,8 +68,20 @@ static void boot_sequence(const struct BootInfo* boot_info) {
     keyboard_init();
     mouse_init();
 
-    // Initialize the currently cooperative task scheduler.
+    // Kernel tasks yield cooperatively; ring-3 apps receive timer quanta.
     scheduler_init();
+
+    /*
+     * Validate and catalog the embedded sample independently of execution.
+     * The user-mode runtime decides whether the current paging/scheduler
+     * implementation can safely launch it.
+     */
+    app_process_table_reset();
+    if (app_catalog_initialize_embedded() == APP_CATALOG_OK) {
+        syslog_write("Apps: embedded ELF catalog validated");
+    } else {
+        syslog_write("Apps: embedded ELF catalog unavailable");
+    }
 
     background_render();
     timer_set_callback(background_animate);
@@ -76,6 +91,21 @@ static void boot_sequence(const struct BootInfo* boot_info) {
 
 void kmain(const struct BootInfo* boot_info) {
     boot_sequence(boot_info);
+
+    /*
+     * Keep maskable interrupts disabled through driver initialization.
+     * Individual drivers unmask their PIC lines only after their state is
+     * ready; make those initialized devices globally interruptible now.
+     */
+    __asm__ volatile("sti" ::: "memory");
+
+    enum app_runtime_launch_result app_result =
+        app_runtime_run_catalog_id("hello");
+    if (app_result == APP_RUNTIME_LAUNCH_OK) {
+        syslog_write("Apps: ring-3 hello exited normally");
+    } else {
+        syslog_write(app_runtime_launch_result_text(app_result));
+    }
 
     // NOTE: We do NOT spawn the GUI task automatically anymore.
     // This prevents the GUI from stealing keyboard input from the shell.

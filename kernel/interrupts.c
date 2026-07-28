@@ -9,6 +9,9 @@
 #include "timer.h"
 #include "graphics.h"
 #include "mouse.h"
+#include "scheduler.h"
+
+extern void isr_syscall(void);
 
 struct interrupt_frame {
     uint64_t rip;
@@ -40,6 +43,7 @@ static struct idt_entry g_idt[256];
 #define PIC2_COMMAND 0xA0
 #define PIC2_DATA    0xA1
 #define PIC_EOI      0x20
+#define INTERRUPT_CLD() __asm__ volatile("cld" ::: "cc")
 
 static void halt_on_invalid(const char* message) {
     syslog_write(message);
@@ -56,15 +60,18 @@ static void pic_remap_and_mask(void) {
     outb(PIC1_DATA, 0x01); io_wait();
     outb(PIC2_DATA, 0x01); io_wait();
     
-    // Mask all interrupts initially except:
-    // Bit 0: Timer (IRQ0)
-    // Bit 1: Keyboard (IRQ1)
-    // Bit 2: Cascade (IRQ2) - REQUIRED for Slave PIC (Mouse) to work
-    // 1111 1000 = 0xF8
-    outb(PIC1_DATA, 0xF8); 
+    /*
+     * Keep every device IRQ masked until its driver has initialized its
+     * software state. Leave only the cascade line open so a slave driver can
+     * unmask its own IRQ later. In particular, this prevents BIOS-rate IRQ0
+     * ticks and keyboard bytes from arriving before timer_init()/keyboard_init().
+     *
+     * 1111 1011 = 0xFB (IRQ2 cascade only)
+     */
+    outb(PIC1_DATA, 0xFB);
     outb(PIC2_DATA, 0xFF); // Mask all slave interrupts (Mouse unmasked later)
     
-    syslog_write("PIC remapped (0x20/0x28) with Cascade enabled.");
+    syslog_write("PIC remapped; device IRQs masked pending driver init");
 }
 
 void interrupts_enable_irq(uint8_t irq) {
@@ -138,17 +145,51 @@ static void exception_panic(uint8_t vector, uint64_t error_code, bool has_error_
     for (;;) __asm__ volatile("hlt");
 }
 
+static bool exception_came_from_user(
+    const struct interrupt_frame* frame) {
+    return frame != NULL &&
+           (frame->cs & 3u) == 3u &&
+           scheduler_current_is_user();
+}
+
+static _Noreturn void contain_user_exception(
+    uint8_t vector,
+    uint64_t error_code,
+    bool has_error_code,
+    const struct interrupt_frame* frame) {
+    uint64_t fault_address = 0;
+    if (vector == 14) {
+        __asm__ volatile("mov %%cr2, %0" : "=r"(fault_address));
+    }
+    scheduler_fault_current_user(
+        vector, has_error_code, error_code,
+        frame != NULL ? frame->rip : 0,
+        frame != NULL ? frame->rsp : 0,
+        fault_address);
+}
+
 #define DECLARE_NOERR_HANDLER(num) \
     __attribute__((interrupt)) static void handler_##num(struct interrupt_frame* frame) { \
+        INTERRUPT_CLD(); \
+        if ((num) != 8 && (num) != 18 && exception_came_from_user(frame)) { \
+            contain_user_exception((uint8_t)(num), 0, false, frame); \
+        } \
         exception_panic((uint8_t)(num), 0, false, frame); \
     }
 #define DECLARE_ERR_HANDLER(num) \
     __attribute__((interrupt)) static void handler_##num(struct interrupt_frame* frame, uint64_t error_code) { \
+        INTERRUPT_CLD(); \
+        if ((num) != 8 && (num) != 18 && exception_came_from_user(frame)) { \
+            contain_user_exception((uint8_t)(num), error_code, true, frame); \
+        } \
         exception_panic((uint8_t)(num), error_code, true, frame); \
     }
 
 DECLARE_NOERR_HANDLER(0); DECLARE_NOERR_HANDLER(1);
-__attribute__((interrupt)) static void handler_2(struct interrupt_frame* frame) { (void)frame; }
+__attribute__((interrupt)) static void handler_2(struct interrupt_frame* frame) {
+    INTERRUPT_CLD();
+    (void)frame;
+}
 DECLARE_NOERR_HANDLER(3); DECLARE_NOERR_HANDLER(4); DECLARE_NOERR_HANDLER(5); DECLARE_NOERR_HANDLER(6); DECLARE_NOERR_HANDLER(7);
 DECLARE_ERR_HANDLER(8); DECLARE_NOERR_HANDLER(9); DECLARE_ERR_HANDLER(10); DECLARE_ERR_HANDLER(11); DECLARE_ERR_HANDLER(12);
 DECLARE_ERR_HANDLER(13); DECLARE_ERR_HANDLER(14); DECLARE_NOERR_HANDLER(15); DECLARE_NOERR_HANDLER(16); DECLARE_ERR_HANDLER(17);
@@ -157,17 +198,20 @@ DECLARE_NOERR_HANDLER(23); DECLARE_NOERR_HANDLER(24); DECLARE_NOERR_HANDLER(25);
 DECLARE_NOERR_HANDLER(28); DECLARE_ERR_HANDLER(29); DECLARE_ERR_HANDLER(30); DECLARE_NOERR_HANDLER(31);
 
 __attribute__((interrupt)) static void handler_irq_master(struct interrupt_frame* frame) {
+    INTERRUPT_CLD();
     (void)frame;
     timer_interrupt_entry();
     outb(PIC1_COMMAND, PIC_EOI);
 }
 __attribute__((interrupt)) static void handler_irq_slave(struct interrupt_frame* frame) {
+    INTERRUPT_CLD();
     (void)frame;
     timer_interrupt_entry();
     outb(PIC2_COMMAND, PIC_EOI);
     outb(PIC1_COMMAND, PIC_EOI);
 }
 __attribute__((interrupt)) static void handler_irq_keyboard(struct interrupt_frame* frame) {
+    INTERRUPT_CLD();
     (void)frame;
     timer_interrupt_entry();
     uint8_t scancode = inb(0x60);
@@ -175,12 +219,19 @@ __attribute__((interrupt)) static void handler_irq_keyboard(struct interrupt_fra
     keyboard_push_byte(scancode);
 }
 __attribute__((interrupt)) static void handler_irq_timer(struct interrupt_frame* frame) {
+    INTERRUPT_CLD();
     (void)frame;
     timer_interrupt_entry();
     timer_handler();
+    /*
+     * A suspended timer handler must never retain the PIC in-service bit.
+     * Acknowledge IRQ0 before a user quantum is allowed to switch tasks.
+     */
     outb(PIC1_COMMAND, PIC_EOI);
+    scheduler_timer_tick();
 }
 __attribute__((interrupt)) static void handler_irq_mouse(struct interrupt_frame* frame) {
+    INTERRUPT_CLD();
     (void)frame;
     timer_interrupt_entry();
     mouse_handle_interrupt();
@@ -229,13 +280,17 @@ void interrupts_init(void) {
     idt_set_gate(0x20, handler_irq_timer);
     idt_set_gate(0x21, handler_irq_keyboard);
     idt_set_gate(0x2C, handler_irq_mouse);
+    idt_set_gate(0x80, isr_syscall);
+    g_idt[0x80].type_attr = 0xEE; /* Present DPL3 interrupt gate. */
     
     const struct idt_descriptor descriptor = { .limit = (uint16_t)(sizeof(g_idt) - 1), .base = (uint64_t)g_idt };
     
     if (g_idt[8].selector != 0x08 || g_idt[8].ist != 1) { halt_on_invalid("Critical: IDT vector 8 misconfigured."); }
+    if (g_idt[0x80].selector != 0x08 ||
+        g_idt[0x80].type_attr != 0xEE) {
+        halt_on_invalid("Critical: user syscall gate misconfigured.");
+    }
 
     __asm__ volatile("lidt %0" : : "m"(descriptor));
-    // INT 0x80 intentionally remains not-present. Kernel page tables are
-    // supervisor-only and no safe user-pointer boundary exists yet.
-    syslog_write("Interrupts initialized (user syscall gate disabled)");
+    syslog_write("Interrupts initialized (checked Apps INT 0x80 enabled)");
 }

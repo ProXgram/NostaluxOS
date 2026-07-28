@@ -31,23 +31,18 @@ static uint64_t g_mapped_usable_bytes = 0;
 static uint64_t g_fixed_used_bytes = 0;
 static size_t g_heap_capacity_bytes = 0;
 
-static uint32_t bytes_to_kib_floor(uint64_t bytes) {
-    const uint64_t kib = bytes / 1024u;
-    if (kib > UINT32_MAX) {
-        return UINT32_MAX;
-    }
-    return (uint32_t)kib;
+static uint64_t bytes_to_kib_floor(uint64_t bytes) {
+    return bytes / 1024u;
 }
 
-static uint32_t bytes_to_kib_ceil(uint64_t bytes) {
+static uint64_t bytes_to_kib_ceil(uint64_t bytes) {
     uint64_t kib = bytes / 1024u;
     if (bytes % 1024u != 0) {
-        kib++;
+        if (kib != UINT64_MAX) {
+            kib++;
+        }
     }
-    if (kib > UINT32_MAX) {
-        return UINT32_MAX;
-    }
-    return (uint32_t)kib;
+    return kib;
 }
 
 static void refresh_memory_usage(void) {

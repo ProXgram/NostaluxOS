@@ -8,6 +8,7 @@
 #define FS_MAX_FILES 32
 #define FS_MAX_FILENAME 32
 #define FS_MAX_FILE_SIZE 1024
+#define FS_LEGACY_UPGRADE_CONFIRMATION "CONFIRM-LEGACY-SNAPSHOT"
 
 struct fs_file {
     bool in_use;
@@ -24,10 +25,28 @@ typedef enum {
     FS_BACKEND_VOLATILE_IO_ERROR,
 } fs_backend_status_t;
 
+typedef enum {
+    FS_LEGACY_UPGRADE_UNAVAILABLE = 0,
+    FS_LEGACY_UPGRADE_AVAILABLE,
+    FS_LEGACY_UPGRADE_OUTCOME_UNCERTAIN,
+} fs_legacy_upgrade_status_t;
+
+typedef enum {
+    FS_LEGACY_UPGRADE_SUCCEEDED = 0,
+    FS_LEGACY_UPGRADE_NOT_AVAILABLE,
+    FS_LEGACY_UPGRADE_CONFIRMATION_REQUIRED,
+    FS_LEGACY_UPGRADE_FAILED,
+    FS_LEGACY_UPGRADE_UNCERTAIN,
+} fs_legacy_upgrade_result_t;
+
 void fs_init(void);
 fs_backend_status_t fs_backend_status(void);
 bool fs_backend_is_persistent(void);
 const char* fs_backend_status_text(void);
+fs_legacy_upgrade_status_t fs_legacy_upgrade_status(void);
+const char* fs_legacy_upgrade_status_text(void);
+fs_legacy_upgrade_result_t fs_upgrade_legacy_snapshot(
+    const char* confirmation);
 size_t fs_file_count(void);
 const struct fs_file* fs_file_at(size_t index);
 const struct fs_file* fs_find(const char* name);
