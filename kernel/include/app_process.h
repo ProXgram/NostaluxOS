@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "app_abi.h"
 #include "app_manifest.h"
 #include "elf64_loader.h"
 
@@ -43,6 +44,7 @@ struct app_process_info {
     uint64_t process_id;
     char app_id[APP_ID_CAPACITY];
     char display_name[APP_DISPLAY_CAPACITY];
+    char startup_argument[APP_STARTUP_ARGUMENT_MAX + 1u];
     enum app_process_state state;
     int64_t exit_code;
     uint64_t capabilities;
@@ -73,6 +75,8 @@ enum app_process_result app_process_track_loaded(
     uint64_t* out_process_id);
 
 enum app_process_result app_process_mark_starting(uint64_t process_id);
+enum app_process_result app_process_set_startup_argument(
+    uint64_t process_id, const char* argument);
 enum app_process_result app_process_mark_running(uint64_t process_id);
 enum app_process_result app_process_mark_exited(uint64_t process_id,
                                                 int64_t exit_code);
@@ -88,6 +92,11 @@ enum app_process_result app_process_release(uint64_t process_id);
 size_t app_process_count(void);
 bool app_process_snapshot(size_t index, struct app_process_info* out_info);
 bool app_process_find(uint64_t process_id, struct app_process_info* out_info);
+bool app_process_get_startup_argument(
+    uint64_t process_id,
+    char* out_argument,
+    size_t capacity,
+    size_t* out_length);
 
 /*
  * Reports runtime capabilities implemented by this kernel build. A launch

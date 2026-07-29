@@ -2,7 +2,7 @@
 
 bool app_abi_syscall_known(uint64_t syscall_id) {
     return syscall_id >= APP_SYSCALL_ABI_QUERY &&
-           syscall_id <= APP_SYSCALL_MEMORY_UNMAP;
+           syscall_id <= APP_SYSCALL_FILE_REPLACE;
 }
 
 uint64_t app_abi_required_capability(uint64_t syscall_id) {
@@ -10,6 +10,7 @@ uint64_t app_abi_required_capability(uint64_t syscall_id) {
         case APP_SYSCALL_ABI_QUERY:
         case APP_SYSCALL_EXIT:
         case APP_SYSCALL_YIELD:
+        case APP_SYSCALL_ARGUMENT_GET:
             return 0;
         case APP_SYSCALL_LOG_WRITE:
             return APP_CAPABILITY_LOG;
@@ -25,6 +26,7 @@ uint64_t app_abi_required_capability(uint64_t syscall_id) {
         case APP_SYSCALL_FILE_READ:
             return APP_CAPABILITY_FILE_READ;
         case APP_SYSCALL_FILE_WRITE:
+        case APP_SYSCALL_FILE_REPLACE:
             return APP_CAPABILITY_FILE_WRITE;
         case APP_SYSCALL_FILE_CLOSE:
             return 0;
@@ -59,6 +61,8 @@ const char* app_abi_syscall_name(uint64_t syscall_id) {
         case APP_SYSCALL_INPUT_POLL: return "input_poll";
         case APP_SYSCALL_MEMORY_MAP: return "memory_map";
         case APP_SYSCALL_MEMORY_UNMAP: return "memory_unmap";
+        case APP_SYSCALL_ARGUMENT_GET: return "argument_get";
+        case APP_SYSCALL_FILE_REPLACE: return "file_replace";
         default: return "unknown";
     }
 }

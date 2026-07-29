@@ -10,26 +10,225 @@ static Task* g_current_task = NULL;
 static Task* g_head = NULL;
 static uint64_t g_next_pid = 1;
 
-#define STACK_SIZE 16384
+#define STACK_SIZE 16384u
+#define STACK_GUARD_SIZE ((size_t)PAGING_PAGE_SIZE)
+#define STACK_ALLOCATION_SIZE \
+    ((size_t)STACK_SIZE + (STACK_GUARD_SIZE * 2u))
+#define STACK_CANARY_WORDS 8u
+#define STACK_CANARY_SEED 0xD14FC0DEF00DBAADull
 #define INITIAL_TASK_RFLAGS 0x202ull
+#define CR0_MONITOR_COPROCESSOR (1ull << 1)
+#define CR0_EMULATION (1ull << 2)
 #define CR0_TASK_SWITCHED (1ull << 3)
+#define CR0_NUMERIC_ERROR (1ull << 5)
+#define CR4_OSFXSR (1ull << 9)
+#define CR4_OSXMMEXCPT (1ull << 10)
+#define CR4_OSXSAVE (1ull << 18)
+#define CPUID_FEATURE_FPU (1u << 0)
+#define CPUID_FEATURE_FXSR (1u << 24)
+#define CPUID_FEATURE_SSE (1u << 25)
+#define CPUID_FEATURE_SSE2 (1u << 26)
+
+static bool g_fpu_context_enabled = false;
+static uint8_t
+    g_initial_fpu_state[SCHEDULER_FPU_STATE_SIZE]
+        __attribute__((aligned(16)));
+
+_Static_assert(
+    offsetof(Task, fpu_state) % 16u == 0,
+    "Task FPU save area must be 16-byte aligned");
+_Static_assert(
+    _Alignof(Task) >= 16u,
+    "Task allocations must preserve FXSAVE alignment");
 
 extern _Noreturn void enter_user_mode(uint64_t entry_point,
                                       uint64_t user_stack_top);
 
 static _Noreturn void user_task_bootstrap(void);
 
+static void copy_bytes(void* destination, const void* source, size_t count) {
+    uint8_t* out = (uint8_t*)destination;
+    const uint8_t* in = (const uint8_t*)source;
+    for (size_t index = 0; index < count; index++) {
+        out[index] = in[index];
+    }
+}
+
 static void disable_unmanaged_fpu_state(void) {
     /*
-     * Apps v1 does not yet save x87/MMX/SIMD state during a context switch.
-     * Keep CR0.TS set so an app attempting to use that state receives #NM,
-     * which the ring-3 exception path contains instead of leaking another
-     * process's register state.
+     * This is a compatibility fallback for an unusually limited CPU. Keep
+     * CR0.TS set so an attempted x87/MMX/SIMD instruction receives #NM rather
+     * than allowing unmanaged register state to cross task boundaries.
      */
     uint64_t cr0;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
     cr0 |= CR0_TASK_SWITCHED;
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+}
+
+static bool initialize_fpu_contexts(void) {
+    uint32_t feature_a;
+    uint32_t feature_b;
+    uint32_t feature_c;
+    uint32_t feature_d;
+    __asm__ volatile(
+        "cpuid"
+        : "=a"(feature_a), "=b"(feature_b),
+          "=c"(feature_c), "=d"(feature_d)
+        : "a"(1u), "c"(0u));
+    (void)feature_a;
+    (void)feature_b;
+    (void)feature_c;
+
+    const uint32_t required =
+        CPUID_FEATURE_FPU | CPUID_FEATURE_FXSR |
+        CPUID_FEATURE_SSE | CPUID_FEATURE_SSE2;
+    if ((feature_d & required) != required) {
+        disable_unmanaged_fpu_state();
+        return false;
+    }
+
+    uint64_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(CR0_EMULATION | CR0_TASK_SWITCHED);
+    cr0 |= CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR;
+    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    /*
+     * FXSAVE does not preserve AVX YMM upper halves. Keep OSXSAVE disabled so
+     * applications cannot enter an extended state this scheduler would omit.
+     */
+    cr4 &= ~CR4_OSXSAVE;
+    cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+    __asm__ volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+
+    /*
+     * Build the architectural reset image explicitly. FNINIT does not erase
+     * the physical x87/MMX payload, and LDMXCSR does not clear XMM registers;
+     * saving immediately after those instructions would copy privileged
+     * residue into every new process.
+     *
+     * FXSAVE layout: FCW at 0, MXCSR at 24, x87/MMX at 32, and XMM at 160.
+     * Zero means all x87 tags are empty and every data register starts clean.
+     */
+    for (size_t index = 0;
+         index < sizeof(g_initial_fpu_state); index++) {
+        g_initial_fpu_state[index] = 0;
+    }
+    g_initial_fpu_state[0] = 0x7fu;
+    g_initial_fpu_state[1] = 0x03u; /* x87 control word 0x037F */
+    g_initial_fpu_state[24] = 0x80u;
+    g_initial_fpu_state[25] = 0x1fu; /* MXCSR 0x00001F80 */
+    __asm__ volatile(
+        "fxrstor64 %0"
+        :
+        : "m"(g_initial_fpu_state)
+        : "memory");
+    return true;
+}
+
+static void initialize_task_fpu(Task* task) {
+    if (task == NULL || !g_fpu_context_enabled) return;
+    copy_bytes(task->fpu_state, g_initial_fpu_state,
+               sizeof(task->fpu_state));
+}
+
+static void save_task_fpu(Task* task) {
+    if (task == NULL || !g_fpu_context_enabled) return;
+    __asm__ volatile(
+        "fxsave64 %0"
+        : "=m"(task->fpu_state)
+        :
+        : "memory");
+}
+
+static void restore_task_fpu(const Task* task) {
+    if (task == NULL || !g_fpu_context_enabled) return;
+    __asm__ volatile(
+        "fxrstor64 %0"
+        :
+        : "m"(task->fpu_state)
+        : "memory");
+}
+
+static uint64_t stack_canary_value(const Task* task, size_t index) {
+    return STACK_CANARY_SEED ^
+           (task != NULL ? task->id * 0x9E3779B97F4A7C15ull : 0) ^
+           (uint64_t)index;
+}
+
+static void initialize_stack_canary(Task* task) {
+    if (task == NULL || task->kernel_stack_canary == NULL) return;
+    for (size_t index = 0; index < STACK_CANARY_WORDS; index++) {
+        task->kernel_stack_canary[index] =
+            stack_canary_value(task, index);
+    }
+}
+
+static bool stack_canary_intact(const Task* task) {
+    if (task == NULL || task->kernel_stack_canary == NULL) return false;
+    for (size_t index = 0; index < STACK_CANARY_WORDS; index++) {
+        if (task->kernel_stack_canary[index] !=
+            stack_canary_value(task, index)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static _Noreturn void halt_on_stack_corruption(void) {
+    syslog_write(
+        "Scheduler: KERNEL STACK CANARY CORRUPTED; system halted");
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
+
+static bool allocate_guarded_kernel_stack(Task* task) {
+    if (task == NULL) return false;
+
+    void* raw = kmalloc(STACK_ALLOCATION_SIZE);
+    if (raw == NULL) return false;
+
+    const uintptr_t guard =
+        ((uintptr_t)raw + STACK_GUARD_SIZE - 1u) &
+        ~(uintptr_t)(STACK_GUARD_SIZE - 1u);
+    const uintptr_t stack_base = guard + STACK_GUARD_SIZE;
+    const uintptr_t stack_top = stack_base + STACK_SIZE;
+    const uintptr_t allocation_end =
+        (uintptr_t)raw + STACK_ALLOCATION_SIZE;
+    if (stack_top > allocation_end ||
+        !paging_kernel_guard_page((void*)guard)) {
+        kfree(raw);
+        return false;
+    }
+
+    task->kernel_stack = raw;
+    task->kernel_stack_guard = (void*)guard;
+    task->kernel_stack_canary = (uint64_t*)stack_base;
+    task->kernel_stack_top = (uint64_t)stack_top;
+    task->owns_kernel_stack = true;
+    return true;
+}
+
+static void release_kernel_stack(Task* task) {
+    if (task == NULL || !task->owns_kernel_stack) return;
+
+    if (!paging_kernel_unguard_page(task->kernel_stack_guard)) {
+        /*
+         * Never return a still-unmapped page to the general heap. Leaking one
+         * failed cleanup allocation is safer than poisoning future kmallocs.
+         */
+        syslog_write("Scheduler: failed to remove kernel stack guard");
+        return;
+    }
+    kfree(task->kernel_stack);
+    task->kernel_stack = NULL;
+    task->kernel_stack_guard = NULL;
+    task->kernel_stack_canary = NULL;
+    task->owns_kernel_stack = false;
 }
 
 static bool allocate_task_id(uint64_t* id) {
@@ -59,7 +258,10 @@ static void copy_task_name(char destination[TASK_NAME_MAX], const char* source) 
 
 static void destroy_task(Task* task) {
     if (task == NULL) return;
-    kfree(task->kernel_stack);
+    if (!stack_canary_intact(task)) {
+        halt_on_stack_corruption();
+    }
+    release_kernel_stack(task);
     paging_address_space_destroy(task->address_space);
     kfree(task);
 }
@@ -110,6 +312,7 @@ void scheduler_init(void) {
         syslog_write("Scheduler: initialization failed (out of memory)");
         return;
     }
+    *kmain_task = (Task){0};
 
     if (!allocate_task_id(&kmain_task->id)) {
         kfree(kmain_task);
@@ -121,7 +324,10 @@ void scheduler_init(void) {
     kmain_task->is_user = false;
     kmain_task->state = TASK_READY;
     kmain_task->kernel_stack_top = (uint64_t)g_kernel_stack_top;
-    kmain_task->kernel_stack = NULL;
+    kmain_task->kernel_stack = g_kernel_stack;
+    kmain_task->kernel_stack_guard = g_kernel_stack_guard_page;
+    kmain_task->kernel_stack_canary = (uint64_t*)g_kernel_stack;
+    kmain_task->owns_kernel_stack = false;
     kmain_task->user_stack = NULL;
     kmain_task->address_space = NULL;
     kmain_task->user_entry = 0;
@@ -131,12 +337,26 @@ void scheduler_init(void) {
     kmain_task->quantum_ticks = 0;
     kmain_task->next = kmain_task; // Circular list
 
+    if (!paging_kernel_guard_page(g_kernel_stack_guard_page)) {
+        kfree(kmain_task);
+        syslog_write(
+            "Scheduler: bootstrap stack guard installation failed");
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
+    initialize_stack_canary(kmain_task);
+    g_fpu_context_enabled = initialize_fpu_contexts();
+    if (g_fpu_context_enabled) {
+        save_task_fpu(kmain_task);
+    }
+
     g_head = kmain_task;
     g_current_task = kmain_task;
-    disable_unmanaged_fpu_state();
     
-    syslog_write(
-        "Scheduler: cooperative kernel/preemptive user tasks; FPU trapped");
+    syslog_write(g_fpu_context_enabled
+        ? "Scheduler: guarded stacks; per-task x87/MMX/SSE state"
+        : "Scheduler: guarded stacks; unsupported FPU state trapped");
 }
 
 extern void task_return_trampoline(void);
@@ -149,16 +369,16 @@ bool spawn_named_task(const char* name, void (*entry_point)(void)) {
         syslog_write("Scheduler: task allocation failed");
         return false;
     }
+    *new_task = (Task){0};
 
-    uint8_t* stack = (uint8_t*)kmalloc(STACK_SIZE);
-    if (stack == NULL) {
+    if (!allocate_guarded_kernel_stack(new_task)) {
         kfree(new_task);
-        syslog_write("Scheduler: stack allocation failed");
+        syslog_write("Scheduler: guarded stack allocation failed");
         return false;
     }
     
     if (!allocate_task_id(&new_task->id)) {
-        kfree(stack);
+        release_kernel_stack(new_task);
         kfree(new_task);
         syslog_write("Scheduler: PID allocation failed");
         return false;
@@ -167,7 +387,6 @@ bool spawn_named_task(const char* name, void (*entry_point)(void)) {
                    name != NULL && name[0] != '\0' ? name : "kernel/task");
     new_task->is_user = false;
     new_task->state = TASK_READY;
-    new_task->kernel_stack = stack;
     new_task->user_stack = NULL;
     new_task->address_space = NULL;
     new_task->user_entry = 0;
@@ -175,8 +394,11 @@ bool spawn_named_task(const char* name, void (*entry_point)(void)) {
     new_task->app_process_id = 0;
     new_task->app_capabilities = 0;
     new_task->quantum_ticks = 0;
+    initialize_stack_canary(new_task);
+    initialize_task_fpu(new_task);
     
-    uint64_t* sp = (uint64_t*)(stack + STACK_SIZE);
+    uint64_t* sp =
+        (uint64_t*)(uintptr_t)new_task->kernel_stack_top;
     
     // Synthetic return address used when the task entry function returns.
     *(--sp) = (uint64_t)task_return_trampoline;
@@ -196,7 +418,6 @@ bool spawn_named_task(const char* name, void (*entry_point)(void)) {
     *(--sp) = 0; // R15
     
     new_task->rsp = (uint64_t)sp;
-    new_task->kernel_stack_top = (uint64_t)(stack + STACK_SIZE);
 
     new_task->next = g_head->next;
     g_head->next = new_task;
@@ -227,6 +448,7 @@ bool scheduler_spawn_user_process(
         entry_point >= PAGING_USER_LIMIT ||
         user_stack_top <= PAGING_USER_BASE ||
         user_stack_top > PAGING_USER_LIMIT ||
+        (user_stack_top & 0xfull) != 0 ||
         !paging_user_range_mapped(address_space, entry_point, 1, false) ||
         !paging_user_range_mapped(address_space,
                                   user_stack_top - sizeof(uint64_t),
@@ -239,15 +461,16 @@ bool scheduler_spawn_user_process(
         syslog_write("Scheduler: user task allocation failed");
         return false;
     }
-    uint8_t* kernel_stack = (uint8_t*)kmalloc(STACK_SIZE);
-    if (kernel_stack == NULL) {
+    *new_task = (Task){0};
+    if (!allocate_guarded_kernel_stack(new_task)) {
         kfree(new_task);
-        syslog_write("Scheduler: user kernel-stack allocation failed");
+        syslog_write(
+            "Scheduler: user guarded-stack allocation failed");
         return false;
     }
 
     if (!allocate_task_id(&new_task->id)) {
-        kfree(kernel_stack);
+        release_kernel_stack(new_task);
         kfree(new_task);
         syslog_write("Scheduler: PID allocation failed");
         return false;
@@ -259,7 +482,6 @@ bool scheduler_spawn_user_process(
                        : "app/user");
     new_task->is_user = true;
     new_task->state = TASK_READY;
-    new_task->kernel_stack = kernel_stack;
     new_task->user_stack = NULL;
     new_task->address_space = address_space;
     new_task->user_entry = entry_point;
@@ -267,10 +489,11 @@ bool scheduler_spawn_user_process(
     new_task->app_process_id = app_process_id;
     new_task->app_capabilities = app_capabilities;
     new_task->quantum_ticks = 0;
-    new_task->kernel_stack_top =
-        (uint64_t)(kernel_stack + STACK_SIZE);
+    initialize_stack_canary(new_task);
+    initialize_task_fpu(new_task);
 
-    uint64_t* sp = (uint64_t*)(kernel_stack + STACK_SIZE);
+    uint64_t* sp =
+        (uint64_t*)(uintptr_t)new_task->kernel_stack_top;
     *(--sp) = (uint64_t)task_return_trampoline;
     *(--sp) = (uint64_t)user_task_bootstrap;
     *(--sp) = INITIAL_TASK_RFLAGS;
@@ -507,6 +730,9 @@ void exit_current_task(void) {
 
 void schedule(void) {
     if (!g_current_task) return;
+    if (!stack_canary_intact(g_current_task)) {
+        halt_on_stack_corruption();
+    }
 
     reap_dead_tasks();
 
@@ -535,6 +761,12 @@ void schedule(void) {
                      : "=r"(saved_rflags)
                      :
                      : "memory");
+    if (!stack_canary_intact(prev) ||
+        !stack_canary_intact(next)) {
+        halt_on_stack_corruption();
+    }
+    save_task_fpu(prev);
+    restore_task_fpu(next);
     g_current_task = next;
     prev->quantum_ticks = 0;
     next->quantum_ticks = 0;

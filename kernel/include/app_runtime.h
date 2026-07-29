@@ -15,6 +15,7 @@ enum app_runtime_launch_result {
     APP_RUNTIME_LAUNCH_SCHEDULER_FAILED,
     APP_RUNTIME_LAUNCH_NOT_FOUND,
     APP_RUNTIME_LAUNCH_APP_FAULTED,
+    APP_RUNTIME_LAUNCH_APP_EXITED_ERROR,
     APP_RUNTIME_LAUNCH_DISPATCH_BUDGET,
     APP_RUNTIME_LAUNCH_NX_REQUIRED,
 };
@@ -27,6 +28,10 @@ enum app_runtime_launch_result {
 enum app_runtime_launch_result app_runtime_spawn(
     const struct app_catalog_entry* entry,
     uint64_t* out_process_id);
+enum app_runtime_launch_result app_runtime_spawn_with_argument(
+    const struct app_catalog_entry* entry,
+    const char* startup_argument,
+    uint64_t* out_process_id);
 
 /*
  * Runs the named embedded app until it exits/faults or a bounded number of
@@ -34,6 +39,9 @@ enum app_runtime_launch_result app_runtime_spawn(
  * this caller by timer preemption and remains killable as a background task.
  */
 enum app_runtime_launch_result app_runtime_run_catalog_id(const char* app_id);
+enum app_runtime_launch_result app_runtime_run_catalog_id_with_argument(
+    const char* app_id,
+    const char* startup_argument);
 
 const char* app_runtime_launch_result_text(
     enum app_runtime_launch_result result);

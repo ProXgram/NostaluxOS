@@ -72,21 +72,21 @@ static void boot_sequence(const struct BootInfo* boot_info) {
     scheduler_init();
 
     /*
-     * Validate and catalog the embedded sample independently of execution.
-     * The user-mode runtime decides whether the current paging/scheduler
-     * implementation can safely launch it.
+     * Mount storage before catalog setup so obsolete filesystem mirrors from
+     * earlier development builds can be reclaimed without risking unknown
+     * files. Current app packages live in the read-only OS image.
      */
     app_process_table_reset();
+    fs_init();
     if (app_catalog_initialize_embedded() == APP_CATALOG_OK) {
         syslog_write("Apps: embedded ELF catalog validated");
+        (void)app_catalog_reclaim_legacy_filesystem_images();
     } else {
         syslog_write("Apps: embedded ELF catalog unavailable");
     }
 
     background_render();
     timer_set_callback(background_animate);
-    
-    fs_init();
 }
 
 void kmain(const struct BootInfo* boot_info) {

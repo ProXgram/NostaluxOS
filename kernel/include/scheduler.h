@@ -7,6 +7,7 @@
 
 #define TASK_NAME_MAX 32
 #define SCHEDULER_USER_QUANTUM_TICKS 5u
+#define SCHEDULER_FPU_STATE_SIZE 512u
 
 struct paging_address_space;
 
@@ -20,7 +21,13 @@ typedef struct {
     char name[TASK_NAME_MAX];
     uint64_t rsp;
     uint64_t kernel_stack_top; // For Ring 3 -> 0 transitions
+    /*
+     * kernel_stack is the allocator payload that must eventually be freed;
+     * guard/canary identify the protected low end of its usable stack.
+     */
     void* kernel_stack;
+    void* kernel_stack_guard;
+    uint64_t* kernel_stack_canary;
     void* user_stack;
     struct paging_address_space* address_space;
     uint64_t user_entry;
@@ -28,6 +35,8 @@ typedef struct {
     uint64_t app_process_id;
     uint64_t app_capabilities;
     uint32_t quantum_ticks;
+    _Alignas(16) uint8_t fpu_state[SCHEDULER_FPU_STATE_SIZE];
+    bool owns_kernel_stack;
     bool is_user;
     TaskState state;
     void* next;

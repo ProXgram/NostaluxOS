@@ -30,11 +30,13 @@
  *   INPUT_POLL      (window_handle, out_event, out_size) -> 0 or 1 event
  *   MEMORY_MAP      (byte_count, protection_flags) -> user address
  *   MEMORY_UNMAP    (user_address, byte_count)
+ *   ARGUMENT_GET     (buffer, capacity) -> startup-argument byte count
+ *   FILE_REPLACE     (path, path_length, bytes, length) -> byte count
  *
- * Ring-3 apps reach this ABI through the checked INT 0x80 gate. ABI_QUERY,
- * EXIT, YIELD, LOG_WRITE, and TIME_GET are implemented. The remaining
- * reserved v1 calls return APP_STATUS_UNSUPPORTED until their backing
- * subsystems and handle validation are complete.
+ * Ring-3 apps reach this ABI through the checked INT 0x80 gate. All pointers
+ * are user virtual addresses and are copied through the current process page
+ * tables. Handles are opaque, process-owned values; an app must never infer a
+ * kernel pointer from them.
  */
 enum app_syscall_id {
     APP_SYSCALL_ABI_QUERY = 0x1000,
@@ -52,6 +54,8 @@ enum app_syscall_id {
     APP_SYSCALL_INPUT_POLL,
     APP_SYSCALL_MEMORY_MAP,
     APP_SYSCALL_MEMORY_UNMAP,
+    APP_SYSCALL_ARGUMENT_GET,
+    APP_SYSCALL_FILE_REPLACE,
 };
 
 enum app_status {
@@ -85,6 +89,27 @@ enum app_input_type {
     APP_INPUT_POINTER_BUTTON,
     APP_INPUT_WINDOW_CLOSE,
 };
+
+enum app_input_flags {
+    APP_INPUT_FLAG_PRESSED  = 1u << 0,
+    APP_INPUT_FLAG_RELEASED = 1u << 1,
+};
+
+enum app_pointer_button {
+    APP_POINTER_BUTTON_LEFT = 1,
+    APP_POINTER_BUTTON_RIGHT = 2,
+};
+
+#define APP_FILE_PATH_MAX          31u
+#define APP_FILE_TRANSFER_MAX      4096u
+#define APP_MEMORY_MAP_MAX         (1024u * 1024u)
+#define APP_MEMORY_PROCESS_MAX     (4u * 1024u * 1024u)
+#define APP_WINDOW_TITLE_MAX       31u
+#define APP_WINDOW_MIN_WIDTH       64u
+#define APP_WINDOW_MIN_HEIGHT      48u
+#define APP_WINDOW_MAX_WIDTH       480u
+#define APP_WINDOW_MAX_HEIGHT      360u
+#define APP_STARTUP_ARGUMENT_MAX   31u
 
 struct app_abi_info {
     uint32_t abi_version;
@@ -123,6 +148,139 @@ struct app_input_event {
     uint32_t key;
     uint32_t button;
 };
+
+/*
+ * Raw Apps v1 call helper. App code may use the typed wrappers below or call
+ * this directly. The kernel never calls these wrappers.
+ */
+#if defined(__x86_64__) && !defined(NOSTALUX_HOST_TEST)
+static inline uint64_t app_syscall5(uint64_t syscall_id,
+                                    uint64_t argument1,
+                                    uint64_t argument2,
+                                    uint64_t argument3,
+                                    uint64_t argument4,
+                                    uint64_t argument5) {
+    uint64_t result;
+    register uint64_t register_r8 __asm__("r8") = argument4;
+    register uint64_t register_r9 __asm__("r9") = argument5;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(result)
+        : "D"(syscall_id), "S"(argument1), "d"(argument2),
+          "c"(argument3), "r"(register_r8), "r"(register_r9)
+        : "memory", "cc");
+    return result;
+}
+
+static inline uint64_t app_syscall2(uint64_t syscall_id,
+                                    uint64_t argument1,
+                                    uint64_t argument2) {
+    return app_syscall5(syscall_id, argument1, argument2, 0, 0, 0);
+}
+
+static inline bool app_result_is_error(uint64_t result) {
+    return (int64_t)result < 0;
+}
+
+static inline uint64_t app_abi_query(struct app_abi_info* info) {
+    return app_syscall2(
+        APP_SYSCALL_ABI_QUERY, (uint64_t)(uintptr_t)info,
+        sizeof(*info));
+}
+
+static inline uint64_t app_log_write(const void* bytes,
+                                     size_t length) {
+    return app_syscall2(
+        APP_SYSCALL_LOG_WRITE, (uint64_t)(uintptr_t)bytes,
+        (uint64_t)length);
+}
+
+static inline uint64_t app_time_get(struct app_time* time) {
+    return app_syscall2(
+        APP_SYSCALL_TIME_GET, (uint64_t)(uintptr_t)time,
+        sizeof(*time));
+}
+
+static inline uint64_t app_argument_get(char* buffer, size_t capacity) {
+    return app_syscall2(
+        APP_SYSCALL_ARGUMENT_GET, (uint64_t)(uintptr_t)buffer,
+        (uint64_t)capacity);
+}
+
+static inline uint64_t app_file_open(const char* path,
+                                     size_t path_length,
+                                     uint32_t flags) {
+    return app_syscall5(APP_SYSCALL_FILE_OPEN,
+                        (uint64_t)(uintptr_t)path,
+                        (uint64_t)path_length, flags, 0, 0);
+}
+
+static inline uint64_t app_file_read(uint64_t handle, void* buffer,
+                                     size_t length, size_t offset) {
+    return app_syscall5(APP_SYSCALL_FILE_READ, handle,
+                        (uint64_t)(uintptr_t)buffer,
+                        (uint64_t)length, (uint64_t)offset, 0);
+}
+
+static inline uint64_t app_file_write(uint64_t handle,
+                                      const void* buffer,
+                                      size_t length, size_t offset) {
+    return app_syscall5(APP_SYSCALL_FILE_WRITE, handle,
+                        (uint64_t)(uintptr_t)buffer,
+                        (uint64_t)length, (uint64_t)offset, 0);
+}
+
+static inline uint64_t app_file_replace(
+    const char* path, size_t path_length,
+    const void* bytes, size_t length) {
+    return app_syscall5(
+        APP_SYSCALL_FILE_REPLACE,
+        (uint64_t)(uintptr_t)path, (uint64_t)path_length,
+        (uint64_t)(uintptr_t)bytes, (uint64_t)length, 0);
+}
+
+static inline uint64_t app_file_close(uint64_t handle) {
+    return app_syscall2(APP_SYSCALL_FILE_CLOSE, handle, 0);
+}
+
+static inline uint64_t app_window_create(
+    const struct app_window_create* request) {
+    return app_syscall2(
+        APP_SYSCALL_WINDOW_CREATE,
+        (uint64_t)(uintptr_t)request, sizeof(*request));
+}
+
+static inline uint64_t app_window_present(
+    const struct app_window_present* request) {
+    return app_syscall2(
+        APP_SYSCALL_WINDOW_PRESENT,
+        (uint64_t)(uintptr_t)request, sizeof(*request));
+}
+
+static inline uint64_t app_window_close(uint64_t handle) {
+    return app_syscall2(APP_SYSCALL_WINDOW_CLOSE, handle, 0);
+}
+
+static inline uint64_t app_input_poll(
+    uint64_t window_handle, struct app_input_event* event) {
+    return app_syscall5(
+        APP_SYSCALL_INPUT_POLL, window_handle,
+        (uint64_t)(uintptr_t)event, sizeof(*event), 0, 0);
+}
+
+static inline uint64_t app_memory_map(size_t byte_count,
+                                      uint32_t protection_flags) {
+    return app_syscall2(APP_SYSCALL_MEMORY_MAP,
+                        (uint64_t)byte_count, protection_flags);
+}
+
+static inline uint64_t app_memory_unmap(void* address,
+                                        size_t byte_count) {
+    return app_syscall2(APP_SYSCALL_MEMORY_UNMAP,
+                        (uint64_t)(uintptr_t)address,
+                        (uint64_t)byte_count);
+}
+#endif
 
 bool app_abi_syscall_known(uint64_t syscall_id);
 uint64_t app_abi_required_capability(uint64_t syscall_id);

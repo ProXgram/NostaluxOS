@@ -5,6 +5,8 @@
 
 #include "app_abi.h"
 #include "app_manifest.h"
+#include "app_process.h"
+#include "app_services.h"
 #include "paging.h"
 #include "rtc.h"
 #include "scheduler.h"
@@ -109,13 +111,51 @@ static uint64_t dispatch_time_get(const struct syscall_regs* regs) {
     return APP_STATUS_OK;
 }
 
+static uint64_t dispatch_argument_get(const struct syscall_regs* regs) {
+    if (regs->rsi == 0 || regs->rdx == 0 ||
+        regs->rdx > (uint64_t)SIZE_MAX) {
+        return app_error(APP_STATUS_INVALID_ARGUMENT);
+    }
+
+    char argument[APP_STARTUP_ARGUMENT_MAX + 1u];
+    size_t length = 0;
+    if (!app_process_get_startup_argument(
+            scheduler_current_app_process_id(),
+            argument, sizeof(argument), &length)) {
+        return app_error(APP_STATUS_IO_ERROR);
+    }
+    if (regs->rdx < length + 1u) {
+        return app_error(APP_STATUS_NO_SPACE);
+    }
+    if (!paging_copy_to_user(
+            current_user_space(), regs->rsi,
+            argument, length + 1u)) {
+        return app_error(APP_STATUS_INVALID_ARGUMENT);
+    }
+    return (uint64_t)length;
+}
+
 uint64_t syscall_dispatcher(struct syscall_regs* regs) {
     /*
      * INT 0x80 is an application boundary, not a way to invoke the old raw
      * kernel helpers. Requiring an active user task also makes a CPL0 INT 0x80
-     * harmless.
+     * harmless. Check CS before reading the privilege-transition-only RSP/SS
+     * tail: an accidental CPL0 INT 0x80 has a shorter hardware frame.
      */
-    if (regs == NULL || !scheduler_current_is_user() ||
+    if (regs == NULL ||
+        !user_return_frame_is_user(&regs->return_frame)) {
+        return SYSCALL_RESULT_UNSUPPORTED;
+    }
+
+    /*
+     * Normalize the frame before any requested side effect. Invalid user
+     * state is poisoned so IRET completes at CPL3 and the resulting page fault
+     * is contained by the ordinary user-exception path.
+     */
+    const bool return_frame_valid =
+        user_return_frame_normalize(&regs->return_frame);
+    if (!return_frame_valid ||
+        !scheduler_current_is_user() ||
         current_user_space() == NULL) {
         return SYSCALL_RESULT_UNSUPPORTED;
     }
@@ -132,21 +172,26 @@ uint64_t syscall_dispatcher(struct syscall_regs* regs) {
             return dispatch_log_write(regs);
         case APP_SYSCALL_TIME_GET:
             return dispatch_time_get(regs);
+        case APP_SYSCALL_ARGUMENT_GET:
+            return dispatch_argument_get(regs);
 
-        /*
-         * File, window, input, and dynamic-memory services have ABI numbers
-         * but no implementation yet. Returning UNSUPPORTED is deliberate.
-         */
         case APP_SYSCALL_FILE_OPEN:
         case APP_SYSCALL_FILE_READ:
         case APP_SYSCALL_FILE_WRITE:
         case APP_SYSCALL_FILE_CLOSE:
+        case APP_SYSCALL_FILE_REPLACE:
         case APP_SYSCALL_WINDOW_CREATE:
         case APP_SYSCALL_WINDOW_PRESENT:
         case APP_SYSCALL_WINDOW_CLOSE:
         case APP_SYSCALL_INPUT_POLL:
         case APP_SYSCALL_MEMORY_MAP:
         case APP_SYSCALL_MEMORY_UNMAP:
+            return app_services_dispatch(
+                regs->rdi, current_user_space(),
+                scheduler_current_app_process_id(),
+                scheduler_current_app_capabilities(),
+                regs->rsi, regs->rdx, regs->rcx,
+                regs->r8, regs->r9);
         default:
             return SYSCALL_RESULT_UNSUPPORTED;
     }

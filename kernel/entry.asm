@@ -94,11 +94,37 @@ enter_user_mode:
     mov fs, ax
     mov gs, ax
 
+    ; IRET enters the ELF entry point directly rather than through CALL.
+    ; Reserve a synthetic return slot so the SysV function-entry invariant is
+    ; RSP % 16 == 8. Returning unexpectedly faults at address zero and remains
+    ; contained as an ordinary ring-3 process fault.
+    sub rsi, 8
+    mov qword [rsi], 0
+
     push qword 0x1b          ; SS
     push rsi                 ; RSP
     push qword 0x202         ; RFLAGS: reserved bit + IF
     push qword 0x23          ; CS (GDT 0x20 | RPL3)
     push rdi                 ; RIP
+
+    ; The C bootstrap may retain kernel pointers and other privileged data in
+    ; caller- or callee-saved registers. Start every process with a clean,
+    ; deterministic general-register file.
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
     iretq
 
 ; ---------------------------------------------

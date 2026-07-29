@@ -28,6 +28,19 @@ static void log_bytes(const char* bytes, size_t length) {
 }
 
 __attribute__((noreturn)) void nostalux_app_entry(void) {
+    /*
+     * Exercise both legacy x87 and SSE state during every boot-time launch.
+     * The app compiler deliberately emits only general-register C code, so
+     * these instructions provide a small architectural check that the
+     * scheduler enabled and can preserve the extended register file.
+     */
+    __asm__ volatile(
+        "fninit\n\t"
+        "pxor %%xmm0, %%xmm0"
+        :
+        :
+        : "memory");
+
     static const char greeting[] =
         "Hello from a separate Nostalux ELF app.";
     static const char abi_error[] =

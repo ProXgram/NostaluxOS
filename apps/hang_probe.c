@@ -1,5 +1,5 @@
 /*
- * This probe deliberately violates the cooperative Apps v1 convention:
+ * This probe deliberately violates the normal Apps v1 idle-loop convention:
  * it sets DF and then spins forever without issuing a syscall or yield.
  *
  * A healthy kernel clears DF on every interrupt entry, preempts the process

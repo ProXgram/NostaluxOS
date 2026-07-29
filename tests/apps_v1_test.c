@@ -254,15 +254,36 @@ static void test_manifest_registry(void) {
 
 static void test_abi_contract(void) {
     assert(app_abi_syscall_known(APP_SYSCALL_ABI_QUERY));
-    assert(app_abi_syscall_known(APP_SYSCALL_MEMORY_UNMAP));
+    assert(app_abi_syscall_known(APP_SYSCALL_ARGUMENT_GET));
     assert(!app_abi_syscall_known(0));
     assert(app_abi_required_capability(APP_SYSCALL_TIME_GET) ==
            APP_CAPABILITY_TIME);
     assert(app_abi_required_capability(APP_SYSCALL_FILE_READ) ==
            APP_CAPABILITY_FILE_READ);
+    assert(app_abi_required_capability(APP_SYSCALL_FILE_OPEN) == 0);
+    assert(app_abi_required_capability(APP_SYSCALL_FILE_CLOSE) == 0);
+    assert(app_abi_required_capability(APP_SYSCALL_MEMORY_MAP) ==
+           APP_CAPABILITY_MEMORY);
     assert(app_abi_required_capability(UINT64_MAX) == UINT64_MAX);
     assert(strcmp(app_abi_syscall_name(APP_SYSCALL_WINDOW_CREATE),
                   "window_create") == 0);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_ARGUMENT_GET) == 0);
+    assert(strcmp(app_abi_syscall_name(APP_SYSCALL_ARGUMENT_GET),
+                  "argument_get") == 0);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_FILE_REPLACE) ==
+           APP_CAPABILITY_FILE_WRITE);
+    assert(strcmp(app_abi_syscall_name(APP_SYSCALL_FILE_REPLACE),
+                  "file_replace") == 0);
+    assert(APP_FILE_PATH_MAX == 31u);
+    assert(APP_FILE_TRANSFER_MAX >= 4096u);
+    assert(APP_WINDOW_MIN_WIDTH <= APP_WINDOW_MAX_WIDTH);
+    assert(APP_WINDOW_MIN_HEIGHT <= APP_WINDOW_MAX_HEIGHT);
+    assert(sizeof(struct app_window_create) == 24u);
+    assert(sizeof(struct app_window_present) == 32u);
+    assert(sizeof(struct app_input_event) == 24u);
+    assert((int64_t)(uint64_t)(int64_t)APP_STATUS_BAD_HANDLE < 0);
 }
 
 static void test_process_metadata(void) {
@@ -290,10 +311,28 @@ static void test_process_metadata(void) {
     assert(process.state == APP_PROCESS_LOADED);
     assert(strcmp(process.app_id, "test-app") == 0);
     assert(process.entry_point == plan.entry_point);
+    char startup_argument[APP_STARTUP_ARGUMENT_MAX + 1u];
+    size_t startup_length = 0;
+    assert(app_process_set_startup_argument(
+               process_id,
+               "argument-that-is-deliberately-too-long") ==
+           APP_PROCESS_INVALID_ARGUMENT);
+    assert(app_process_set_startup_argument(
+               process_id, "notes.txt") == APP_PROCESS_OK);
+    assert(app_process_get_startup_argument(
+        process_id, startup_argument, sizeof(startup_argument),
+        &startup_length));
+    assert(startup_length == strlen("notes.txt"));
+    assert(strcmp(startup_argument, "notes.txt") == 0);
+    assert(app_process_find(process_id, &process));
+    assert(strcmp(process.startup_argument, "notes.txt") == 0);
 
     assert(app_process_mark_running(process_id) ==
            APP_PROCESS_INVALID_TRANSITION);
     assert(app_process_mark_starting(process_id) == APP_PROCESS_OK);
+    assert(app_process_set_startup_argument(
+               process_id, "late.txt") ==
+           APP_PROCESS_INVALID_TRANSITION);
     assert(app_process_mark_running(process_id) == APP_PROCESS_OK);
 
     const struct app_fault_record fault = {
@@ -462,16 +501,91 @@ static void test_hang_probe_elf(const char* path) {
     free(image);
 }
 
+typedef enum app_catalog_result (*catalog_installer)(
+    const void*, size_t, size_t*);
+
+static void test_catalog_app_elf(
+    const char* path,
+    catalog_installer install,
+    const char* expected_id,
+    const char* expected_executable,
+    uint64_t expected_capabilities) {
+    FILE* file = fopen(path, "rb");
+    assert(file != NULL);
+    assert(fseek(file, 0, SEEK_END) == 0);
+    long file_length = ftell(file);
+    assert(file_length > 0);
+    assert(fseek(file, 0, SEEK_SET) == 0);
+
+    uint8_t* image = (uint8_t*)malloc((size_t)file_length);
+    assert(image != NULL);
+    assert(fread(image, 1, (size_t)file_length, file) ==
+           (size_t)file_length);
+    assert(fclose(file) == 0);
+
+    struct elf64_image_plan plan;
+    assert(elf64_inspect(image, (size_t)file_length, &plan) ==
+           ELF64_LOAD_OK);
+    uint8_t* loaded = (uint8_t*)malloc(plan.image_span);
+    assert(loaded != NULL);
+    assert(elf64_load_contiguous(
+               image, (size_t)file_length,
+               loaded, plan.image_span, NULL) == ELF64_LOAD_OK);
+
+    app_catalog_reset();
+    assert(install(image, (size_t)file_length, NULL) == APP_CATALOG_OK);
+    const struct app_catalog_entry* entry =
+        app_catalog_find_id(expected_id);
+    assert(entry != NULL);
+    assert(strcmp(entry->manifest.executable,
+                  expected_executable) == 0);
+    assert(entry->manifest.capabilities == expected_capabilities);
+    assert(entry->image_plan.entry_point == plan.entry_point);
+    app_catalog_reset();
+
+    free(loaded);
+    free(image);
+}
+
 int main(int argc, char** argv) {
     test_valid_inspect_and_load();
     test_elf_rejections();
     test_manifest_registry();
     test_abi_contract();
     test_process_metadata();
-    if (argc == 4) {
+    if (argc == 10) {
         test_toolchain_elf(argv[1]);
         test_fault_probe_elf(argv[2]);
         test_hang_probe_elf(argv[3]);
+        test_catalog_app_elf(
+            argv[4], app_catalog_install_rflags_probe,
+            "rflags-probe", "rflags-probe.elf", 0);
+        test_catalog_app_elf(
+            argv[5], app_catalog_install_stack_probe,
+            "stack-probe", "stack-probe.elf", 0);
+        test_catalog_app_elf(
+            argv[6], app_catalog_install_calculator,
+            "calculator", "calculator.elf",
+            APP_CAPABILITY_LOG | APP_CAPABILITY_INPUT |
+                APP_CAPABILITY_WINDOW | APP_CAPABILITY_MEMORY);
+        test_catalog_app_elf(
+            argv[7], app_catalog_install_notepad,
+            "notepad", "notepad.elf",
+            APP_CAPABILITY_LOG | APP_CAPABILITY_FILE_READ |
+                APP_CAPABILITY_FILE_WRITE | APP_CAPABILITY_INPUT |
+                APP_CAPABILITY_WINDOW | APP_CAPABILITY_MEMORY);
+        test_catalog_app_elf(
+            argv[8], app_catalog_install_image_viewer,
+            "image-viewer", "image-viewer.elf",
+            APP_CAPABILITY_LOG | APP_CAPABILITY_FILE_READ |
+                APP_CAPABILITY_INPUT | APP_CAPABILITY_WINDOW |
+                APP_CAPABILITY_MEMORY);
+        test_catalog_app_elf(
+            argv[9], app_catalog_install_ai_assistant,
+            "ai-assistant", "ai-assistant.elf",
+            APP_CAPABILITY_LOG | APP_CAPABILITY_TIME |
+                APP_CAPABILITY_INPUT | APP_CAPABILITY_WINDOW |
+                APP_CAPABILITY_MEMORY);
     } else {
         assert(argc == 1);
     }

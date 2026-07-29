@@ -57,16 +57,40 @@ _Static_assert(offsetof(struct gdt_layout, u_code) == 0x20, "UCode selector must
 _Static_assert(offsetof(struct gdt_layout, tss) == 0x28, "TSS selector must be 0x28");
 
 enum {
+    PAGE_SIZE = 4096,
     KERNEL_STACK_SIZE = 16384,
     DOUBLE_FAULT_STACK_SIZE = 4096,
 };
 
-uint8_t g_kernel_stack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
-uint8_t* const g_kernel_stack_top = g_kernel_stack + KERNEL_STACK_SIZE;
-static uint8_t g_double_fault_stack[DOUBLE_FAULT_STACK_SIZE] __attribute__((aligned(16)));
+/*
+ * Reserve a complete page immediately below the bootstrap kernel stack. The
+ * scheduler removes that page from the shared kernel mapping once paging and
+ * the heap are ready, giving kernel/main the same overflow boundary as spawned
+ * tasks.
+ */
+uint8_t
+    g_kernel_stack_storage[PAGE_SIZE + KERNEL_STACK_SIZE]
+        __attribute__((aligned(PAGE_SIZE)));
+/*
+ * Keep the historical g_kernel_stack array symbol at the first usable byte,
+ * while reserving the preceding page inside the same backing object.
+ */
+__asm__(
+    ".global g_kernel_stack\n"
+    ".set g_kernel_stack, g_kernel_stack_storage + 4096\n");
+extern uint8_t g_kernel_stack[];
+uint8_t* const g_kernel_stack_guard_page = g_kernel_stack_storage;
+uint8_t* const g_kernel_stack_top =
+    g_kernel_stack_storage + sizeof(g_kernel_stack_storage);
+static uint8_t
+    g_double_fault_stack[DOUBLE_FAULT_STACK_SIZE]
+        __attribute__((aligned(PAGE_SIZE)));
 
 static struct tss g_tss __attribute__((aligned(16))) = {
-    .rsp = {[0] = (uint64_t)(g_kernel_stack + sizeof(g_kernel_stack))},
+    .rsp = {
+        [0] = (uint64_t)(
+            g_kernel_stack_storage + sizeof(g_kernel_stack_storage))
+    },
     .ist = {[0] = (uint64_t)(g_double_fault_stack + sizeof(g_double_fault_stack))},
     .io_map_base = sizeof(struct tss),
 };

@@ -34,6 +34,14 @@ uint64_t paging_kernel_cr3(void);
 bool paging_nx_available(void);
 
 /*
+ * Installs/removes a supervisor-only, non-present 4 KiB guard page. The page
+ * must be page-aligned and either belong to the low kernel image mapping or
+ * the fixed managed-heap range. These calls are idempotent.
+ */
+bool paging_kernel_guard_page(void* page);
+bool paging_kernel_unguard_page(void* page);
+
+/*
  * Maps fresh zeroed pages. address and size must be page-aligned and wholly
  * inside [PAGING_USER_BASE, PAGING_USER_LIMIT). Existing mappings are never
  * replaced.
@@ -43,6 +51,14 @@ bool paging_user_map_anonymous(struct paging_address_space* space,
                                size_t size,
                                bool writable,
                                bool executable);
+/*
+ * Removes an exact range of process-owned anonymous leaf mappings and
+ * releases their frames. The full range is validated before any PTE changes;
+ * shared kernel mappings and process page-table pages are never freed.
+ */
+bool paging_user_unmap_anonymous(struct paging_address_space* space,
+                                 uint64_t address,
+                                 size_t size);
 
 /*
  * Checked user copies walk the supplied page tables rather than dereferencing

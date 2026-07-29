@@ -14,9 +14,11 @@
 #endif
 #define TEST_DISK_SECTORS (FS_STORAGE_LBA + 2048u)
 #define TEST_FS_STORAGE_LBA FS_STORAGE_LBA
-#define TEST_FS_DISK_VERSION 4u
+#define TEST_FS_INTEGRITY_VERSION 4u
+#define TEST_FS_DISK_VERSION 5u
+#define TEST_FS_DISK_DATA_BYTES 1024u
 #define TEST_FS_RECORD_BYTES \
-    (1u + FS_MAX_FILENAME + 4u + FS_MAX_FILE_SIZE)
+    (1u + FS_MAX_FILENAME + 4u + TEST_FS_DISK_DATA_BYTES)
 #define TEST_FS_TABLE_BYTES (TEST_FS_RECORD_BYTES * FS_MAX_FILES)
 #define TEST_FS_TABLE_SECTORS \
     ((TEST_FS_TABLE_BYTES + TEST_SECTOR_SIZE - 1u) / TEST_SECTOR_SIZE)
@@ -108,7 +110,7 @@ struct test_fs_record {
     uint8_t in_use;
     char name[FS_MAX_FILENAME];
     uint32_t size;
-    char data[FS_MAX_FILE_SIZE];
+    char data[TEST_FS_DISK_DATA_BYTES];
 } __attribute__((packed));
 
 _Static_assert(sizeof(struct test_fs_header) == TEST_SECTOR_SIZE,
@@ -163,7 +165,8 @@ static void update_slot_checksum(uint8_t slot) {
     header->checksum =
         test_checksum(test_table(slot),
                       TEST_FS_TABLE_SECTORS * TEST_SECTOR_SIZE);
-    if (header->version == TEST_FS_DISK_VERSION) {
+    if (header->version >= TEST_FS_INTEGRITY_VERSION &&
+        header->version <= TEST_FS_DISK_VERSION) {
         header->header_checksum = 0u;
         header->header_checksum = test_header_checksum(header);
     }
@@ -222,6 +225,15 @@ static size_t disk_record_index(uint8_t slot, const char* name) {
         }
     }
     return FS_MAX_FILES;
+}
+
+static struct test_fs_record* first_unused_disk_record(uint8_t slot) {
+    struct test_fs_record* records =
+        (struct test_fs_record*)test_table(slot);
+    for (size_t index = 0; index < FS_MAX_FILES; index++) {
+        if (records[index].in_use == 0) return &records[index];
+    }
+    return NULL;
 }
 
 static bool disk_contains_name(const char* name) {
@@ -426,6 +438,89 @@ static void test_generation_corruption_cannot_reorder_slots(void) {
     assert(g_write_calls == 0);
     assert(fs_write("session.txt", "volatile recovery"));
     assert(g_write_calls == 0);
+}
+
+static void test_equal_protected_generations_cannot_hide_divergence(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("newest-only.txt", "different protected snapshot"));
+
+    const uint8_t newest = newest_slot();
+    const uint8_t older = (uint8_t)(newest ^ 1u);
+    test_header(older)->generation =
+        test_header(newest)->generation;
+    update_slot_checksum(older);
+
+    uint8_t first_header_before[TEST_SECTOR_SIZE];
+    uint8_t second_header_before[TEST_SECTOR_SIZE];
+    memcpy(first_header_before, test_header(0),
+           sizeof(first_header_before));
+    memcpy(second_header_before, test_header(1),
+           sizeof(second_header_before));
+
+    reset_io_observation();
+    fs_init();
+
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_CORRUPT);
+    assert(fs_legacy_upgrade_status() ==
+           FS_LEGACY_UPGRADE_UNAVAILABLE);
+    assert(g_write_calls == 0u);
+    assert(log_contains(
+        "equal integrity-protected generations differ"));
+
+    assert(fs_write("session-only.txt", "preserve both snapshots"));
+    assert(g_write_calls == 0u);
+    assert(memcmp(first_header_before, test_header(0),
+                  sizeof(first_header_before)) == 0);
+    assert(memcmp(second_header_before, test_header(1),
+                  sizeof(second_header_before)) == 0);
+}
+
+static void test_equal_identical_protected_generations_are_safe(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("stable.txt", "same protected snapshot"));
+
+    const uint8_t source = newest_slot();
+    const uint8_t duplicate = (uint8_t)(source ^ 1u);
+    memcpy(test_table(duplicate), test_table(source),
+           TEST_FS_TABLE_SECTORS * TEST_SECTOR_SIZE);
+    memcpy(test_header(duplicate), test_header(source),
+           TEST_SECTOR_SIZE);
+
+    reset_io_observation();
+    fs_init();
+
+    assert(fs_backend_is_persistent());
+    assert(g_write_calls == 0u);
+    const struct fs_file* stable = fs_find("stable.txt");
+    assert(stable != NULL);
+    assert(strcmp(stable->data, "same protected snapshot") == 0);
+}
+
+static void test_half_range_generations_are_ambiguous(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("stable.txt", "identical protected table"));
+
+    const uint8_t source = newest_slot();
+    const uint8_t duplicate = (uint8_t)(source ^ 1u);
+    memcpy(test_table(duplicate), test_table(source),
+           TEST_FS_TABLE_SECTORS * TEST_SECTOR_SIZE);
+    memcpy(test_header(duplicate), test_header(source),
+           TEST_SECTOR_SIZE);
+    test_header(0)->generation = 7u;
+    test_header(1)->generation = 0x80000007u;
+    update_slot_checksum(0);
+    update_slot_checksum(1);
+
+    reset_io_observation();
+    fs_init();
+
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_CORRUPT);
+    assert(g_write_calls == 0u);
+    assert(log_contains(
+        "integrity-protected generation order is ambiguous"));
 }
 
 static void test_legacy_headers_migrate_to_integrity_metadata(void) {
@@ -1059,6 +1154,285 @@ static void test_public_mutations_roll_back_on_sync_failure(void) {
     }
 }
 
+static void fill_pattern(uint8_t* bytes, size_t length, uint8_t salt) {
+    for (size_t index = 0; index < length; index++) {
+        bytes[index] =
+            (uint8_t)(((index * 37u) + salt) & 0xffu);
+    }
+}
+
+static void test_extent_file_round_trip(void) {
+    static uint8_t payload[FS_MAX_FILE_SIZE - 1u];
+    fill_pattern(payload, sizeof(payload), 19u);
+    payload[17] = 0;
+    payload[TEST_FS_DISK_DATA_BYTES] = 0;
+
+    reset_storage();
+    fs_init();
+    assert(fs_write_bytes("large-app.elf", payload, sizeof(payload)));
+    assert(fs_backend_is_persistent());
+
+    uint8_t slot = newest_slot();
+    struct test_fs_record* head =
+        disk_record(slot, "large-app.elf");
+    assert(head != NULL);
+    assert(head->size == sizeof(payload));
+    size_t head_index = disk_record_index(slot, "large-app.elf");
+    assert(head_index + 7u < FS_MAX_FILES);
+    for (size_t part = 1; part < 8u; part++) {
+        struct test_fs_record* continuation =
+            &((struct test_fs_record*)test_table(slot))[head_index + part];
+        assert(continuation->in_use == 2u);
+        size_t expected =
+            part == 7u
+                ? sizeof(payload) - 7u * TEST_FS_DISK_DATA_BYTES
+                : TEST_FS_DISK_DATA_BYTES;
+        assert(continuation->size == expected);
+    }
+
+    reset_io_observation();
+    fs_init();
+    const struct fs_file* reloaded = fs_find("large-app.elf");
+    assert(reloaded != NULL);
+    assert(reloaded->size == sizeof(payload));
+    assert(memcmp(reloaded->data, payload, sizeof(payload)) == 0);
+}
+
+static void test_extent_capacity_is_not_an_io_failure(void) {
+    static uint8_t payload[4u * TEST_FS_DISK_DATA_BYTES];
+    fill_pattern(payload, sizeof(payload), 71u);
+
+    reset_storage();
+    fs_init();
+    for (size_t index = 0; index < 7u; index++) {
+        char name[FS_MAX_FILENAME];
+        snprintf(name, sizeof(name), "extent%zu.bin", index);
+        assert(fs_write_bytes(name, payload, sizeof(payload)));
+    }
+    assert(fs_backend_is_persistent());
+    assert(!fs_write_bytes("extent7.bin", payload, sizeof(payload)));
+    assert(fs_backend_is_persistent());
+    assert(fs_find("extent7.bin") == NULL);
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(fs_find("extent7.bin") == NULL);
+    for (size_t index = 0; index < 7u; index++) {
+        char name[FS_MAX_FILENAME];
+        snprintf(name, sizeof(name), "extent%zu.bin", index);
+        const struct fs_file* file = fs_find(name);
+        assert(file != NULL);
+        assert(file->size == sizeof(payload));
+        assert(memcmp(file->data, payload, sizeof(payload)) == 0);
+    }
+
+    assert(fs_remove("extent0.bin"));
+    assert(fs_write_bytes("extent7.bin", payload, sizeof(payload)));
+    assert(fs_backend_is_persistent());
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(fs_find("extent0.bin") == NULL);
+    const struct fs_file* replacement = fs_find("extent7.bin");
+    assert(replacement != NULL);
+    assert(replacement->size == sizeof(payload));
+    assert(memcmp(replacement->data, payload, sizeof(payload)) == 0);
+}
+
+static void assert_malformed_newest_slot_is_rejected(
+    const char* rejected_name) {
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_status() == FS_BACKEND_VOLATILE_CORRUPT);
+    assert(log_contains("rejected slot with invalid records"));
+    assert(g_write_calls == 0);
+    if (rejected_name != NULL) {
+        assert(fs_find(rejected_name) == NULL);
+    }
+}
+
+static void test_v5_missing_continuation_is_rejected(void) {
+    static uint8_t payload[2u * TEST_FS_DISK_DATA_BYTES + 17u];
+    fill_pattern(payload, sizeof(payload), 3u);
+
+    reset_storage();
+    fs_init();
+    assert(fs_write_bytes("missing-chain.bin", payload, sizeof(payload)));
+
+    uint8_t slot = newest_slot();
+    size_t head_index = disk_record_index(slot, "missing-chain.bin");
+    assert(head_index + 2u < FS_MAX_FILES);
+    struct test_fs_record* records =
+        (struct test_fs_record*)test_table(slot);
+    records[head_index + 1u].in_use = 0;
+    update_slot_checksum(slot);
+
+    assert_malformed_newest_slot_is_rejected("missing-chain.bin");
+}
+
+static void test_v5_orphan_continuation_is_rejected(void) {
+    reset_storage();
+    fs_init();
+
+    uint8_t slot = newest_slot();
+    struct test_fs_record* orphan = first_unused_disk_record(slot);
+    assert(orphan != NULL);
+    memset(orphan, 0, sizeof(*orphan));
+    orphan->in_use = 2u;
+    orphan->size = 1u;
+    orphan->data[0] = 0x5Au;
+    update_slot_checksum(slot);
+
+    assert_malformed_newest_slot_is_rejected(NULL);
+}
+
+static void test_v5_wrong_continuation_size_is_rejected(void) {
+    static uint8_t payload[2u * TEST_FS_DISK_DATA_BYTES + 17u];
+    fill_pattern(payload, sizeof(payload), 11u);
+
+    reset_storage();
+    fs_init();
+    assert(fs_write_bytes("wrong-chunk.bin", payload, sizeof(payload)));
+
+    uint8_t slot = newest_slot();
+    size_t head_index = disk_record_index(slot, "wrong-chunk.bin");
+    assert(head_index + 2u < FS_MAX_FILES);
+    struct test_fs_record* records =
+        (struct test_fs_record*)test_table(slot);
+    assert(records[head_index + 1u].size == TEST_FS_DISK_DATA_BYTES);
+    records[head_index + 1u].size--;
+    update_slot_checksum(slot);
+
+    assert_malformed_newest_slot_is_rejected("wrong-chunk.bin");
+}
+
+static void test_v5_oversized_head_is_rejected(void) {
+    reset_storage();
+    fs_init();
+
+    uint8_t slot = newest_slot();
+    struct test_fs_record* head = disk_record(slot, "readme.txt");
+    assert(head != NULL);
+    head->size = FS_MAX_FILE_SIZE;
+    update_slot_checksum(slot);
+
+    assert_malformed_newest_slot_is_rejected(NULL);
+}
+
+static void test_v5_duplicate_names_are_rejected(void) {
+    reset_storage();
+    fs_init();
+
+    uint8_t slot = newest_slot();
+    struct test_fs_record* first = disk_record(slot, "readme.txt");
+    struct test_fs_record* duplicate = disk_record(slot, "motd.txt");
+    assert(first != NULL);
+    assert(duplicate != NULL);
+    memset(duplicate->name, 0, sizeof(duplicate->name));
+    memcpy(duplicate->name, first->name, sizeof(duplicate->name));
+    update_slot_checksum(slot);
+
+    assert_malformed_newest_slot_is_rejected(NULL);
+}
+
+static void test_system_managed_files_require_trusted_apis(void) {
+    static const uint8_t initial[] = {
+        0x7Fu, 'E', 'L', 'F', 0x00u, 0xA5u
+    };
+    static const uint8_t replacement[] = {
+        0x7Fu, 'E', 'L', 'F', 0x01u, 0x5Au
+    };
+
+    reset_storage();
+    fs_init();
+
+    assert(fs_name_is_system_managed("hello.elf"));
+    assert(fs_name_is_system_managed("rflags-probe.elf"));
+    assert(fs_name_is_system_managed("stack-probe.elf"));
+    assert(fs_name_is_system_managed("system-apps.db"));
+    assert(!fs_name_is_system_managed("hello.backup"));
+    assert(!fs_name_is_system_managed(NULL));
+
+    assert(!fs_touch("hello.elf"));
+    assert(!fs_write_bytes("hello.elf", initial, sizeof(initial)));
+    assert(!fs_write("hello.elf", "untrusted"));
+    assert(!fs_append("hello.elf", "untrusted"));
+    assert(fs_find("hello.elf") == NULL);
+    assert(!fs_system_write_bytes("ordinary.txt", initial,
+                                  sizeof(initial)));
+    assert(!fs_system_write_bytes("system.log", initial,
+                                  sizeof(initial)));
+
+    assert(fs_write("ordinary.txt", "ordinary"));
+    assert(fs_system_write_bytes("hello.elf", initial, sizeof(initial)));
+    const struct fs_file* managed = fs_find("hello.elf");
+    assert(managed != NULL);
+    assert(managed->size == sizeof(initial));
+    assert(memcmp(managed->data, initial, sizeof(initial)) == 0);
+
+    assert(!fs_touch("hello.elf"));
+    assert(!fs_write_bytes("hello.elf", replacement,
+                           sizeof(replacement)));
+    assert(!fs_write("hello.elf", "untrusted"));
+    assert(!fs_append("hello.elf", "untrusted"));
+    assert(!fs_rename("hello.elf", "hello.backup"));
+    assert(!fs_rename("ordinary.txt", "hello.elf"));
+    assert(!fs_remove("hello.elf"));
+    managed = fs_find("hello.elf");
+    assert(managed != NULL);
+    assert(managed->size == sizeof(initial));
+    assert(memcmp(managed->data, initial, sizeof(initial)) == 0);
+
+    assert(fs_system_write_bytes("hello.elf", replacement,
+                                 sizeof(replacement)));
+    assert(!fs_system_rename("ordinary.txt", "ordinary.backup"));
+    assert(!fs_system_rename("hello.elf", "fault-probe.elf"));
+    assert(fs_system_rename("hello.elf", "hello.backup"));
+    assert(fs_find("hello.elf") == NULL);
+    const struct fs_file* backup = fs_find("hello.backup");
+    assert(backup != NULL);
+    assert(backup->size == sizeof(replacement));
+    assert(memcmp(backup->data, replacement, sizeof(replacement)) == 0);
+
+    assert(!fs_system_remove("hello.backup"));
+    assert(fs_system_write_bytes("fault-probe.elf", initial,
+                                 sizeof(initial)));
+    assert(!fs_remove("fault-probe.elf"));
+    assert(fs_system_remove("fault-probe.elf"));
+    assert(fs_find("fault-probe.elf") == NULL);
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(fs_find("hello.elf") == NULL);
+    assert(fs_find("fault-probe.elf") == NULL);
+    backup = fs_find("hello.backup");
+    assert(backup != NULL);
+    assert(backup->size == sizeof(replacement));
+    assert(memcmp(backup->data, replacement, sizeof(replacement)) == 0);
+}
+
+static void test_v4_volume_upgrades_to_extent_format(void) {
+    reset_storage();
+    fs_init();
+    assert(fs_write("v4-file.txt", "preserve me"));
+
+    for (uint8_t slot = 0; slot < 2u; slot++) {
+        struct test_fs_header* header = test_header(slot);
+        if (header->magic == 0) continue;
+        header->version = TEST_FS_INTEGRITY_VERSION;
+        update_slot_checksum(slot);
+    }
+
+    reset_io_observation();
+    fs_init();
+    assert(fs_backend_is_persistent());
+    assert(strcmp(fs_find("v4-file.txt")->data, "preserve me") == 0);
+    assert(test_header(newest_slot())->version == TEST_FS_DISK_VERSION);
+}
+
 static void test_uncertain_header_write_is_reconciled(void) {
     reset_storage();
     fs_init();
@@ -1130,6 +1504,9 @@ int main(void) {
     test_blank_headers_prioritize_table_io_over_corruption();
     test_valid_older_slot_preserves_corrupt_newer_slot();
     test_generation_corruption_cannot_reorder_slots();
+    test_equal_protected_generations_cannot_hide_divergence();
+    test_equal_identical_protected_generations_are_safe();
+    test_half_range_generations_are_ambiguous();
     test_legacy_headers_migrate_to_integrity_metadata();
     test_ordinary_legacy_volume_requires_confirmed_upgrade();
     test_unverified_legacy_upgrade_requires_reboot();
@@ -1149,6 +1526,15 @@ int main(void) {
     test_legacy_reserved_name_user_files_are_preserved();
     test_full_volume_gets_one_virtual_system_log();
     test_public_mutations_roll_back_on_sync_failure();
+    test_extent_file_round_trip();
+    test_extent_capacity_is_not_an_io_failure();
+    test_v5_missing_continuation_is_rejected();
+    test_v5_orphan_continuation_is_rejected();
+    test_v5_wrong_continuation_size_is_rejected();
+    test_v5_oversized_head_is_rejected();
+    test_v5_duplicate_names_are_rejected();
+    test_system_managed_files_require_trusted_apis();
+    test_v4_volume_upgrades_to_extent_format();
     test_uncertain_header_write_is_reconciled();
     test_indeterminate_commit_retains_mutation_in_memory();
     test_syslog_text_snapshot();

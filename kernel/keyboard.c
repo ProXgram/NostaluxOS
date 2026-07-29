@@ -32,6 +32,7 @@ struct keymap_entry {
 static volatile uint8_t g_kb_buffer[SCANCODE_BUFFER_SIZE];
 static volatile size_t g_kb_head = 0;
 static volatile size_t g_kb_tail = 0;
+static uint16_t g_poll_prefix = 0;
 
 static bool g_shift_l = false;
 static bool g_shift_r = false;
@@ -78,6 +79,7 @@ static const struct keymap_entry KEYMAP_SET1[128] = {
 void keyboard_init(void) {
     g_kb_head = 0;
     g_kb_tail = 0;
+    g_poll_prefix = 0;
     interrupts_enable_irq(1); // Unmask Keyboard IRQ
 }
 
@@ -122,17 +124,16 @@ static uint16_t keyboard_read_scancode(void) {
 
 static bool keyboard_poll_scancode(uint16_t* out_code) {
     uint8_t val;
-    static uint16_t prefix = 0;
     
     if (!keyboard_try_pop_byte(&val)) return false;
 
     if (val == SCANCODE_EXTENDED) {
-        prefix = SCANCODE_EXTENDED_MASK;
+        g_poll_prefix = SCANCODE_EXTENDED_MASK;
         return false;
     }
 
-    *out_code = prefix | val;
-    prefix = 0;
+    *out_code = g_poll_prefix | val;
+    g_poll_prefix = 0;
     return true;
 }
 
@@ -295,6 +296,22 @@ char keyboard_poll_char(void) {
     if (released || extended) return 0;
 
     return translate_scancode(scan);
+}
+
+void keyboard_discard_pending(void) {
+    uint8_t value;
+    bool extended = g_poll_prefix != 0;
+    g_poll_prefix = 0;
+    while (keyboard_try_pop_byte(&value)) {
+        if (value == SCANCODE_EXTENDED) {
+            extended = true;
+            continue;
+        }
+        const bool released = (value & SCANCODE_RELEASE_MASK) != 0;
+        const uint8_t scan = value & 0x7Fu;
+        if (!extended) update_modifiers(scan, released);
+        extended = false;
+    }
 }
 
 void keyboard_read_line(char* buffer, size_t size) {

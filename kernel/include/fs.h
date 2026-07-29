@@ -7,7 +7,7 @@
 /* Persistent record capacity; virtual read-only files may add public entries. */
 #define FS_MAX_FILES 32
 #define FS_MAX_FILENAME 32
-#define FS_MAX_FILE_SIZE 1024
+#define FS_MAX_FILE_SIZE 8192
 #define FS_LEGACY_UPGRADE_CONFIRMATION "CONFIRM-LEGACY-SNAPSHOT"
 
 struct fs_file {
@@ -52,9 +52,15 @@ const struct fs_file* fs_file_at(size_t index);
 const struct fs_file* fs_find(const char* name);
 bool fs_touch(const char* name);
 bool fs_write_bytes(const char* name, const void* contents, size_t length);
+/* Trusted kernel path for OS-managed catalog files. */
+bool fs_system_write_bytes(
+    const char* name, const void* contents, size_t length);
 bool fs_write(const char* name, const char* contents);
 bool fs_append(const char* name, const char* contents);
 bool fs_rename(const char* old_name, const char* new_name);
 bool fs_remove(const char* name);
+bool fs_system_rename(const char* old_name, const char* new_name);
+bool fs_system_remove(const char* name);
+bool fs_name_is_system_managed(const char* name);
 
 #endif /* FS_H */

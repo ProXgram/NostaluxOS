@@ -20,6 +20,9 @@
 #define PDPT_SPAN        (1ull << 30)
 #define PML4_SPAN        (1ull << 39)
 #define FRAMEBUFFER_PD_TABLES 2u
+#define KERNEL_HEAP_MAX_BYTES (16ull * 1024ull * 1024ull)
+#define KERNEL_HEAP_PT_COUNT \
+    (KERNEL_HEAP_MAX_BYTES / HUGE_PAGE_SIZE)
 
 extern uint8_t __text_start[];
 extern uint8_t __text_end[];
@@ -32,6 +35,14 @@ static uint64_t g_pml4[512] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t g_pdpt[512] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t g_pd[512] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t g_kernel_pt[512] __attribute__((aligned(PAGE_SIZE)));
+/*
+ * Keep the complete managed heap on 4 KiB mappings. Task stacks are allocated
+ * from this range, and a huge-page identity mapping cannot represent an
+ * unmapped guard page without also removing neighboring heap allocations.
+ */
+static uint64_t
+    g_kernel_heap_pt[KERNEL_HEAP_PT_COUNT][512]
+        __attribute__((aligned(PAGE_SIZE)));
 static uint64_t g_framebuffer_pd[FRAMEBUFFER_PD_TABLES][512] __attribute__((aligned(PAGE_SIZE)));
 static bool g_paging_ready = false;
 static bool g_nx_enabled = false;
@@ -153,6 +164,27 @@ static bool initialize_identity_map(const struct BootInfo* boot_info) {
         g_kernel_pt[i] = base | flags;
     }
 
+    /*
+     * The heap occupies at most [8 MiB, 24 MiB). Split those eight huge pages
+     * up front so scheduler stacks can receive real, shared kernel guard pages
+     * without allocating page-table memory while handling an overflow.
+     */
+    for (size_t table = 0; table < KERNEL_HEAP_PT_COUNT; table++) {
+        const uint64_t table_base =
+            SYSTEM_RESERVED_LOW_MEMORY_BYTES +
+            (uint64_t)table * HUGE_PAGE_SIZE;
+        const size_t pd_index =
+            (size_t)(table_base / HUGE_PAGE_SIZE);
+        g_pd[pd_index] =
+            (uint64_t)g_kernel_heap_pt[table] | flags;
+        for (size_t page = 0; page < 512; page++) {
+            const uint64_t page_base =
+                table_base + (uint64_t)page * PAGE_SIZE;
+            g_kernel_heap_pt[table][page] =
+                page_base | flags;
+        }
+    }
+
     return map_framebuffer(boot_info, flags);
 }
 
@@ -211,8 +243,79 @@ void paging_init(const struct BootInfo* boot_info) {
     }
     load_new_tables();
     detect_and_enable_nx();
+    if (g_nx_enabled) {
+        for (size_t table = 0; table < KERNEL_HEAP_PT_COUNT; table++) {
+            for (size_t page = 0; page < 512; page++) {
+                g_kernel_heap_pt[table][page] |= PAGE_NX;
+            }
+        }
+        /*
+         * The entries were populated before EFER.NXE was enabled. Reload CR3
+         * so no stale translation can retain the earlier executable mapping.
+         */
+        load_new_tables();
+    }
     g_paging_ready = true;
     syslog_write("Paging: Initialized (Supervisor Identity Map)");
+}
+
+static uint64_t* kernel_guard_page_entry(uint64_t address) {
+    if ((address & (PAGE_SIZE - 1u)) != 0) return NULL;
+
+    if (address < HUGE_PAGE_SIZE) {
+        return &g_kernel_pt[address / PAGE_SIZE];
+    }
+
+    const uint64_t heap_end =
+        SYSTEM_RESERVED_LOW_MEMORY_BYTES + KERNEL_HEAP_MAX_BYTES;
+    if (address < SYSTEM_RESERVED_LOW_MEMORY_BYTES ||
+        address >= heap_end) {
+        return NULL;
+    }
+
+    const uint64_t heap_offset =
+        address - SYSTEM_RESERVED_LOW_MEMORY_BYTES;
+    const size_t table =
+        (size_t)(heap_offset / HUGE_PAGE_SIZE);
+    const size_t page =
+        (size_t)((heap_offset % HUGE_PAGE_SIZE) / PAGE_SIZE);
+    return &g_kernel_heap_pt[table][page];
+}
+
+bool paging_kernel_guard_page(void* page) {
+    if (!g_paging_ready || page == NULL) return false;
+
+    const uint64_t address = (uint64_t)(uintptr_t)page;
+    uint64_t* entry = kernel_guard_page_entry(address);
+    if (entry == NULL ||
+        (*entry & PAGE_ADDRESS_MASK) !=
+            (address & PAGE_ADDRESS_MASK)) {
+        return false;
+    }
+
+    if ((*entry & PAGE_PRESENT) != 0) {
+        *entry &= ~PAGE_PRESENT;
+        __asm__ volatile("invlpg (%0)" : : "r"(address) : "memory");
+    }
+    return true;
+}
+
+bool paging_kernel_unguard_page(void* page) {
+    if (!g_paging_ready || page == NULL) return false;
+
+    const uint64_t address = (uint64_t)(uintptr_t)page;
+    uint64_t* entry = kernel_guard_page_entry(address);
+    if (entry == NULL ||
+        (*entry & PAGE_ADDRESS_MASK) !=
+            (address & PAGE_ADDRESS_MASK)) {
+        return false;
+    }
+
+    if ((*entry & PAGE_PRESENT) == 0) {
+        *entry |= PAGE_PRESENT | PAGE_RW;
+        __asm__ volatile("invlpg (%0)" : : "r"(address) : "memory");
+    }
+    return true;
 }
 
 static uint64_t* allocate_owned_page(struct paging_address_space* space) {
@@ -373,7 +476,8 @@ static bool map_fresh_user_page(struct paging_address_space* space,
     uint64_t flags = PAGE_PRESENT | PAGE_USER;
     if (writable) flags |= PAGE_RW;
     if (!executable && g_nx_enabled) flags |= PAGE_NX;
-    pt[pt_index] = ((uint64_t)frame & PAGE_ADDRESS_MASK) | flags;
+    pt[pt_index] =
+        ((uint64_t)frame & PAGE_ADDRESS_MASK) | flags | PAGE_OWNED;
     return true;
 }
 
@@ -392,8 +496,123 @@ bool paging_user_map_anonymous(struct paging_address_space* space,
     for (size_t offset = 0; offset < size; offset += (size_t)PAGE_SIZE) {
         if (!map_fresh_user_page(space, address + (uint64_t)offset,
                                  writable, executable)) {
+            if (offset != 0 &&
+                !paging_user_unmap_anonymous(space, address, offset)) {
+                syslog_write(
+                    "Paging: anonymous-map rollback invariant failed");
+            }
             return false;
         }
+    }
+    return true;
+}
+
+static uint64_t* user_leaf_entry(struct paging_address_space* space,
+                                 uint64_t address) {
+    if (space == NULL || space->pml4 == NULL ||
+        !user_range_valid(address, 1)) {
+        return NULL;
+    }
+
+    uint64_t* pml4e =
+        &space->pml4[(address >> 39) & 0x1ffu];
+    if ((*pml4e & (PAGE_PRESENT | PAGE_USER | PAGE_OWNED)) !=
+            (PAGE_PRESENT | PAGE_USER | PAGE_OWNED) ||
+        (*pml4e & PAGE_PS) != 0) {
+        return NULL;
+    }
+    uint64_t* pdpt =
+        (uint64_t*)(uintptr_t)(*pml4e & PAGE_ADDRESS_MASK);
+    uint64_t* pdpte = &pdpt[(address >> 30) & 0x1ffu];
+    if ((*pdpte & (PAGE_PRESENT | PAGE_USER | PAGE_OWNED)) !=
+            (PAGE_PRESENT | PAGE_USER | PAGE_OWNED) ||
+        (*pdpte & PAGE_PS) != 0) {
+        return NULL;
+    }
+    uint64_t* pd =
+        (uint64_t*)(uintptr_t)(*pdpte & PAGE_ADDRESS_MASK);
+    uint64_t* pde = &pd[(address >> 21) & 0x1ffu];
+    if ((*pde & (PAGE_PRESENT | PAGE_USER | PAGE_OWNED)) !=
+            (PAGE_PRESENT | PAGE_USER | PAGE_OWNED) ||
+        (*pde & PAGE_PS) != 0) {
+        return NULL;
+    }
+    uint64_t* pt =
+        (uint64_t*)(uintptr_t)(*pde & PAGE_ADDRESS_MASK);
+    return &pt[(address >> 12) & 0x1ffu];
+}
+
+static struct paging_allocation* find_owned_allocation(
+    struct paging_address_space* space,
+    uint64_t page,
+    struct paging_allocation*** link_out) {
+    if (space == NULL) return NULL;
+
+    struct paging_allocation** link = &space->allocations;
+    while (*link != NULL) {
+        if ((*link)->page == page) {
+            if (link_out != NULL) *link_out = link;
+            return *link;
+        }
+        link = &(*link)->next;
+    }
+    return NULL;
+}
+
+bool paging_user_unmap_anonymous(struct paging_address_space* space,
+                                 uint64_t address,
+                                 size_t size) {
+    if (space == NULL || size == 0 ||
+        (address & (PAGE_SIZE - 1u)) != 0 ||
+        (size & (size_t)(PAGE_SIZE - 1u)) != 0 ||
+        !user_range_valid(address, size)) {
+        return false;
+    }
+
+    /*
+     * Validate the complete request before changing a PTE. This makes a bad
+     * or partially stale free fail atomically and prevents a caller from
+     * using this API to remove shared kernel mappings or page-table pages.
+     */
+    for (size_t offset = 0; offset < size;
+         offset += (size_t)PAGE_SIZE) {
+        uint64_t* entry =
+            user_leaf_entry(space, address + (uint64_t)offset);
+        if (entry == NULL ||
+            (*entry & (PAGE_PRESENT | PAGE_USER | PAGE_OWNED)) !=
+                (PAGE_PRESENT | PAGE_USER | PAGE_OWNED)) {
+            return false;
+        }
+        const uint64_t frame = *entry & PAGE_ADDRESS_MASK;
+        if (find_owned_allocation(space, frame, NULL) == NULL) {
+            return false;
+        }
+    }
+
+    uint64_t active_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));
+    const bool is_active =
+        (active_cr3 & PAGE_ADDRESS_MASK) ==
+        ((uint64_t)space->pml4 & PAGE_ADDRESS_MASK);
+
+    for (size_t offset = 0; offset < size;
+         offset += (size_t)PAGE_SIZE) {
+        const uint64_t user_address =
+            address + (uint64_t)offset;
+        uint64_t* entry = user_leaf_entry(space, user_address);
+        const uint64_t frame = *entry & PAGE_ADDRESS_MASK;
+        *entry = 0;
+        if (is_active) {
+            __asm__ volatile(
+                "invlpg (%0)" : : "r"(user_address) : "memory");
+        }
+
+        struct paging_allocation** link = NULL;
+        struct paging_allocation* allocation =
+            find_owned_allocation(space, frame, &link);
+        *link = allocation->next;
+        kfree(allocation->raw);
+        kfree(allocation);
     }
     return true;
 }

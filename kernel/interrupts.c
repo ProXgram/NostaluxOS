@@ -10,16 +10,9 @@
 #include "graphics.h"
 #include "mouse.h"
 #include "scheduler.h"
+#include "user_return.h"
 
 extern void isr_syscall(void);
-
-struct interrupt_frame {
-    uint64_t rip;
-    uint64_t cs;
-    uint64_t rflags;
-    uint64_t rsp;
-    uint64_t ss;
-};
 
 struct idt_entry {
     uint16_t offset_low;
@@ -44,6 +37,17 @@ static struct idt_entry g_idt[256];
 #define PIC2_DATA    0xA1
 #define PIC_EOI      0x20
 #define INTERRUPT_CLD() __asm__ volatile("cld" ::: "cc")
+
+static void normalize_user_interrupt_return(
+    struct user_return_frame* frame) {
+    /*
+     * Same-CPL kernel frames stop after RFLAGS, so test CS before the shared
+     * normalizer is allowed to inspect the saved RSP and SS.
+     */
+    if (user_return_frame_is_user(frame)) {
+        (void)user_return_frame_normalize(frame);
+    }
+}
 
 static void halt_on_invalid(const char* message) {
     syslog_write(message);
@@ -117,7 +121,7 @@ static void panic_write_hex_line(const char* label, uint64_t value) {
     panic_write_line(buffer);
 }
 static void panic_write_vector_line(uint8_t vector) { panic_write_hex_line("Exception Vector: ", vector); }
-static void exception_panic(uint8_t vector, uint64_t error_code, bool has_error_code, const struct interrupt_frame* frame) {
+static void exception_panic(uint8_t vector, uint64_t error_code, bool has_error_code, const struct user_return_frame* frame) {
     __asm__ volatile("cli");
     panic_draw_bg();
     panic_write_line("!!! SYSTEM PANIC (GUI MODE) !!!");
@@ -146,7 +150,7 @@ static void exception_panic(uint8_t vector, uint64_t error_code, bool has_error_
 }
 
 static bool exception_came_from_user(
-    const struct interrupt_frame* frame) {
+    const struct user_return_frame* frame) {
     return frame != NULL &&
            (frame->cs & 3u) == 3u &&
            scheduler_current_is_user();
@@ -156,7 +160,7 @@ static _Noreturn void contain_user_exception(
     uint8_t vector,
     uint64_t error_code,
     bool has_error_code,
-    const struct interrupt_frame* frame) {
+    const struct user_return_frame* frame) {
     uint64_t fault_address = 0;
     if (vector == 14) {
         __asm__ volatile("mov %%cr2, %0" : "=r"(fault_address));
@@ -169,7 +173,7 @@ static _Noreturn void contain_user_exception(
 }
 
 #define DECLARE_NOERR_HANDLER(num) \
-    __attribute__((interrupt)) static void handler_##num(struct interrupt_frame* frame) { \
+    __attribute__((interrupt)) static void handler_##num(struct user_return_frame* frame) { \
         INTERRUPT_CLD(); \
         if ((num) != 8 && (num) != 18 && exception_came_from_user(frame)) { \
             contain_user_exception((uint8_t)(num), 0, false, frame); \
@@ -177,7 +181,7 @@ static _Noreturn void contain_user_exception(
         exception_panic((uint8_t)(num), 0, false, frame); \
     }
 #define DECLARE_ERR_HANDLER(num) \
-    __attribute__((interrupt)) static void handler_##num(struct interrupt_frame* frame, uint64_t error_code) { \
+    __attribute__((interrupt)) static void handler_##num(struct user_return_frame* frame, uint64_t error_code) { \
         INTERRUPT_CLD(); \
         if ((num) != 8 && (num) != 18 && exception_came_from_user(frame)) { \
             contain_user_exception((uint8_t)(num), error_code, true, frame); \
@@ -186,9 +190,9 @@ static _Noreturn void contain_user_exception(
     }
 
 DECLARE_NOERR_HANDLER(0); DECLARE_NOERR_HANDLER(1);
-__attribute__((interrupt)) static void handler_2(struct interrupt_frame* frame) {
+__attribute__((interrupt)) static void handler_2(struct user_return_frame* frame) {
     INTERRUPT_CLD();
-    (void)frame;
+    normalize_user_interrupt_return(frame);
 }
 DECLARE_NOERR_HANDLER(3); DECLARE_NOERR_HANDLER(4); DECLARE_NOERR_HANDLER(5); DECLARE_NOERR_HANDLER(6); DECLARE_NOERR_HANDLER(7);
 DECLARE_ERR_HANDLER(8); DECLARE_NOERR_HANDLER(9); DECLARE_ERR_HANDLER(10); DECLARE_ERR_HANDLER(11); DECLARE_ERR_HANDLER(12);
@@ -197,30 +201,30 @@ DECLARE_NOERR_HANDLER(18); DECLARE_NOERR_HANDLER(19); DECLARE_NOERR_HANDLER(20);
 DECLARE_NOERR_HANDLER(23); DECLARE_NOERR_HANDLER(24); DECLARE_NOERR_HANDLER(25); DECLARE_NOERR_HANDLER(26); DECLARE_NOERR_HANDLER(27);
 DECLARE_NOERR_HANDLER(28); DECLARE_ERR_HANDLER(29); DECLARE_ERR_HANDLER(30); DECLARE_NOERR_HANDLER(31);
 
-__attribute__((interrupt)) static void handler_irq_master(struct interrupt_frame* frame) {
+__attribute__((interrupt)) static void handler_irq_master(struct user_return_frame* frame) {
     INTERRUPT_CLD();
-    (void)frame;
+    normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     outb(PIC1_COMMAND, PIC_EOI);
 }
-__attribute__((interrupt)) static void handler_irq_slave(struct interrupt_frame* frame) {
+__attribute__((interrupt)) static void handler_irq_slave(struct user_return_frame* frame) {
     INTERRUPT_CLD();
-    (void)frame;
+    normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     outb(PIC2_COMMAND, PIC_EOI);
     outb(PIC1_COMMAND, PIC_EOI);
 }
-__attribute__((interrupt)) static void handler_irq_keyboard(struct interrupt_frame* frame) {
+__attribute__((interrupt)) static void handler_irq_keyboard(struct user_return_frame* frame) {
     INTERRUPT_CLD();
-    (void)frame;
+    normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     uint8_t scancode = inb(0x60);
     outb(PIC1_COMMAND, PIC_EOI);
     keyboard_push_byte(scancode);
 }
-__attribute__((interrupt)) static void handler_irq_timer(struct interrupt_frame* frame) {
+__attribute__((interrupt)) static void handler_irq_timer(struct user_return_frame* frame) {
     INTERRUPT_CLD();
-    (void)frame;
+    normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     timer_handler();
     /*
@@ -230,9 +234,9 @@ __attribute__((interrupt)) static void handler_irq_timer(struct interrupt_frame*
     outb(PIC1_COMMAND, PIC_EOI);
     scheduler_timer_tick();
 }
-__attribute__((interrupt)) static void handler_irq_mouse(struct interrupt_frame* frame) {
+__attribute__((interrupt)) static void handler_irq_mouse(struct user_return_frame* frame) {
     INTERRUPT_CLD();
-    (void)frame;
+    normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     mouse_handle_interrupt();
     outb(PIC2_COMMAND, PIC_EOI);

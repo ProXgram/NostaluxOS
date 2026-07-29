@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "app_process.h"
+#include "app_services.h"
 #include "elf64_loader.h"
 #include "paging.h"
 #include "scheduler.h"
@@ -13,6 +14,9 @@
 #define APP_USER_STACK_SIZE (16u * PAGING_PAGE_SIZE)
 #define APP_USER_STACK_TOP  (PAGING_USER_LIMIT - PAGING_PAGE_SIZE)
 #define APP_RUN_DISPATCH_BUDGET 8u
+
+_Static_assert((APP_USER_STACK_TOP & 0xfull) == 0,
+               "User stack boundary must be 16-byte aligned");
 
 static uint64_t align_down_page(uint64_t value) {
     return value & ~(PAGING_PAGE_SIZE - 1u);
@@ -105,10 +109,13 @@ static bool page_permissions(
 
 static bool map_and_load_image(
     struct paging_address_space* space,
-    const struct app_catalog_entry* entry) {
-    uint64_t first_page = align_down_page(entry->image_plan.virtual_base);
+    const uint8_t* image,
+    const struct elf64_image_plan* plan) {
+    if (space == NULL || image == NULL || plan == NULL) return false;
+
+    uint64_t first_page = align_down_page(plan->virtual_base);
     uint64_t final_page;
-    if (!align_up_page(entry->image_plan.virtual_end, &final_page) ||
+    if (!align_up_page(plan->virtual_end, &final_page) ||
         first_page < PAGING_USER_BASE ||
         final_page > PAGING_USER_LIMIT ||
         first_page >= final_page) {
@@ -127,7 +134,7 @@ static bool map_and_load_image(
         bool used;
         bool writable;
         bool executable;
-        if (!page_permissions(&entry->image_plan, page,
+        if (!page_permissions(plan, page,
                               &used, &writable, &executable)) {
             return false;
         }
@@ -140,13 +147,13 @@ static bool map_and_load_image(
     }
 
     for (size_t index = 0;
-         index < entry->image_plan.segment_count; index++) {
+         index < plan->segment_count; index++) {
         const struct elf64_load_segment* segment =
-            &entry->image_plan.segments[index];
+            &plan->segments[index];
         if (segment->file_size == 0) continue;
         if (!paging_initialize_user_memory(
                 space, segment->virtual_address,
-                entry->image + (size_t)segment->file_offset,
+                image + (size_t)segment->file_offset,
                 (size_t)segment->file_size)) {
             return false;
         }
@@ -157,21 +164,44 @@ static bool map_and_load_image(
         true, false);
 }
 
-enum app_runtime_launch_result app_runtime_spawn(
+static bool resolve_launch_image(
     const struct app_catalog_entry* entry,
+    const uint8_t** out_image,
+    struct elf64_image_plan* out_plan) {
+    if (entry == NULL || out_image == NULL || out_plan == NULL) {
+        return false;
+    }
+
+    /*
+     * Each app is independently linked as an ELF and packaged into the
+     * read-only OS image. Reinspect those immutable bytes on every launch and
+     * compare the complete plan with the catalog-time validation result.
+     */
+    if (entry->image == NULL || entry->image_size == 0 ||
+        elf64_inspect(entry->image, entry->image_size, out_plan) !=
+            ELF64_LOAD_OK ||
+        !plans_equal(out_plan, &entry->image_plan)) {
+        return false;
+    }
+    *out_image = entry->image;
+    return true;
+}
+
+enum app_runtime_launch_result app_runtime_spawn_with_argument(
+    const struct app_catalog_entry* entry,
+    const char* startup_argument,
     uint64_t* out_process_id) {
-    if (entry == NULL || entry->image == NULL ||
-        entry->image_size == 0 || out_process_id == NULL) {
+    if (entry == NULL || out_process_id == NULL) {
         return APP_RUNTIME_LAUNCH_INVALID_ARGUMENT;
     }
     if (!paging_nx_available()) {
         return APP_RUNTIME_LAUNCH_NX_REQUIRED;
     }
 
+    const uint8_t* launch_image;
     struct elf64_image_plan verified_plan;
-    if (elf64_inspect(entry->image, entry->image_size,
-                      &verified_plan) != ELF64_LOAD_OK ||
-        !plans_equal(&verified_plan, &entry->image_plan)) {
+    if (!resolve_launch_image(
+            entry, &launch_image, &verified_plan)) {
         return APP_RUNTIME_LAUNCH_INVALID_IMAGE;
     }
 
@@ -179,17 +209,23 @@ enum app_runtime_launch_result app_runtime_spawn(
         paging_address_space_create();
     if (space == NULL) return APP_RUNTIME_LAUNCH_OUT_OF_MEMORY;
 
-    if (!map_and_load_image(space, entry)) {
+    if (!map_and_load_image(space, launch_image, &verified_plan)) {
         paging_address_space_destroy(space);
         return APP_RUNTIME_LAUNCH_MAPPING_FAILED;
     }
 
     uint64_t process_id;
     if (app_process_track_loaded(&entry->manifest,
-                                 &entry->image_plan,
+                                 &verified_plan,
                                  &process_id) != APP_PROCESS_OK) {
         paging_address_space_destroy(space);
         return APP_RUNTIME_LAUNCH_PROCESS_TABLE_FAILED;
+    }
+    if (app_process_set_startup_argument(
+            process_id, startup_argument) != APP_PROCESS_OK) {
+        paging_address_space_destroy(space);
+        (void)app_process_release(process_id);
+        return APP_RUNTIME_LAUNCH_INVALID_ARGUMENT;
     }
     if (app_process_mark_starting(process_id) != APP_PROCESS_OK) {
         paging_address_space_destroy(space);
@@ -208,7 +244,7 @@ enum app_runtime_launch_result app_runtime_spawn(
     task_name[task_index] = '\0';
 
     if (!scheduler_spawn_user_process(
-            task_name, space, entry->image_plan.entry_point,
+            task_name, space, verified_plan.entry_point,
             APP_USER_STACK_TOP, process_id,
             entry->manifest.capabilities)) {
         (void)app_process_mark_exited(process_id, -1);
@@ -217,19 +253,37 @@ enum app_runtime_launch_result app_runtime_spawn(
         return APP_RUNTIME_LAUNCH_SCHEDULER_FAILED;
     }
 
+    if ((entry->manifest.capabilities &
+         APP_CAPABILITY_WINDOW) != 0) {
+        (void)app_services_authorize_launch_focus(process_id);
+    }
     *out_process_id = process_id;
     return APP_RUNTIME_LAUNCH_OK;
 }
 
+enum app_runtime_launch_result app_runtime_spawn(
+    const struct app_catalog_entry* entry,
+    uint64_t* out_process_id) {
+    return app_runtime_spawn_with_argument(
+        entry, NULL, out_process_id);
+}
+
 enum app_runtime_launch_result app_runtime_run_catalog_id(
     const char* app_id) {
+    return app_runtime_run_catalog_id_with_argument(app_id, NULL);
+}
+
+enum app_runtime_launch_result app_runtime_run_catalog_id_with_argument(
+    const char* app_id,
+    const char* startup_argument) {
     const struct app_catalog_entry* entry =
         app_catalog_find_id(app_id);
     if (entry == NULL) return APP_RUNTIME_LAUNCH_NOT_FOUND;
 
     uint64_t process_id;
     enum app_runtime_launch_result result =
-        app_runtime_spawn(entry, &process_id);
+        app_runtime_spawn_with_argument(
+            entry, startup_argument, &process_id);
     if (result != APP_RUNTIME_LAUNCH_OK) return result;
 
     for (size_t dispatch = 0;
@@ -237,7 +291,9 @@ enum app_runtime_launch_result app_runtime_run_catalog_id(
         struct app_process_info process;
         if (!app_process_find(process_id, &process)) break;
         if (process.state == APP_PROCESS_EXITED) {
-            return APP_RUNTIME_LAUNCH_OK;
+            return process.exit_code == 0
+                ? APP_RUNTIME_LAUNCH_OK
+                : APP_RUNTIME_LAUNCH_APP_EXITED_ERROR;
         }
         if (process.state == APP_PROCESS_FAULTED) {
             return APP_RUNTIME_LAUNCH_APP_FAULTED;
@@ -269,6 +325,8 @@ const char* app_runtime_launch_result_text(
             return "application not found";
         case APP_RUNTIME_LAUNCH_APP_FAULTED:
             return "application faulted and was contained";
+        case APP_RUNTIME_LAUNCH_APP_EXITED_ERROR:
+            return "application exited with an error";
         case APP_RUNTIME_LAUNCH_DISPATCH_BUDGET:
             return "application remains runnable after dispatch budget";
         case APP_RUNTIME_LAUNCH_NX_REQUIRED:

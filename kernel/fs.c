@@ -12,9 +12,14 @@
 #define FS_LEGACY_DISK_VERSION 1u
 #define FS_GENERATION_DISK_VERSION 2u
 #define FS_CONTENT_DISK_VERSION 3u
-#define FS_DISK_VERSION 4u
+#define FS_INTEGRITY_DISK_VERSION 4u
+#define FS_DISK_VERSION 5u
 #define FS_SLOT_COUNT 2u
-#define FS_DISK_RECORD_BYTES (1u + FS_MAX_FILENAME + 4u + FS_MAX_FILE_SIZE)
+#define FS_DISK_DATA_BYTES 1024u
+#define FS_DISK_RECORD_HEAD 1u
+#define FS_DISK_RECORD_CONTINUATION 2u
+#define FS_DISK_RECORD_BYTES \
+    (1u + FS_MAX_FILENAME + 4u + FS_DISK_DATA_BYTES)
 #define FS_DISK_TABLE_BYTES (FS_DISK_RECORD_BYTES * FS_MAX_FILES)
 #define FS_DISK_TABLE_SECTORS ((FS_DISK_TABLE_BYTES + 511u) / 512u)
 #define FS_DISK_TABLE_PAD (FS_DISK_TABLE_SECTORS * 512u - FS_DISK_TABLE_BYTES)
@@ -40,7 +45,7 @@ struct fs_disk_record {
     uint8_t in_use;
     char name[FS_MAX_FILENAME];
     uint32_t size;
-    char data[FS_MAX_FILE_SIZE];
+    char data[FS_DISK_DATA_BYTES];
 } __attribute__((packed));
 
 struct fs_disk_table {
@@ -54,6 +59,9 @@ _Static_assert(sizeof(struct fs_disk_table) == FS_DISK_TABLE_SECTORS * 512u,
 _Static_assert(FS_DISK_TABLE_SECTORS <= 255u, "ATA PIO count is one byte");
 
 static struct fs_disk_table g_disk_table;
+/* Mutations are serialized on this single-core kernel; keep rollback storage
+ * out of the small per-task kernel stacks. */
+static struct fs_file g_mutation_backup;
 static uint8_t g_active_slot = FS_SLOT_COUNT;
 static uint32_t g_active_generation = 0;
 static uint32_t g_loaded_version = 0;
@@ -108,6 +116,40 @@ static void fs_refresh_system_log(void);
 static uint32_t fs_checksum(const void* data, size_t length);
 static uint32_t fs_header_checksum(const struct fs_disk_header* header);
 
+bool fs_name_is_system_managed(const char* name) {
+    if (name == NULL) return false;
+    static const char* const names[] = {
+        "hello.elf",
+        "fault-probe.elf",
+        "hang-probe.elf",
+        "rflags-probe.elf",
+        "stack-probe.elf",
+        "calculator.elf",
+        "notepad.elf",
+        "image-viewer.elf",
+        "ai-assistant.elf",
+        "system-apps.db",
+    };
+    for (size_t index = 0;
+         index < sizeof(names) / sizeof(names[0]); index++) {
+        if (kstrcmp(name, names[index]) == 0) return true;
+    }
+    return false;
+}
+
+static void fs_copy_file(struct fs_file* destination,
+                         const struct fs_file* source) {
+    if (destination == NULL || source == NULL) return;
+    destination->in_use = source->in_use;
+    for (size_t index = 0; index < FS_MAX_FILENAME; index++) {
+        destination->name[index] = source->name[index];
+    }
+    destination->size = source->size;
+    for (size_t index = 0; index < FS_MAX_FILE_SIZE; index++) {
+        destination->data[index] = source->data[index];
+    }
+}
+
 static enum fs_disk_load_result fs_loaded_result(
     bool saw_io_error, bool saw_corruption) {
     if (saw_io_error) return FS_DISK_LOADED_IO_ERROR;
@@ -124,17 +166,18 @@ static bool fs_header_is_valid(const struct fs_disk_header* header) {
         (header->version != FS_LEGACY_DISK_VERSION &&
          header->version != FS_GENERATION_DISK_VERSION &&
          header->version != FS_CONTENT_DISK_VERSION &&
+         header->version != FS_INTEGRITY_DISK_VERSION &&
          header->version != FS_DISK_VERSION) ||
         header->table_bytes != FS_DISK_TABLE_BYTES) {
         return false;
     }
 
     /*
-     * Legacy headers remain readable for an in-place migration. Their
-     * generation was not integrity-protected, so once any v4 slot exists it
-     * is always preferred over a legacy slot.
+     * Versions 1-3 remain readable for an in-place migration, but their
+     * generation was not integrity-protected. Versions 4 and 5 protect every
+     * ordering field with the header checksum.
      */
-    return header->version != FS_DISK_VERSION ||
+    return header->version < FS_INTEGRITY_DISK_VERSION ||
            header->header_checksum == fs_header_checksum(header);
 }
 
@@ -200,14 +243,26 @@ static bool fs_bytes_equal(
     return true;
 }
 
-static void fs_serialize(void) {
+static size_t fs_disk_records_needed(size_t size) {
+    return size == 0
+        ? 1u
+        : (size + FS_DISK_DATA_BYTES - 1u) / FS_DISK_DATA_BYTES;
+}
+
+static bool fs_serialize(void) {
     uint8_t* raw = (uint8_t*)&g_disk_table;
     for (size_t i = 0; i < sizeof(g_disk_table); i++) raw[i] = 0;
 
+    size_t disk_index = 0;
     for (size_t i = 0; i < FS_MAX_FILES; i++) {
         if (!FILES[i].in_use) continue;
-        struct fs_disk_record* record = &g_disk_table.records[i];
-        record->in_use = 1;
+
+        size_t record_count = fs_disk_records_needed(FILES[i].size);
+        if (record_count > FS_MAX_FILES - disk_index) return false;
+
+        struct fs_disk_record* record =
+            &g_disk_table.records[disk_index++];
+        record->in_use = FS_DISK_RECORD_HEAD;
         record->size = (uint32_t)FILES[i].size;
 
         size_t n = 0;
@@ -216,13 +271,31 @@ static void fs_serialize(void) {
             n++;
         }
 
-        for (size_t j = 0; j < FILES[i].size; j++) {
+        size_t copied = 0;
+        size_t chunk = FILES[i].size;
+        if (chunk > FS_DISK_DATA_BYTES) chunk = FS_DISK_DATA_BYTES;
+        for (size_t j = 0; j < chunk; j++) {
             record->data[j] = FILES[i].data[j];
         }
+        copied = chunk;
+
+        while (copied < FILES[i].size) {
+            struct fs_disk_record* continuation =
+                &g_disk_table.records[disk_index++];
+            chunk = FILES[i].size - copied;
+            if (chunk > FS_DISK_DATA_BYTES) chunk = FS_DISK_DATA_BYTES;
+            continuation->in_use = FS_DISK_RECORD_CONTINUATION;
+            continuation->size = (uint32_t)chunk;
+            for (size_t j = 0; j < chunk; j++) {
+                continuation->data[j] = FILES[i].data[copied + j];
+            }
+            copied += chunk;
+        }
     }
+    return true;
 }
 
-static bool fs_deserialize(void) {
+static bool fs_deserialize_legacy(void) {
     /*
      * Validate the complete table before touching the mounted view. A failed
      * reload must not leave FILES half-populated from corrupt media.
@@ -230,7 +303,8 @@ static bool fs_deserialize(void) {
     for (size_t i = 0; i < FS_MAX_FILES; i++) {
         const struct fs_disk_record* record = &g_disk_table.records[i];
         if (record->in_use == 0) continue;
-        if (record->in_use != 1 || record->size >= FS_MAX_FILE_SIZE ||
+        if (record->in_use != FS_DISK_RECORD_HEAD ||
+            record->size >= FS_DISK_DATA_BYTES ||
             record->name[FS_MAX_FILENAME - 1] != '\0' ||
             record->data[record->size] != '\0' ||
             !fs_is_valid_name(record->name)) {
@@ -240,7 +314,7 @@ static bool fs_deserialize(void) {
         for (size_t previous = 0; previous < i; previous++) {
             const struct fs_disk_record* prior =
                 &g_disk_table.records[previous];
-            if (prior->in_use == 1 &&
+            if (prior->in_use == FS_DISK_RECORD_HEAD &&
                 kstrcmp(prior->name, record->name) == 0) {
                 return false;
             }
@@ -272,6 +346,124 @@ static bool fs_deserialize(void) {
     return true;
 }
 
+static bool fs_disk_continuation_is_valid(
+    const struct fs_disk_record* record, size_t expected_size) {
+    if (record == NULL ||
+        record->in_use != FS_DISK_RECORD_CONTINUATION ||
+        record->size != expected_size) {
+        return false;
+    }
+    for (size_t index = 0; index < FS_MAX_FILENAME; index++) {
+        if (record->name[index] != '\0') return false;
+    }
+    return true;
+}
+
+static bool fs_deserialize_current(void) {
+    size_t logical_count = 0;
+    size_t disk_index = 0;
+
+    /*
+     * Validate every extent chain and every filename before changing FILES.
+     * A continuation is meaningful only immediately after its head.
+     */
+    while (disk_index < FS_MAX_FILES) {
+        const struct fs_disk_record* head =
+            &g_disk_table.records[disk_index];
+        if (head->in_use == 0) {
+            disk_index++;
+            continue;
+        }
+        if (head->in_use != FS_DISK_RECORD_HEAD ||
+            head->size >= FS_MAX_FILE_SIZE ||
+            head->name[FS_MAX_FILENAME - 1] != '\0' ||
+            !fs_is_valid_name(head->name)) {
+            return false;
+        }
+
+        for (size_t previous = 0; previous < disk_index; previous++) {
+            const struct fs_disk_record* prior =
+                &g_disk_table.records[previous];
+            if (prior->in_use == FS_DISK_RECORD_HEAD &&
+                kstrcmp(prior->name, head->name) == 0) {
+                return false;
+            }
+        }
+
+        size_t needed = fs_disk_records_needed(head->size);
+        if (needed > FS_MAX_FILES - disk_index) return false;
+        size_t remaining =
+            head->size > FS_DISK_DATA_BYTES
+                ? head->size - FS_DISK_DATA_BYTES
+                : 0;
+        for (size_t part = 1; part < needed; part++) {
+            size_t expected = remaining;
+            if (expected > FS_DISK_DATA_BYTES) {
+                expected = FS_DISK_DATA_BYTES;
+            }
+            if (!fs_disk_continuation_is_valid(
+                    &g_disk_table.records[disk_index + part],
+                    expected)) {
+                return false;
+            }
+            remaining -= expected;
+        }
+        if (remaining != 0 || logical_count >= FS_MAX_FILES) return false;
+        logical_count++;
+        disk_index += needed;
+    }
+
+    for (size_t index = 0; index < FS_MAX_FILES; index++) {
+        FILES[index].in_use = false;
+        FILES[index].name[0] = '\0';
+        FILES[index].size = 0;
+        FILES[index].data[0] = '\0';
+    }
+
+    size_t logical_index = 0;
+    disk_index = 0;
+    while (disk_index < FS_MAX_FILES) {
+        const struct fs_disk_record* head =
+            &g_disk_table.records[disk_index];
+        if (head->in_use == 0) {
+            disk_index++;
+            continue;
+        }
+
+        struct fs_file* file = &FILES[logical_index++];
+        file->in_use = true;
+        size_t name_index = 0;
+        while (head->name[name_index] != '\0') {
+            file->name[name_index] = head->name[name_index];
+            name_index++;
+        }
+        file->name[name_index] = '\0';
+        file->size = head->size;
+
+        size_t copied = 0;
+        size_t chunk = file->size;
+        if (chunk > FS_DISK_DATA_BYTES) chunk = FS_DISK_DATA_BYTES;
+        for (size_t byte = 0; byte < chunk; byte++) {
+            file->data[byte] = head->data[byte];
+        }
+        copied = chunk;
+
+        size_t needed = fs_disk_records_needed(file->size);
+        for (size_t part = 1; part < needed; part++) {
+            const struct fs_disk_record* continuation =
+                &g_disk_table.records[disk_index + part];
+            chunk = continuation->size;
+            for (size_t byte = 0; byte < chunk; byte++) {
+                file->data[copied + byte] = continuation->data[byte];
+            }
+            copied += chunk;
+        }
+        file->data[file->size] = '\0';
+        disk_index += needed;
+    }
+    return true;
+}
+
 static enum fs_slot_load_result fs_load_slot(
     uint8_t slot, const struct fs_disk_header* header) {
     uint32_t header_lba = fs_slot_header_lba(slot);
@@ -284,7 +476,11 @@ static enum fs_slot_load_result fs_load_slot(
         syslog_write("FS: rejected slot with corrupt checksum");
         return FS_SLOT_CORRUPT;
     }
-    if (!fs_deserialize()) {
+    bool deserialized =
+        header->version >= FS_DISK_VERSION
+            ? fs_deserialize_current()
+            : fs_deserialize_legacy();
+    if (!deserialized) {
         syslog_write("FS: rejected slot with invalid records");
         return FS_SLOT_CORRUPT;
     }
@@ -372,7 +568,10 @@ static enum fs_sync_result fs_sync_to_disk_verified(
     uint32_t target_lba = fs_slot_header_lba(target_slot);
     uint32_t next_generation = g_active_generation + 1u;
 
-    fs_serialize();
+    if (!fs_serialize()) {
+        syslog_write("FS: Disk sync failed (record table full)");
+        return FS_SYNC_FAILED;
+    }
     ata_write_result_t table_write =
         ata_write(target_lba + 1u, (uint8_t)FS_DISK_TABLE_SECTORS,
                   (const uint8_t*)&g_disk_table);
@@ -474,31 +673,62 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
     /*
      * Versions 1-3 checksum their tables but do not integrity-protect the
      * generation field. If both legacy snapshots are valid yet different, no
-     * ordering rule can prove which one is newest. We may load the legacy
-     * generation winner as a recovery view, but must mark it corrupt/volatile
-     * so neither snapshot is overwritten. Identical copies are safe to
-     * migrate automatically.
+     * ordering rule can prove which one is newest. Integrity-protected slots
+     * are also ambiguous when equal generations name different tables, or
+     * when their serial numbers are exactly half the uint32_t range apart.
+     * Load one recovery view, but keep the backend volatile so neither
+     * snapshot is overwritten. Identical equal-generation copies are safe.
      */
     bool legacy_order_is_ambiguous = false;
-    if (valid[0] && valid[1] &&
-        headers[0].version != FS_DISK_VERSION &&
-        headers[1].version != FS_DISK_VERSION) {
+    bool protected_order_is_ambiguous = false;
+    const bool both_legacy =
+        valid[0] && valid[1] &&
+        headers[0].version < FS_INTEGRITY_DISK_VERSION &&
+        headers[1].version < FS_INTEGRITY_DISK_VERSION;
+    const bool both_integrity_protected =
+        valid[0] && valid[1] &&
+        headers[0].version >= FS_INTEGRITY_DISK_VERSION &&
+        headers[1].version >= FS_INTEGRITY_DISK_VERSION;
+    const uint32_t first_generation =
+        valid[0] ? fs_header_generation(&headers[0]) : 0u;
+    const uint32_t second_generation =
+        valid[1] ? fs_header_generation(&headers[1]) : 0u;
+    if (both_legacy ||
+        (both_integrity_protected &&
+         first_generation == second_generation)) {
         enum fs_compare_result comparison = fs_compare_slot_tables(0u, 1u);
         if (comparison == FS_COMPARE_IO_ERROR) {
             saw_io_error = true;
         } else if (comparison == FS_COMPARE_DIFFERENT) {
-            legacy_order_is_ambiguous = true;
-            syslog_write(
-                "FS: legacy snapshots differ; generation order is untrusted");
+            if (both_legacy) {
+                legacy_order_is_ambiguous = true;
+                syslog_write(
+                    "FS: legacy snapshots differ; generation order is untrusted");
+            } else {
+                protected_order_is_ambiguous = true;
+                syslog_write(
+                    "FS: equal integrity-protected generations differ");
+            }
         }
     }
+    if (both_integrity_protected &&
+        first_generation - second_generation == 0x80000000u) {
+        protected_order_is_ambiguous = true;
+        syslog_write(
+            "FS: integrity-protected generation order is ambiguous");
+    }
+    const bool slot_order_is_ambiguous =
+        legacy_order_is_ambiguous ||
+        protected_order_is_ambiguous;
 
     uint8_t first = 0;
     uint8_t second = 1;
     bool first_integrity_protected =
-        valid[0] && headers[0].version == FS_DISK_VERSION;
+        valid[0] &&
+        headers[0].version >= FS_INTEGRITY_DISK_VERSION;
     bool second_integrity_protected =
-        valid[1] && headers[1].version == FS_DISK_VERSION;
+        valid[1] &&
+        headers[1].version >= FS_INTEGRITY_DISK_VERSION;
     if (valid[1] &&
         (!valid[0] ||
          (second_integrity_protected && !first_integrity_protected) ||
@@ -519,7 +749,8 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
             }
             return fs_loaded_result(
                 saw_io_error,
-                saw_nonblank_invalid_header || legacy_order_is_ambiguous);
+                saw_nonblank_invalid_header ||
+                    slot_order_is_ambiguous);
         }
         if (result == FS_SLOT_CORRUPT) saw_corrupt_slot = true;
         else saw_io_error = true;
@@ -535,7 +766,7 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
             return fs_loaded_result(
                 saw_io_error,
                 saw_corrupt_slot || saw_nonblank_invalid_header ||
-                    legacy_order_is_ambiguous);
+                    slot_order_is_ambiguous);
         }
         if (result == FS_SLOT_CORRUPT) saw_corrupt_slot = true;
         else saw_io_error = true;
@@ -565,6 +796,13 @@ static enum fs_disk_load_result fs_load_from_disk(void) {
 }
 
 static bool fs_commit_changes(void) {
+    /*
+     * Enforce the physical 32-record extent budget on both persistent and
+     * volatile volumes. Running out of records is not a disk I/O failure and
+     * must not downgrade a healthy persistent mount.
+     */
+    if (!fs_serialize()) return false;
+
     if (g_backend_status != FS_BACKEND_PERSISTENT) {
         /*
          * A volatile mount remains useful, but it must never write into media
@@ -1097,7 +1335,7 @@ fs_legacy_upgrade_result_t fs_upgrade_legacy_snapshot(
         g_legacy_upgrade_status = FS_LEGACY_UPGRADE_UNAVAILABLE;
         syslog_write(
             "FS: explicitly upgraded recovered legacy snapshot to "
-            "verified v4 metadata");
+            "verified v5 metadata");
         return FS_LEGACY_UPGRADE_SUCCEEDED;
     }
     if (result == FS_SYNC_UNCERTAIN) {
@@ -1158,7 +1396,8 @@ const struct fs_file* fs_find(const char* name) {
 }
 
 bool fs_touch(const char* name) {
-    if (fs_name_is_system_log(name)) return false;
+    if (fs_name_is_system_log(name) ||
+        fs_name_is_system_managed(name)) return false;
     if (!fs_is_valid_name(name) ||
         (fs_name_is_self_test_file(name) && !g_self_test_active)) {
         return false;
@@ -1182,9 +1421,12 @@ bool fs_touch(const char* name) {
     return true;
 }
 
-bool fs_write_bytes(const char* name, const void* contents, size_t length) {
+static bool fs_write_bytes_internal(
+    const char* name, const void* contents,
+    size_t length, bool allow_system) {
     if (!fs_is_valid_name(name) ||
         fs_name_is_system_log(name) ||
+        (!allow_system && fs_name_is_system_managed(name)) ||
         (fs_name_is_self_test_file(name) && !g_self_test_active) ||
         (contents == NULL && length != 0) ||
         length >= FS_MAX_FILE_SIZE) {
@@ -1193,9 +1435,8 @@ bool fs_write_bytes(const char* name, const void* contents, size_t length) {
 
     struct fs_file* file = fs_find_mutable(name);
     bool existed = file != NULL;
-    struct fs_file backup;
     if (existed) {
-        backup = *file;
+        fs_copy_file(&g_mutation_backup, file);
     } else {
         file = fs_allocate_slot();
         if (file == NULL) return false;
@@ -1212,11 +1453,21 @@ bool fs_write_bytes(const char* name, const void* contents, size_t length) {
     file->size = length;
 
     if (!fs_commit_changes()) {
-        if (existed) *file = backup;
+        if (existed) fs_copy_file(file, &g_mutation_backup);
         else fs_clear(file);
         return false;
     }
     return true;
+}
+
+bool fs_write_bytes(const char* name, const void* contents, size_t length) {
+    return fs_write_bytes_internal(name, contents, length, false);
+}
+
+bool fs_system_write_bytes(
+    const char* name, const void* contents, size_t length) {
+    if (!fs_name_is_system_managed(name)) return false;
+    return fs_write_bytes_internal(name, contents, length, true);
 }
 
 bool fs_write(const char* name, const char* contents) {
@@ -1226,6 +1477,7 @@ bool fs_write(const char* name, const char* contents) {
 
 bool fs_append(const char* name, const char* contents) {
     if (!fs_is_valid_name(name) || fs_name_is_system_log(name) ||
+        fs_name_is_system_managed(name) ||
         (fs_name_is_self_test_file(name) && !g_self_test_active) ||
         contents == NULL) {
         return false;
@@ -1235,9 +1487,8 @@ bool fs_append(const char* name, const char* contents) {
 
     struct fs_file* file = fs_find_mutable(name);
     bool existed = file != NULL;
-    struct fs_file backup;
     if (existed) {
-        backup = *file;
+        fs_copy_file(&g_mutation_backup, file);
     } else {
         file = fs_allocate_slot();
         if (file == NULL) return false;
@@ -1258,18 +1509,25 @@ bool fs_append(const char* name, const char* contents) {
     file->data[file->size] = '\0';
 
     if (!fs_commit_changes()) {
-        if (existed) *file = backup;
+        if (existed) fs_copy_file(file, &g_mutation_backup);
         else fs_clear(file);
         return false;
     }
     return true;
 }
 
-bool fs_rename(const char* old_name, const char* new_name) {
+static bool fs_rename_internal(
+    const char* old_name, const char* new_name,
+    bool allow_system) {
     if (!fs_is_valid_name(old_name) || !fs_is_valid_name(new_name))
         return false;
     if (fs_name_is_system_log(old_name) ||
         fs_name_is_system_log(new_name)) {
+        return false;
+    }
+    if (!allow_system &&
+        (fs_name_is_system_managed(old_name) ||
+         fs_name_is_system_managed(new_name))) {
         return false;
     }
     if (fs_name_is_self_test_file(new_name) &&
@@ -1302,8 +1560,21 @@ bool fs_rename(const char* old_name, const char* new_name) {
     return true;
 }
 
-bool fs_remove(const char* name) {
+bool fs_rename(const char* old_name, const char* new_name) {
+    return fs_rename_internal(old_name, new_name, false);
+}
+
+bool fs_system_rename(const char* old_name, const char* new_name) {
+    if (!fs_name_is_system_managed(old_name) ||
+        fs_name_is_system_managed(new_name)) {
+        return false;
+    }
+    return fs_rename_internal(old_name, new_name, true);
+}
+
+static bool fs_remove_internal(const char* name, bool allow_system) {
     if (fs_name_is_system_log(name)) return false;
+    if (!allow_system && fs_name_is_system_managed(name)) return false;
     struct fs_file* file = fs_find_mutable(name);
     if (file == NULL) return false;
     if (fs_name_is_self_test_file(name) &&
@@ -1312,13 +1583,22 @@ bool fs_remove(const char* name) {
         return false;
     }
 
-    struct fs_file backup = *file;
+    fs_copy_file(&g_mutation_backup, file);
     fs_clear(file);
     if (!fs_commit_changes()) {
-        *file = backup;
+        fs_copy_file(file, &g_mutation_backup);
         return false;
     }
     return true;
+}
+
+bool fs_remove(const char* name) {
+    return fs_remove_internal(name, false);
+}
+
+bool fs_system_remove(const char* name) {
+    if (!fs_name_is_system_managed(name)) return false;
+    return fs_remove_internal(name, true);
 }
 
 static bool fs_self_test_reload(const char* failure_message) {

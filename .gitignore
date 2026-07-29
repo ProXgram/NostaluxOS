@@ -1,2 +1,4 @@
 build/
 .nostalux-image.lock
+__pycache__/
+*.py[cod]

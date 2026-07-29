@@ -23,6 +23,9 @@ char keyboard_get_char(void);
 /* Non-Blocking: Returns character if available, or 0 if buffer empty */
 char keyboard_poll_char(void);
 
+/* Drops queued keystrokes while preserving modifier-key state. */
+void keyboard_discard_pending(void);
+
 /* Modified to accept an idle callback */
 void keyboard_read_line_ex(char* buffer, size_t size, keyboard_idle_callback_t on_idle);
 void keyboard_read_line(char* buffer, size_t size); // Legacy wrapper

@@ -68,15 +68,45 @@ HANG_APP_OBJ := $(APP_BUILD_DIR)/hang-probe.o
 HANG_APP_LINKED := $(APP_BUILD_DIR)/hang-probe.unstripped.elf
 HANG_APP_ELF := $(APP_BUILD_DIR)/hang-probe.elf
 HANG_APP_BLOB_OBJ := $(APP_BUILD_DIR)/hang_probe_blob.o
-APP_ELFS := $(HELLO_APP_ELF) $(FAULT_APP_ELF) $(HANG_APP_ELF)
+RFLAGS_APP_OBJ := $(APP_BUILD_DIR)/rflags-probe.o
+RFLAGS_APP_LINKED := $(APP_BUILD_DIR)/rflags-probe.unstripped.elf
+RFLAGS_APP_ELF := $(APP_BUILD_DIR)/rflags-probe.elf
+RFLAGS_APP_BLOB_OBJ := $(APP_BUILD_DIR)/rflags_probe_blob.o
+STACK_APP_OBJ := $(APP_BUILD_DIR)/stack-probe.o
+STACK_APP_LINKED := $(APP_BUILD_DIR)/stack-probe.unstripped.elf
+STACK_APP_ELF := $(APP_BUILD_DIR)/stack-probe.elf
+STACK_APP_BLOB_OBJ := $(APP_BUILD_DIR)/stack_probe_blob.o
+CALCULATOR_APP_OBJ := $(APP_BUILD_DIR)/calculator.o
+CALCULATOR_APP_LINKED := $(APP_BUILD_DIR)/calculator.unstripped.elf
+CALCULATOR_APP_ELF := $(APP_BUILD_DIR)/calculator.elf
+CALCULATOR_APP_BLOB_OBJ := $(APP_BUILD_DIR)/calculator_blob.o
+NOTEPAD_APP_OBJ := $(APP_BUILD_DIR)/notepad.o
+NOTEPAD_APP_LINKED := $(APP_BUILD_DIR)/notepad.unstripped.elf
+NOTEPAD_APP_ELF := $(APP_BUILD_DIR)/notepad.elf
+NOTEPAD_APP_BLOB_OBJ := $(APP_BUILD_DIR)/notepad_blob.o
+IMAGE_VIEWER_APP_OBJ := $(APP_BUILD_DIR)/image-viewer.o
+IMAGE_VIEWER_APP_LINKED := $(APP_BUILD_DIR)/image-viewer.unstripped.elf
+IMAGE_VIEWER_APP_ELF := $(APP_BUILD_DIR)/image-viewer.elf
+IMAGE_VIEWER_APP_BLOB_OBJ := $(APP_BUILD_DIR)/image_viewer_blob.o
+AI_ASSISTANT_APP_OBJ := $(APP_BUILD_DIR)/ai-assistant.o
+AI_ASSISTANT_APP_LINKED := $(APP_BUILD_DIR)/ai-assistant.unstripped.elf
+AI_ASSISTANT_APP_ELF := $(APP_BUILD_DIR)/ai-assistant.elf
+AI_ASSISTANT_APP_BLOB_OBJ := $(APP_BUILD_DIR)/ai_assistant_blob.o
+DESKTOP_APP_ELFS := $(CALCULATOR_APP_ELF) $(NOTEPAD_APP_ELF) \
+	$(IMAGE_VIEWER_APP_ELF) $(AI_ASSISTANT_APP_ELF)
+APP_ELFS := $(HELLO_APP_ELF) $(FAULT_APP_ELF) $(HANG_APP_ELF) \
+	$(RFLAGS_APP_ELF) $(STACK_APP_ELF) $(DESKTOP_APP_ELFS)
 KERNEL_EXTRA_OBJS := $(HELLO_APP_BLOB_OBJ) $(FAULT_APP_BLOB_OBJ) \
-	$(HANG_APP_BLOB_OBJ)
+	$(HANG_APP_BLOB_OBJ) $(RFLAGS_APP_BLOB_OBJ) \
+	$(STACK_APP_BLOB_OBJ) $(CALCULATOR_APP_BLOB_OBJ) \
+	$(NOTEPAD_APP_BLOB_OBJ) $(IMAGE_VIEWER_APP_BLOB_OBJ) \
+	$(AI_ASSISTANT_APP_BLOB_OBJ)
 
 APP_CFLAGS := -std=gnu11 -Os -ffreestanding -fno-builtin \
 	-fno-stack-protector -fcf-protection=none -fno-pic -fno-pie \
 	-fno-asynchronous-unwind-tables -mno-red-zone -mgeneral-regs-only \
 	-mcmodel=large -nostdlib -nostartfiles -Wall -Wextra -Werror \
-	-Ikernel/include \
+	-Ikernel/include -Iapps \
 	-mno-mmx -mno-sse -mno-sse2 -mno-sse3 -mno-ssse3 -mno-sse4 \
 	-mno-avx
 
@@ -87,6 +117,10 @@ QEMU ?= qemu-system-x86_64
 QEMU_NATIVE ?=
 FLOCK ?= flock
 IMAGE_LOCK ?= .nostalux-image.lock
+PYTHON ?= python3
+QEMU_SMOKE_TIMEOUT ?= 30
+QEMU_SMOKE_LOCK_TIMEOUT ?= 3
+QEMU_SMOKE_MEMORY_MIB ?= 128
 
 # Cross-architecture virtualization is not possible with KVM/WHVP. QEMU's TCG
 # translates the x86-64 guest on ARM64 hosts.
@@ -97,6 +131,8 @@ else
 QEMU_ACCEL :=
 endif
 endif
+
+QEMU_SMOKE_ARGS ?= $(QEMU_ACCEL)
 
 # Interactive runs prefer a native Windows QEMU executable when one can be
 # discovered. Linux QEMU remains the portable fallback and powers headless runs.
@@ -173,10 +209,14 @@ define RUN_QEMU
 	exit 1
 endef
 
-.PHONY: all apps clean test test-apps-v1 test-bmp \
+.PHONY: all apps clean test test-apps-v1 test-app-catalog-reclaim \
+	test-app-services \
+	test-app-behavior test-bmp \
 	test-terminal-capture test-shell-capture test-fs-persistence \
-	test-memory-accounting test-vmmouse-decode run run-windowed \
-	run-fullscreen check-conflicts check-target-tools
+	test-memory-accounting test-user-return test-vmmouse-decode \
+	run run-windowed \
+	run-fullscreen test-qemu-smoke qemu-smoke check-conflicts \
+	check-target-tools
 
 all: check-conflicts check-target-tools $(OS_IMAGE)
 
@@ -211,8 +251,10 @@ check-target-tools:
 			exit 1 ;; \
 	esac
 
-test: test-apps-v1 test-bmp test-terminal-capture test-shell-capture \
-	test-fs-persistence test-memory-accounting test-vmmouse-decode
+test: test-apps-v1 test-app-catalog-reclaim test-app-services \
+	test-app-behavior test-bmp \
+	test-terminal-capture test-shell-capture test-fs-persistence \
+	test-memory-accounting test-user-return test-vmmouse-decode
 
 test-apps-v1: check-target-tools $(APP_ELFS) | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror \
@@ -221,7 +263,30 @@ test-apps-v1: check-target-tools $(APP_ELFS) | $(BUILD_DIR)
 		kernel/app_manifest.c kernel/app_process.c kernel/elf64_loader.c \
 		-o $(BUILD_DIR)/apps_v1_test
 	$(BUILD_DIR)/apps_v1_test $(HELLO_APP_ELF) $(FAULT_APP_ELF) \
-		$(HANG_APP_ELF)
+		$(HANG_APP_ELF) $(RFLAGS_APP_ELF) $(STACK_APP_ELF) \
+		$(DESKTOP_APP_ELFS)
+
+test-app-catalog-reclaim: check-target-tools $(HELLO_APP_ELF) | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror \
+		-DNOSTALUX_HOST_TEST -DNOSTALUX_APP_CATALOG_FS_TEST \
+		-Ikernel/include \
+		tests/app_catalog_reclaim_test.c kernel/app_catalog.c \
+		kernel/app_manifest.c kernel/elf64_loader.c \
+		-o $(BUILD_DIR)/app_catalog_reclaim_test
+	$(BUILD_DIR)/app_catalog_reclaim_test $(HELLO_APP_ELF)
+
+test-app-services: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/app_services_test.c kernel/app_services.c \
+		kernel/app_manifest.c \
+		-o $(BUILD_DIR)/app_services_test
+	$(BUILD_DIR)/app_services_test
+
+test-app-behavior: | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror \
+		-DNOSTALUX_HOST_TEST -Ikernel/include -Iapps \
+		tests/app_behavior_test.c -o $(BUILD_DIR)/app_behavior_test
+	$(BUILD_DIR)/app_behavior_test
 
 test-bmp: | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
@@ -253,11 +318,44 @@ test-memory-accounting: | $(BUILD_DIR)
 		-o $(BUILD_DIR)/memory_accounting_test
 	$(BUILD_DIR)/memory_accounting_test
 
+test-user-return: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/user_return_test.c -o $(BUILD_DIR)/user_return_test
+	$(BUILD_DIR)/user_return_test
+
 test-vmmouse-decode: | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
 		tests/vmmouse_decode_test.c kernel/vmmouse_decode.c \
 		-o $(BUILD_DIR)/vmmouse_decode_test
 	$(BUILD_DIR)/vmmouse_decode_test
+
+# This target intentionally has no build-artifact prerequisites: it must never
+# rebuild or write the user's primary disk image. Run `make` first when the
+# image is missing or stale.
+test-qemu-smoke: check-conflicts
+	@set -eu; \
+	if ! command -v "$(firstword $(PYTHON))" >/dev/null 2>&1; then \
+		echo "Error: QEMU smoke testing requires $(firstword $(PYTHON))." >&2; \
+		exit 1; \
+	fi; \
+	if ! command -v "$(QEMU)" >/dev/null 2>&1; then \
+		echo "Error: QEMU smoke testing requires $(QEMU)." >&2; \
+		exit 1; \
+	fi; \
+	if ! $(MAKE) --no-print-directory -q "$(OS_IMAGE)"; then \
+		echo "Error: $(OS_IMAGE) is missing or stale; run 'make' before the smoke test." >&2; \
+		exit 1; \
+	fi; \
+	$(PYTHON) scripts/qemu-smoke.py \
+		--qemu "$(QEMU)" \
+		--qemu-args "$(QEMU_SMOKE_ARGS)" \
+		--image "$(OS_IMAGE)" \
+		--image-lock "$(IMAGE_LOCK)" \
+		--timeout "$(QEMU_SMOKE_TIMEOUT)" \
+		--lock-timeout "$(QEMU_SMOKE_LOCK_TIMEOUT)" \
+		--memory-mib "$(QEMU_SMOKE_MEMORY_MIB)"
+
+qemu-smoke: test-qemu-smoke
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
@@ -305,6 +403,95 @@ $(HANG_APP_ELF): $(HANG_APP_LINKED) | $(APP_BUILD_DIR)
 $(HANG_APP_BLOB_OBJ): apps/hang_probe_blob.asm $(HANG_APP_ELF) | $(APP_BUILD_DIR)
 	$(NASM) -f elf64 apps/hang_probe_blob.asm -o $@
 
+$(RFLAGS_APP_OBJ): apps/rflags_probe.c kernel/include/app_abi.h \
+		Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
+$(RFLAGS_APP_LINKED): $(RFLAGS_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(RFLAGS_APP_OBJ)
+
+$(RFLAGS_APP_ELF): $(RFLAGS_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(RFLAGS_APP_BLOB_OBJ): apps/rflags_probe_blob.asm \
+		$(RFLAGS_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/rflags_probe_blob.asm -o $@
+
+$(STACK_APP_OBJ): apps/stack_probe.c Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
+$(STACK_APP_LINKED): $(STACK_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(STACK_APP_OBJ)
+
+$(STACK_APP_ELF): $(STACK_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(STACK_APP_BLOB_OBJ): apps/stack_probe_blob.asm \
+		$(STACK_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/stack_probe_blob.asm -o $@
+
+$(CALCULATOR_APP_OBJ): apps/calculator.c apps/app_ui.h \
+		kernel/include/app_abi.h Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
+$(NOTEPAD_APP_OBJ): apps/notepad.c apps/app_ui.h \
+		kernel/include/app_abi.h Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
+$(IMAGE_VIEWER_APP_OBJ): apps/image_viewer.c apps/app_ui.h \
+		kernel/include/app_abi.h Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
+$(AI_ASSISTANT_APP_OBJ): apps/ai_assistant.c apps/app_ui.h \
+		kernel/include/app_abi.h Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
+$(CALCULATOR_APP_LINKED): $(CALCULATOR_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(CALCULATOR_APP_OBJ)
+
+$(NOTEPAD_APP_LINKED): $(NOTEPAD_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(NOTEPAD_APP_OBJ)
+
+$(IMAGE_VIEWER_APP_LINKED): $(IMAGE_VIEWER_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(IMAGE_VIEWER_APP_OBJ)
+
+$(AI_ASSISTANT_APP_LINKED): $(AI_ASSISTANT_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(AI_ASSISTANT_APP_OBJ)
+
+$(CALCULATOR_APP_ELF): $(CALCULATOR_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(NOTEPAD_APP_ELF): $(NOTEPAD_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(IMAGE_VIEWER_APP_ELF): $(IMAGE_VIEWER_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(AI_ASSISTANT_APP_ELF): $(AI_ASSISTANT_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(CALCULATOR_APP_BLOB_OBJ): apps/calculator_blob.asm \
+		$(CALCULATOR_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/calculator_blob.asm -o $@
+
+$(NOTEPAD_APP_BLOB_OBJ): apps/notepad_blob.asm \
+		$(NOTEPAD_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/notepad_blob.asm -o $@
+
+$(IMAGE_VIEWER_APP_BLOB_OBJ): apps/image_viewer_blob.asm \
+		$(IMAGE_VIEWER_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/image_viewer_blob.asm -o $@
+
+$(AI_ASSISTANT_APP_BLOB_OBJ): apps/ai_assistant_blob.asm \
+		$(AI_ASSISTANT_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/ai_assistant_blob.asm -o $@
+
 $(KERNEL_ELF): kernel/entry.asm $(KERNEL_OBJS) $(KERNEL_EXTRA_OBJS) \
 		kernel/linker.ld | $(BUILD_DIR)
 	$(NASM) -f elf64 kernel/entry.asm -o $(BUILD_DIR)/entry.o
@@ -329,6 +516,8 @@ $(BOOT_BIN): bootloader/boot.asm $(PAYLOAD_BIN) | $(BUILD_DIR)
 	TOTAL_SECTORS=$$(( (TOTAL_SIZE + 511) / 512 )); \
 	$(NASM) -f bin $(NASMFLAGS) -DTOTAL_SECTORS=$$TOTAL_SECTORS bootloader/boot.asm -o $@
 
+# DrvFS can timestamp a newly replaced image fractionally ahead of WSL's
+# clock, so the recipe lets that subsecond skew settle before returning.
 $(OS_IMAGE): $(BOOT_BIN) $(PAYLOAD_BIN)
 	@set -eu; \
 	if ! command -v "$(firstword $(FLOCK))" >/dev/null 2>&1; then \
@@ -364,6 +553,8 @@ $(OS_IMAGE): $(BOOT_BIN) $(PAYLOAD_BIN)
 		truncate -s "$$MIN_IMAGE_SIZE" "$$TMP_IMAGE"; \
 	fi; \
 	mv "$$TMP_IMAGE" '$@'; \
+	touch '$@'; \
+	sleep 1; \
 	rm -f "$$SAVED_STORAGE"; \
 	trap - 0 1 2 15
 

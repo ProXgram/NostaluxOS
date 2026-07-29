@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+extern uint8_t* const g_kernel_stack_guard_page;
 extern uint8_t g_kernel_stack[];
 extern uint8_t* const g_kernel_stack_top;
 

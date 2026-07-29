@@ -1,5 +1,9 @@
 #include "app_process.h"
 
+#ifndef NOSTALUX_HOST_TEST
+#include "app_services.h"
+#endif
+
 static struct app_process_info g_processes[APP_PROCESS_CAPACITY];
 static size_t g_process_count = 0;
 static uint64_t g_next_process_id = 1;
@@ -112,6 +116,14 @@ static bool plan_is_consistent(const struct elf64_image_plan* image) {
 }
 
 void app_process_table_reset(void) {
+#ifndef NOSTALUX_HOST_TEST
+    for (size_t index = 0; index < APP_PROCESS_CAPACITY; index++) {
+        if (g_processes[index].state != APP_PROCESS_UNUSED) {
+            app_services_release_process(
+                g_processes[index].process_id);
+        }
+    }
+#endif
     clear_bytes(g_processes, sizeof(g_processes));
     g_process_count = 0;
     g_next_process_id = 1;
@@ -173,6 +185,34 @@ enum app_process_result app_process_mark_starting(uint64_t process_id) {
     return APP_PROCESS_OK;
 }
 
+enum app_process_result app_process_set_startup_argument(
+    uint64_t process_id, const char* argument) {
+    struct app_process_info* process = find_process(process_id);
+    if (process == NULL) return APP_PROCESS_NOT_FOUND;
+    if (process->state != APP_PROCESS_LOADED) {
+        return APP_PROCESS_INVALID_TRANSITION;
+    }
+
+    size_t length = 0;
+    if (argument != NULL) {
+        while (argument[length] != '\0' &&
+               length <= APP_STARTUP_ARGUMENT_MAX) {
+            const uint8_t value = (uint8_t)argument[length];
+            if (value < 32u || value > 126u) {
+                return APP_PROCESS_INVALID_ARGUMENT;
+            }
+            length++;
+        }
+        if (length > APP_STARTUP_ARGUMENT_MAX) {
+            return APP_PROCESS_INVALID_ARGUMENT;
+        }
+    }
+    copy_string(process->startup_argument,
+                sizeof(process->startup_argument),
+                argument);
+    return APP_PROCESS_OK;
+}
+
 enum app_process_result app_process_mark_running(uint64_t process_id) {
     struct app_process_info* process = find_process(process_id);
     if (process == NULL) return APP_PROCESS_NOT_FOUND;
@@ -193,6 +233,9 @@ enum app_process_result app_process_mark_exited(uint64_t process_id,
     }
     process->exit_code = exit_code;
     process->state = APP_PROCESS_EXITED;
+#ifndef NOSTALUX_HOST_TEST
+    app_services_release_process(process_id);
+#endif
     return APP_PROCESS_OK;
 }
 
@@ -209,6 +252,9 @@ enum app_process_result app_process_record_fault(
     }
     process->fault = *fault;
     process->state = APP_PROCESS_FAULTED;
+#ifndef NOSTALUX_HOST_TEST
+    app_services_release_process(process_id);
+#endif
     return APP_PROCESS_OK;
 }
 
@@ -221,6 +267,9 @@ enum app_process_result app_process_release(uint64_t process_id) {
         return APP_PROCESS_INVALID_TRANSITION;
     }
 
+#ifndef NOSTALUX_HOST_TEST
+    app_services_release_process(process_id);
+#endif
     clear_bytes(process, sizeof(*process));
     g_process_count--;
     return APP_PROCESS_OK;
@@ -270,6 +319,26 @@ bool app_process_find(uint64_t process_id,
     const struct app_process_info* process = find_process(process_id);
     if (process == NULL) return false;
     *out_info = *process;
+    return true;
+}
+
+bool app_process_get_startup_argument(
+    uint64_t process_id,
+    char* out_argument,
+    size_t capacity,
+    size_t* out_length) {
+    if (out_argument == NULL || capacity == 0 ||
+        out_length == NULL) {
+        return false;
+    }
+    const struct app_process_info* process = find_process(process_id);
+    if (process == NULL) return false;
+
+    size_t length = 0;
+    while (process->startup_argument[length] != '\0') length++;
+    if (length + 1u > capacity) return false;
+    copy_string(out_argument, capacity, process->startup_argument);
+    *out_length = length;
     return true;
 }
 
