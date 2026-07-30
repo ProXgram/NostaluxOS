@@ -22,6 +22,86 @@ static void assistant_time_answer(char* answer, size_t capacity) {
     answer[12] = (char)('0' + time.second % 10u);
 }
 
+static void assistant_append_octet(
+    char* text, size_t capacity, uint8_t value) {
+    char digits[3];
+    size_t count = 0;
+    if (value >= 100u) {
+        digits[count++] = (char)('0' + value / 100u);
+    }
+    if (value >= 10u) {
+        digits[count++] =
+            (char)('0' + (value / 10u) % 10u);
+    }
+    digits[count++] = (char)('0' + value % 10u);
+    for (size_t index = 0; index < count; index++) {
+        size_t length = app_text_length(text);
+        if (length + 1u >= capacity) return;
+        text[length] = digits[index];
+        text[length + 1u] = '\0';
+    }
+}
+
+static void assistant_append_ipv4(
+    char* text, size_t capacity, uint32_t address) {
+    for (unsigned int index = 0; index < 4u; index++) {
+        if (index != 0u) {
+            size_t length = app_text_length(text);
+            if (length + 1u >= capacity) return;
+            text[length] = '.';
+            text[length + 1u] = '\0';
+        }
+        unsigned int shift = 24u - index * 8u;
+        assistant_append_octet(
+            text, capacity, (uint8_t)(address >> shift));
+    }
+}
+
+static void assistant_network_answer(
+    char* answer, size_t capacity) {
+    struct app_network_status status;
+    uint64_t result = app_syscall2(
+        APP_SYSCALL_NETWORK_STATUS,
+        (uint64_t)(uintptr_t)&status, sizeof(status));
+    if (!app_result_ok(result)) {
+        app_text_copy(
+            answer, capacity, "NETWORK STATUS IS UNAVAILABLE.");
+        return;
+    }
+    if ((status.flags & APP_NETWORK_DEVICE_PRESENT) == 0u) {
+        app_text_copy(
+            answer, capacity,
+            "NO COMPATIBLE NETWORK CARD WAS DETECTED.");
+        return;
+    }
+    if ((status.flags & APP_NETWORK_LINK_UP) == 0u) {
+        app_text_copy(
+            answer, capacity,
+            "THE NETWORK CARD IS REAL, BUT ITS LINK IS DOWN.");
+        return;
+    }
+    if ((status.flags & APP_NETWORK_CONFIGURED) == 0u) {
+        app_text_copy(
+            answer, capacity,
+            (status.flags & APP_NETWORK_DHCP_ACTIVE) != 0u
+                ? "THE LINK IS UP. DHCP IS REQUESTING AN ADDRESS."
+                : "THE LINK IS UP, BUT IP IS NOT CONFIGURED.");
+        return;
+    }
+
+    app_text_copy(answer, capacity, "NETWORK ONLINE. IP ");
+    assistant_append_ipv4(
+        answer, capacity, status.ipv4_address);
+    size_t length = app_text_length(answer);
+    const char suffix[] = ". BROWSER LOADS HTTP.";
+    for (size_t index = 0;
+         suffix[index] != '\0' && length + 1u < capacity;
+         index++) {
+        answer[length++] = suffix[index];
+    }
+    answer[length] = '\0';
+}
+
 static void assistant_answer(const char* prompt,
                              char* answer, size_t capacity) {
     if (app_text_has_word(prompt, "TIME") ||

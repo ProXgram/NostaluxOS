@@ -10,6 +10,7 @@ PHDRS
      * first 4 KiB on padding before its only PT_LOAD segment.
      */
     image PT_LOAD FILEHDR PHDRS FLAGS(5); /* Read + execute, never writable. */
+    data PT_LOAD FLAGS(6);       /* Read + write, never executable. */
     stack PT_GNU_STACK FLAGS(6);  /* Read + write, never executable. */
 }
 
@@ -31,6 +32,24 @@ SECTIONS
     {
         *(.rodata .rodata.*)
     } :image
+
+    /*
+     * x86 permissions apply to complete pages. Start mutable state on the
+     * next page so it can never make a code page writable. Apps without
+     * mutable state do not get a data PT_LOAD from GNU ld.
+     */
+    . = ALIGN(0x1000);
+
+    .data : ALIGN(16)
+    {
+        *(.data .data.*)
+    } :data
+
+    .bss (NOLOAD) : ALIGN(16)
+    {
+        *(.bss .bss.*)
+        *(COMMON)
+    } :data
 
     /DISCARD/ :
     {

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
@@ -197,6 +199,124 @@ def wait_for_file(path: Path, deadline: float) -> None:
         time.sleep(min(0.02, remaining(deadline)))
 
 
+def wait_for_log_text(path: Path, expected: str, deadline: float) -> None:
+    while True:
+        require_time(deadline, f"waiting for log marker {expected!r}")
+        try:
+            log_text = path.read_text(errors="replace")
+        except OSError:
+            log_text = ""
+        if expected in log_text:
+            return
+        time.sleep(min(0.02, remaining(deadline)))
+
+def wait_for_log_text_count(
+    path: Path, expected: str, count: int, deadline: float
+) -> None:
+    while True:
+        require_time(
+            deadline,
+            f"waiting for {count} log markers {expected!r}",
+        )
+        try:
+            log_text = path.read_text(errors="replace")
+        except OSError:
+            log_text = ""
+        if log_text.count(expected) >= count:
+            return
+        time.sleep(min(0.02, remaining(deadline)))
+
+
+def fnv1a32(data: bytes) -> int:
+    value = 2166136261
+    for byte in data:
+        value ^= byte
+        value = (value * 16777619) & 0xFFFFFFFF
+    return value
+
+
+class SmokeHttpHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    response_body = b"Nostalux real TCP and HTTP smoke response\n"
+    browser_response_body = (
+        b"Nostalux isolated Browser redirect and chunked response\n"
+    )
+    browser_second_response_body = (
+        b"Nostalux second isolated Browser request and verified save\n"
+    )
+    successful_get = threading.Event()
+    browser_redirect_get = threading.Event()
+    browser_chunked_get = threading.Event()
+    browser_second_redirect_get = threading.Event()
+    browser_second_chunked_get = threading.Event()
+
+    def do_GET(self) -> None:
+        if self.path == "/nostalux-smoke":
+            self.successful_get.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(self.response_body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(self.response_body)
+            return
+        if self.path in (
+            "/nostalux-browser/nested/redirect",
+            "/nostalux-browser-second/nested/redirect",
+        ):
+            second = self.path.startswith("/nostalux-browser-second/")
+            if second:
+                self.browser_second_redirect_get.set()
+            else:
+                self.browser_redirect_get.set()
+            self.send_response_only(103, "Early Hints")
+            self.send_header("Link", "</nostalux.css>; rel=preload")
+            self.end_headers()
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                "../../nostalux-browser-second//chunked"
+                if second
+                else "../../nostalux-browser//chunked",
+            )
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+        if self.path in (
+            "/nostalux-browser//chunked",
+            "/nostalux-browser-second//chunked",
+        ):
+            second = self.path.startswith("/nostalux-browser-second/")
+            if second:
+                self.browser_second_chunked_get.set()
+            else:
+                self.browser_chunked_get.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            body = (
+                self.browser_second_response_body
+                if second
+                else self.browser_response_body
+            )
+            split = len(body) // 2
+            for chunk in (body[:split], body[split:]):
+                self.wfile.write(
+                    f"{len(chunk):X};smoke=yes\r\n".encode("ascii")
+                )
+                self.wfile.write(chunk + b"\r\n")
+            self.wfile.write(b"0\r\nX-Nostalux-Smoke: passed\r\n\r\n")
+            self.wfile.flush()
+            return
+        self.send_error(404)
+
+    def log_message(self, format: str, *args) -> None:
+        del format, args
+
+
 def validate_framebuffer(path: Path) -> tuple[int, int, int]:
     with path.open("rb") as ppm:
         magic = ppm.readline().strip()
@@ -224,7 +344,13 @@ def validate_framebuffer(path: Path) -> tuple[int, int, int]:
     return width, height, len(colors)
 
 
-KEY_NAMES = {" ": "spc", "-": "minus"}
+KEY_NAMES = {
+    " ": "spc",
+    "-": "minus",
+    ".": "dot",
+    "/": "slash",
+    ":": "shift-semicolon",
+}
 
 
 def type_command(qmp: QmpClient, command: str, deadline: float) -> None:
@@ -463,9 +589,25 @@ def main() -> int:
         socket_path = temp_dir / "qmp.sock"
         screenshot = temp_dir / "boot.ppm"
         log_path = temp_dir / "qemu.log"
+        debug_log_path = temp_dir / "debug.log"
         digest = copy_image(
             image, disk_copy, lock_path, deadline, args.lock_timeout
         )
+        SmokeHttpHandler.successful_get.clear()
+        SmokeHttpHandler.browser_redirect_get.clear()
+        SmokeHttpHandler.browser_chunked_get.clear()
+        SmokeHttpHandler.browser_second_redirect_get.clear()
+        SmokeHttpHandler.browser_second_chunked_get.clear()
+        http_server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), SmokeHttpHandler
+        )
+        http_thread = threading.Thread(
+            target=http_server.serve_forever,
+            name="nostalux-smoke-http",
+            daemon=True,
+        )
+        http_thread.start()
+        http_port = int(http_server.server_address[1])
 
         command = [
             qemu,
@@ -478,12 +620,18 @@ def main() -> int:
             "none",
             "-serial",
             "none",
+            "-debugcon",
+            f"file:{debug_log_path}",
+            "-global",
+            "isa-debugcon.iobase=0xe9",
             "-qmp",
             f"unix:{socket_path},server=on,wait=off",
             "-no-reboot",
             "-no-shutdown",
-            "-nic",
-            "none",
+            "-netdev",
+            "user,id=nostaluxnet,ipv6=off",
+            "-device",
+            "rtl8139,netdev=nostaluxnet",
             "-m",
             str(args.memory_mib),
             "-machine",
@@ -584,6 +732,117 @@ def main() -> int:
                 )
                 validate_initial_extended_state(recovered_app_registers)
 
+                phase = "waiting for a real DHCP lease"
+                wait_for_kernel(qmp, deadline)
+                wait_for_log_text(
+                    debug_log_path,
+                    "Network: DHCP configured",
+                    deadline,
+                )
+                wait_for_log_text(
+                    debug_log_path,
+                    "Network: RTL8139 IRQ delivery confirmed",
+                    deadline,
+                )
+
+                phase = "validating ICMP through QEMU user networking"
+                type_command(qmp, "ping 10.0.2.2", deadline)
+                wait_for_log_text(
+                    debug_log_path,
+                    "Network: ICMP echo command completed",
+                    deadline,
+                )
+
+                phase = "validating TCP and HTTP against the host"
+                smoke_url = (
+                    f"http://10.0.2.2:{http_port}/nostalux-smoke"
+                )
+                type_command(qmp, f"http {smoke_url}", deadline)
+                wait_for_log_text(
+                    debug_log_path,
+                    "Network: HTTP command completed",
+                    deadline,
+                )
+                if not SmokeHttpHandler.successful_get.is_set():
+                    raise SmokeFailure(
+                        "guest reported HTTP success without requesting "
+                        "the smoke server's expected path"
+                    )
+
+                phase = "validating isolated asynchronous Browser networking"
+                browser_url = (
+                    f"http://10.0.2.2:{http_port}/"
+                    "nostalux-browser/nested/redirect"
+                )
+                type_command(
+                    qmp,
+                    f"app browser --download {browser_url}",
+                    deadline,
+                )
+                wait_for_log_text_count(
+                    debug_log_path,
+                    "Browser explicit download verified: download.txt",
+                    1,
+                    deadline,
+                )
+                first_digest = (
+                    "Browser explicit download digest: bytes="
+                    f"{len(SmokeHttpHandler.browser_response_body)} "
+                    "fnv1a="
+                    f"{fnv1a32(SmokeHttpHandler.browser_response_body)}"
+                )
+                wait_for_log_text(
+                    debug_log_path, first_digest, deadline
+                )
+                wait_for_kernel(qmp, deadline)
+                if not SmokeHttpHandler.browser_redirect_get.is_set():
+                    raise SmokeFailure(
+                        "isolated Browser did not request the redirect path"
+                    )
+                if not SmokeHttpHandler.browser_chunked_get.is_set():
+                    raise SmokeFailure(
+                        "isolated Browser did not follow the redirect to the "
+                        "chunked response"
+                    )
+
+                phase = (
+                    "validating Browser process exit and request cleanup"
+                )
+                second_browser_url = (
+                    f"http://10.0.2.2:{http_port}/"
+                    "nostalux-browser-second/nested/redirect"
+                )
+                type_command(
+                    qmp,
+                    f"app browser --download {second_browser_url}",
+                    deadline,
+                )
+                wait_for_log_text_count(
+                    debug_log_path,
+                    "Browser explicit download verified: download.txt",
+                    2,
+                    deadline,
+                )
+                second_digest = (
+                    "Browser explicit download digest: bytes="
+                    f"{len(SmokeHttpHandler.browser_second_response_body)} "
+                    "fnv1a="
+                    f"{fnv1a32(SmokeHttpHandler.browser_second_response_body)}"
+                )
+                wait_for_log_text(
+                    debug_log_path, second_digest, deadline
+                )
+                wait_for_kernel(qmp, deadline)
+                if not SmokeHttpHandler.browser_second_redirect_get.is_set():
+                    raise SmokeFailure(
+                        "second Browser process did not request its "
+                        "redirect path"
+                    )
+                if not SmokeHttpHandler.browser_second_chunked_get.is_set():
+                    raise SmokeFailure(
+                        "second Browser process did not follow its redirect"
+                    )
+
                 print(
                     f"PASS kernel: long mode, shell idle at RIP 0x{kernel_rip:x}"
                 )
@@ -614,6 +873,21 @@ def main() -> int:
                     f"0x{recovered_app_rsp:x} at RIP 0x{recovered_app_rip:x}"
                 )
                 print(
+                    "PASS network: DHCP configured the RTL8139, real IRQ "
+                    "delivery was observed, and ICMP reached the QEMU gateway"
+                )
+                print(
+                    "PASS HTTP: the guest completed a real TCP GET from "
+                    f"{smoke_url}"
+                )
+                print(
+                    "PASS Browser: the isolated asynchronous app followed a "
+                    "dot-segment redirect after an informational response, "
+                    "decoded chunked bodies, verified saved bytes, exited, "
+                    "and released the request for a second process "
+                    f"({browser_url})"
+                )
+                print(
                     "PASS isolation: QEMU used a read-only disposable image "
                     f"copy (source SHA-256 {digest[:16]}...)"
                 )
@@ -624,6 +898,10 @@ def main() -> int:
             if log_tail:
                 print("QEMU log tail:", file=sys.stderr)
                 print(log_tail, file=sys.stderr)
+            debug_tail = qemu_log_tail(debug_log_path)
+            if debug_tail:
+                print("Nostalux debug log tail:", file=sys.stderr)
+                print(debug_tail, file=sys.stderr)
             if isinstance(error, SmokeFailure):
                 raise SmokeFailure(f"{phase}: {error}") from error
             raise
@@ -632,6 +910,9 @@ def main() -> int:
                 stop_qemu(process, qmp)
             if qmp is not None:
                 qmp.connection.close()
+            http_server.shutdown()
+            http_server.server_close()
+            http_thread.join(timeout=1.0)
 
     print(f"QEMU smoke test passed in {time.monotonic() - started:.2f}s")
     return 0

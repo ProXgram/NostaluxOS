@@ -5,8 +5,10 @@
 
 #include "app_abi.h"
 #include "app_manifest.h"
+#include "app_network_services.h"
 #include "app_process.h"
 #include "app_services.h"
+#include "network.h"
 #include "paging.h"
 #include "rtc.h"
 #include "scheduler.h"
@@ -135,6 +137,52 @@ static uint64_t dispatch_argument_get(const struct syscall_regs* regs) {
     return (uint64_t)length;
 }
 
+static uint64_t dispatch_network_status(
+    const struct syscall_regs* regs) {
+    if (!current_has_capability(APP_CAPABILITY_NETWORK)) {
+        return app_error(APP_STATUS_PERMISSION_DENIED);
+    }
+    if (regs->rsi == 0 ||
+        regs->rdx < sizeof(struct app_network_status)) {
+        return app_error(APP_STATUS_INVALID_ARGUMENT);
+    }
+
+    struct network_status kernel_status;
+    network_get_status(&kernel_status);
+    struct app_network_status result = {
+        .flags =
+            (kernel_status.device_present
+                 ? APP_NETWORK_DEVICE_PRESENT : 0u) |
+            (kernel_status.device_ready
+                 ? APP_NETWORK_DEVICE_READY : 0u) |
+            (kernel_status.link_up
+                 ? APP_NETWORK_LINK_UP : 0u) |
+            (kernel_status.configured
+                 ? APP_NETWORK_CONFIGURED : 0u) |
+            (kernel_status.dhcp_in_progress
+                 ? APP_NETWORK_DHCP_ACTIVE : 0u),
+        .mac = {
+            kernel_status.mac[0], kernel_status.mac[1],
+            kernel_status.mac[2], kernel_status.mac[3],
+            kernel_status.mac[4], kernel_status.mac[5],
+        },
+        .reserved = {0, 0},
+        .ipv4_address = kernel_status.ipv4_address,
+        .subnet_mask = kernel_status.subnet_mask,
+        .gateway = kernel_status.gateway,
+        .dns_server = kernel_status.dns_server,
+        .received_packets = kernel_status.received_packets,
+        .transmitted_packets = kernel_status.transmitted_packets,
+        .dropped_packets = kernel_status.dropped_packets,
+    };
+    if (!paging_copy_to_user(
+            current_user_space(), regs->rsi,
+            &result, sizeof(result))) {
+        return app_error(APP_STATUS_INVALID_ARGUMENT);
+    }
+    return APP_STATUS_OK;
+}
+
 uint64_t syscall_dispatcher(struct syscall_regs* regs) {
     /*
      * INT 0x80 is an application boundary, not a way to invoke the old raw
@@ -174,12 +222,26 @@ uint64_t syscall_dispatcher(struct syscall_regs* regs) {
             return dispatch_time_get(regs);
         case APP_SYSCALL_ARGUMENT_GET:
             return dispatch_argument_get(regs);
+        case APP_SYSCALL_NETWORK_STATUS:
+            return dispatch_network_status(regs);
+        case APP_SYSCALL_NETWORK_HTTP_START:
+        case APP_SYSCALL_NETWORK_REQUEST_STATUS:
+        case APP_SYSCALL_NETWORK_REQUEST_READ:
+        case APP_SYSCALL_NETWORK_REQUEST_CANCEL:
+        case APP_SYSCALL_NETWORK_REQUEST_CLOSE:
+            return app_network_services_dispatch(
+                regs->rdi, current_user_space(),
+                scheduler_current_app_process_id(),
+                scheduler_current_app_capabilities(),
+                regs->rsi, regs->rdx, regs->rcx,
+                regs->r8, regs->r9);
 
         case APP_SYSCALL_FILE_OPEN:
         case APP_SYSCALL_FILE_READ:
         case APP_SYSCALL_FILE_WRITE:
         case APP_SYSCALL_FILE_CLOSE:
         case APP_SYSCALL_FILE_REPLACE:
+        case APP_SYSCALL_FILE_CREATE_EXCLUSIVE:
         case APP_SYSCALL_WINDOW_CREATE:
         case APP_SYSCALL_WINDOW_PRESENT:
         case APP_SYSCALL_WINDOW_CLOSE:

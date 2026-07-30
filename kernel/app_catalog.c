@@ -103,11 +103,25 @@ static const struct app_manifest AI_ASSISTANT_MANIFEST = {
     .abi_version = NOSTALUX_APP_ABI_VERSION,
     .capabilities = APP_CAPABILITY_LOG | APP_CAPABILITY_TIME |
                     APP_CAPABILITY_INPUT | APP_CAPABILITY_WINDOW |
-                    APP_CAPABILITY_MEMORY,
+                    APP_CAPABILITY_MEMORY | APP_CAPABILITY_NETWORK,
     .id = "ai-assistant",
     .display_name = "AI Assistant",
     .executable = "ai-assistant.elf",
     .description = "Truthful offline intent helper in an isolated process",
+};
+
+static const struct app_manifest BROWSER_MANIFEST = {
+    .manifest_version = NOSTALUX_APP_MANIFEST_VERSION,
+    .abi_version = NOSTALUX_APP_ABI_VERSION,
+    .capabilities = APP_CAPABILITY_LOG | APP_CAPABILITY_TIME |
+                    APP_CAPABILITY_FILE_READ |
+                    APP_CAPABILITY_FILE_WRITE | APP_CAPABILITY_INPUT |
+                    APP_CAPABILITY_WINDOW | APP_CAPABILITY_MEMORY |
+                    APP_CAPABILITY_NETWORK,
+    .id = "browser",
+    .display_name = "Browser",
+    .executable = "browser.elf",
+    .description = "Asynchronous HTTP and file viewer in an isolated process",
 };
 
 static bool strings_equal_bounded(const char* first,
@@ -234,6 +248,14 @@ enum app_catalog_result app_catalog_install_ai_assistant(
         &AI_ASSISTANT_MANIFEST, image, image_size, out_index);
 }
 
+enum app_catalog_result app_catalog_install_browser(
+    const void* image,
+    size_t image_size,
+    size_t* out_index) {
+    return app_catalog_install(
+        &BROWSER_MANIFEST, image, image_size, out_index);
+}
+
 #ifndef NOSTALUX_HOST_TEST
 extern const uint8_t nostalux_hello_app_start[];
 extern const uint8_t nostalux_hello_app_end[];
@@ -253,6 +275,8 @@ extern const uint8_t nostalux_image_viewer_app_start[];
 extern const uint8_t nostalux_image_viewer_app_end[];
 extern const uint8_t nostalux_ai_assistant_app_start[];
 extern const uint8_t nostalux_ai_assistant_app_end[];
+extern const uint8_t nostalux_browser_app_start[];
+extern const uint8_t nostalux_browser_app_end[];
 
 static bool embedded_size(const uint8_t* start, const uint8_t* end,
                           size_t* size) {
@@ -420,6 +444,7 @@ enum app_catalog_result app_catalog_initialize_embedded(void) {
     size_t notepad_size;
     size_t image_viewer_size;
     size_t ai_assistant_size;
+    size_t browser_size;
     app_catalog_reset();
     if (!embedded_size(nostalux_hello_app_start,
                        nostalux_hello_app_end, &hello_size) ||
@@ -440,7 +465,10 @@ enum app_catalog_result app_catalog_initialize_embedded(void) {
                        &image_viewer_size) ||
         !embedded_size(nostalux_ai_assistant_app_start,
                        nostalux_ai_assistant_app_end,
-                       &ai_assistant_size)) {
+                       &ai_assistant_size) ||
+        !embedded_size(nostalux_browser_app_start,
+                       nostalux_browser_app_end,
+                       &browser_size)) {
         return APP_CATALOG_EMBEDDED_IMAGE_UNAVAILABLE;
     }
     enum app_catalog_result result =
@@ -477,6 +505,10 @@ enum app_catalog_result app_catalog_initialize_embedded(void) {
     if (result == APP_CATALOG_OK) {
         result = app_catalog_install_ai_assistant(
             nostalux_ai_assistant_app_start, ai_assistant_size, NULL);
+    }
+    if (result == APP_CATALOG_OK) {
+        result = app_catalog_install_browser(
+            nostalux_browser_app_start, browser_size, NULL);
     }
     if (result != APP_CATALOG_OK) {
         app_catalog_reset();

@@ -32,6 +32,13 @@
  *   MEMORY_UNMAP    (user_address, byte_count)
  *   ARGUMENT_GET     (buffer, capacity) -> startup-argument byte count
  *   FILE_REPLACE     (path, path_length, bytes, length) -> byte count
+ *   NETWORK_STATUS   (out_status, out_size)
+ *   NETWORK_HTTP_START (request, request_size) -> request handle
+ *   NETWORK_REQUEST_STATUS (handle, out_status, out_size)
+ *   NETWORK_REQUEST_READ (handle, buffer, length, offset) -> byte count
+ *   NETWORK_REQUEST_CANCEL (handle)
+ *   NETWORK_REQUEST_CLOSE (handle)
+ *   FILE_CREATE_EXCLUSIVE (path, path_length, bytes, length) -> byte count
  *
  * Ring-3 apps reach this ABI through the checked INT 0x80 gate. All pointers
  * are user virtual addresses and are copied through the current process page
@@ -56,6 +63,17 @@ enum app_syscall_id {
     APP_SYSCALL_MEMORY_UNMAP,
     APP_SYSCALL_ARGUMENT_GET,
     APP_SYSCALL_FILE_REPLACE,
+    APP_SYSCALL_NETWORK_STATUS,
+    APP_SYSCALL_NETWORK_HTTP_START,
+    APP_SYSCALL_NETWORK_REQUEST_STATUS,
+    APP_SYSCALL_NETWORK_REQUEST_READ,
+    APP_SYSCALL_NETWORK_REQUEST_CANCEL,
+    APP_SYSCALL_NETWORK_REQUEST_CLOSE,
+    /*
+     * Append-only ABI: keep every existing syscall number stable.
+     * Creates a new file only when the path is still absent.
+     */
+    APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
 };
 
 enum app_status {
@@ -68,6 +86,7 @@ enum app_status {
     APP_STATUS_IO_ERROR = -6,
     APP_STATUS_WOULD_BLOCK = -7,
     APP_STATUS_BAD_HANDLE = -8,
+    APP_STATUS_ALREADY_EXISTS = -9,
 };
 
 enum app_file_open_flags {
@@ -109,7 +128,11 @@ enum app_pointer_button {
 #define APP_WINDOW_MIN_HEIGHT      48u
 #define APP_WINDOW_MAX_WIDTH       480u
 #define APP_WINDOW_MAX_HEIGHT      360u
-#define APP_STARTUP_ARGUMENT_MAX   31u
+#define APP_STARTUP_ARGUMENT_MAX   255u
+#define APP_NETWORK_URL_MAX        511u
+#define APP_NETWORK_RESPONSE_MAX   8191u
+#define APP_NETWORK_TRANSFER_MAX   4096u
+#define APP_NETWORK_REDIRECT_MAX   5u
 
 struct app_abi_info {
     uint32_t abi_version;
@@ -123,6 +146,84 @@ struct app_time {
     uint8_t minute;
     uint8_t second;
     uint8_t reserved[5];
+};
+
+enum app_network_flags {
+    APP_NETWORK_DEVICE_PRESENT = 1u << 0,
+    APP_NETWORK_DEVICE_READY   = 1u << 1,
+    APP_NETWORK_LINK_UP        = 1u << 2,
+    APP_NETWORK_CONFIGURED     = 1u << 3,
+    APP_NETWORK_DHCP_ACTIVE    = 1u << 4,
+};
+
+struct app_network_status {
+    uint32_t flags;
+    uint8_t mac[6];
+    uint8_t reserved[2];
+    /* Canonical IPv4 values: a.b.c.d is a<<24 | b<<16 | c<<8 | d. */
+    uint32_t ipv4_address;
+    uint32_t subnet_mask;
+    uint32_t gateway;
+    uint32_t dns_server;
+    uint64_t received_packets;
+    uint64_t transmitted_packets;
+    uint64_t dropped_packets;
+};
+
+enum app_network_http_flags {
+    APP_NETWORK_HTTP_FOLLOW_REDIRECTS = 1u << 0,
+};
+
+enum app_network_request_state {
+    APP_NETWORK_REQUEST_WAITING = 0,
+    APP_NETWORK_REQUEST_CONFIGURING,
+    APP_NETWORK_REQUEST_RESOLVING,
+    APP_NETWORK_REQUEST_CONNECTING,
+    APP_NETWORK_REQUEST_SENDING,
+    APP_NETWORK_REQUEST_RECEIVING,
+    APP_NETWORK_REQUEST_REDIRECTING,
+    APP_NETWORK_REQUEST_COMPLETE,
+    APP_NETWORK_REQUEST_FAILED,
+    APP_NETWORK_REQUEST_CANCELED,
+};
+
+enum app_network_request_error {
+    APP_NETWORK_ERROR_NONE = 0,
+    APP_NETWORK_ERROR_NOT_READY,
+    APP_NETWORK_ERROR_LINK_DOWN,
+    APP_NETWORK_ERROR_BUSY,
+    APP_NETWORK_ERROR_INVALID_URL,
+    APP_NETWORK_ERROR_TIMEOUT,
+    APP_NETWORK_ERROR_DNS,
+    APP_NETWORK_ERROR_CONNECTION,
+    APP_NETWORK_ERROR_PROTOCOL,
+    APP_NETWORK_ERROR_RESPONSE_TOO_LARGE,
+    APP_NETWORK_ERROR_UNSUPPORTED,
+    APP_NETWORK_ERROR_IO,
+    APP_NETWORK_ERROR_CANCELED,
+};
+
+enum app_network_request_status_flags {
+    APP_NETWORK_STATUS_TOTAL_KNOWN = 1u << 0,
+};
+
+struct app_network_http_request {
+    const char* url;
+    size_t url_length;
+    size_t response_capacity;
+    uint32_t flags;
+    uint32_t timeout_milliseconds;
+};
+
+struct app_network_request_status {
+    uint32_t state;
+    uint32_t error;
+    uint32_t http_status;
+    uint32_t redirect_count;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t received_bytes;
+    uint64_t total_bytes;
 };
 
 struct app_window_create {
@@ -207,6 +308,44 @@ static inline uint64_t app_argument_get(char* buffer, size_t capacity) {
         (uint64_t)capacity);
 }
 
+static inline uint64_t app_network_status_get(
+    struct app_network_status* status) {
+    return app_syscall2(
+        APP_SYSCALL_NETWORK_STATUS,
+        (uint64_t)(uintptr_t)status, sizeof(*status));
+}
+
+static inline uint64_t app_network_http_start(
+    const struct app_network_http_request* request) {
+    return app_syscall2(
+        APP_SYSCALL_NETWORK_HTTP_START,
+        (uint64_t)(uintptr_t)request, sizeof(*request));
+}
+
+static inline uint64_t app_network_request_status_get(
+    uint64_t handle, struct app_network_request_status* status) {
+    return app_syscall5(
+        APP_SYSCALL_NETWORK_REQUEST_STATUS, handle,
+        (uint64_t)(uintptr_t)status, sizeof(*status), 0, 0);
+}
+
+static inline uint64_t app_network_request_read(
+    uint64_t handle, void* buffer, size_t length, size_t offset) {
+    return app_syscall5(
+        APP_SYSCALL_NETWORK_REQUEST_READ, handle,
+        (uint64_t)(uintptr_t)buffer, length, offset, 0);
+}
+
+static inline uint64_t app_network_request_cancel(uint64_t handle) {
+    return app_syscall2(
+        APP_SYSCALL_NETWORK_REQUEST_CANCEL, handle, 0);
+}
+
+static inline uint64_t app_network_request_close(uint64_t handle) {
+    return app_syscall2(
+        APP_SYSCALL_NETWORK_REQUEST_CLOSE, handle, 0);
+}
+
 static inline uint64_t app_file_open(const char* path,
                                      size_t path_length,
                                      uint32_t flags) {
@@ -235,6 +374,15 @@ static inline uint64_t app_file_replace(
     const void* bytes, size_t length) {
     return app_syscall5(
         APP_SYSCALL_FILE_REPLACE,
+        (uint64_t)(uintptr_t)path, (uint64_t)path_length,
+        (uint64_t)(uintptr_t)bytes, (uint64_t)length, 0);
+}
+
+static inline uint64_t app_file_create_exclusive(
+    const char* path, size_t path_length,
+    const void* bytes, size_t length) {
+    return app_syscall5(
+        APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
         (uint64_t)(uintptr_t)path, (uint64_t)path_length,
         (uint64_t)(uintptr_t)bytes, (uint64_t)length, 0);
 }

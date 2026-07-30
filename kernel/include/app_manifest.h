@@ -21,12 +21,14 @@ enum app_capability {
     APP_CAPABILITY_INPUT      = 1ull << 4,
     APP_CAPABILITY_WINDOW     = 1ull << 5,
     APP_CAPABILITY_MEMORY     = 1ull << 6,
+    APP_CAPABILITY_NETWORK    = 1ull << 7,
 };
 
 #define APP_CAPABILITY_ALL \
     (APP_CAPABILITY_LOG | APP_CAPABILITY_TIME | APP_CAPABILITY_FILE_READ | \
      APP_CAPABILITY_FILE_WRITE | APP_CAPABILITY_INPUT | \
-     APP_CAPABILITY_WINDOW | APP_CAPABILITY_MEMORY)
+     APP_CAPABILITY_WINDOW | APP_CAPABILITY_MEMORY | \
+     APP_CAPABILITY_NETWORK)
 
 /*
  * This fixed-width representation can be populated by a future filesystem

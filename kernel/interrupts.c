@@ -11,6 +11,7 @@
 #include "mouse.h"
 #include "scheduler.h"
 #include "user_return.h"
+#include "irq_registry.h"
 
 extern void isr_syscall(void);
 
@@ -36,7 +37,26 @@ static struct idt_entry g_idt[256];
 #define PIC2_COMMAND 0xA0
 #define PIC2_DATA    0xA1
 #define PIC_EOI      0x20
+#define PIC_READ_ISR 0x0B
 #define INTERRUPT_CLD() __asm__ volatile("cld" ::: "cc")
+
+static struct irq_registry g_irq_registry;
+static bool g_interrupts_ready;
+
+static uint64_t interrupt_save_and_disable(void) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli"
+                     : "=r"(flags)
+                     :
+                     : "memory");
+    return flags;
+}
+
+static void interrupt_restore(uint64_t flags) {
+    if ((flags & (1ull << 9)) != 0u) {
+        __asm__ volatile("sti" ::: "memory");
+    }
+}
 
 static void normalize_user_interrupt_return(
     struct user_return_frame* frame) {
@@ -79,11 +99,64 @@ static void pic_remap_and_mask(void) {
 }
 
 void interrupts_enable_irq(uint8_t irq) {
-    uint16_t port;
-    uint8_t value;
-    if (irq < 8) { port = PIC1_DATA; } else { port = PIC2_DATA; irq -= 8; }
-    value = inb(port) & ~(1 << irq);
-    outb(port, value);
+    if (irq >= IRQ_REGISTRY_LINE_COUNT) return;
+    const uint64_t flags = interrupt_save_and_disable();
+    if (irq < 8u) {
+        outb(PIC1_DATA,
+             (uint8_t)(inb(PIC1_DATA) & ~(uint8_t)(1u << irq)));
+    } else {
+        const uint8_t slave_irq = (uint8_t)(irq - 8u);
+        outb(PIC2_DATA,
+             (uint8_t)(inb(PIC2_DATA) &
+                       ~(uint8_t)(1u << slave_irq)));
+        /* A slave line is unreachable while the master's cascade is masked. */
+        outb(PIC1_DATA,
+             (uint8_t)(inb(PIC1_DATA) & ~(uint8_t)(1u << 2)));
+    }
+    interrupt_restore(flags);
+}
+
+void interrupts_disable_irq(uint8_t irq) {
+    if (irq >= IRQ_REGISTRY_LINE_COUNT || irq == 2u) return;
+    const uint64_t flags = interrupt_save_and_disable();
+    if (irq < 8u) {
+        outb(PIC1_DATA,
+             (uint8_t)(inb(PIC1_DATA) | (uint8_t)(1u << irq)));
+    } else {
+        const uint8_t slave_irq = (uint8_t)(irq - 8u);
+        outb(PIC2_DATA,
+             (uint8_t)(inb(PIC2_DATA) |
+                       (uint8_t)(1u << slave_irq)));
+    }
+    interrupt_restore(flags);
+}
+
+bool interrupts_register_irq(uint8_t irq,
+                             irq_registry_handler_t handler,
+                             void* context) {
+    if (!g_interrupts_ready || irq >= IRQ_REGISTRY_LINE_COUNT ||
+        irq == 2u || handler == NULL) {
+        return false;
+    }
+    const uint64_t flags = interrupt_save_and_disable();
+    const bool registered =
+        irq_registry_register(&g_irq_registry, irq, handler, context);
+    interrupt_restore(flags);
+    return registered;
+}
+
+bool interrupts_unregister_irq(uint8_t irq,
+                               irq_registry_handler_t handler,
+                               void* context) {
+    if (!g_interrupts_ready || irq >= IRQ_REGISTRY_LINE_COUNT ||
+        irq == 2u || handler == NULL) {
+        return false;
+    }
+    const uint64_t flags = interrupt_save_and_disable();
+    const bool removed =
+        irq_registry_unregister(&g_irq_registry, irq, handler, context);
+    interrupt_restore(flags);
+    return removed;
 }
 
 static const char* const EXCEPTION_NAMES[] = {
@@ -201,25 +274,65 @@ DECLARE_NOERR_HANDLER(18); DECLARE_NOERR_HANDLER(19); DECLARE_NOERR_HANDLER(20);
 DECLARE_NOERR_HANDLER(23); DECLARE_NOERR_HANDLER(24); DECLARE_NOERR_HANDLER(25); DECLARE_NOERR_HANDLER(26); DECLARE_NOERR_HANDLER(27);
 DECLARE_NOERR_HANDLER(28); DECLARE_ERR_HANDLER(29); DECLARE_ERR_HANDLER(30); DECLARE_NOERR_HANDLER(31);
 
-__attribute__((interrupt)) static void handler_irq_master(struct user_return_frame* frame) {
+static uint16_t pic_read_in_service(void) {
+    outb(PIC1_COMMAND, PIC_READ_ISR);
+    outb(PIC2_COMMAND, PIC_READ_ISR);
+    return (uint16_t)inb(PIC1_COMMAND) |
+           ((uint16_t)inb(PIC2_COMMAND) << 8);
+}
+
+static bool pic_irq_is_spurious(uint8_t irq) {
+    if (irq != 7u && irq != 15u) return false;
+    return (pic_read_in_service() & (uint16_t)(1u << irq)) == 0u;
+}
+
+static void pic_acknowledge_irq(uint8_t irq) {
+    if (irq >= 8u) outb(PIC2_COMMAND, PIC_EOI);
+    outb(PIC1_COMMAND, PIC_EOI);
+}
+
+static void handle_registered_irq(struct user_return_frame* frame,
+                                  uint8_t irq) {
     INTERRUPT_CLD();
     normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
-    outb(PIC1_COMMAND, PIC_EOI);
+
+    if (pic_irq_is_spurious(irq)) {
+        /*
+         * A spurious IRQ7 has no in-service bit and needs no EOI. A spurious
+         * IRQ15 still entered through the master's cascade, so acknowledge
+         * only that master IRQ2 in-service state.
+         */
+        if (irq == 15u) outb(PIC1_COMMAND, PIC_EOI);
+        return;
+    }
+
+    (void)irq_registry_dispatch(&g_irq_registry, irq);
+    pic_acknowledge_irq(irq);
 }
-__attribute__((interrupt)) static void handler_irq_slave(struct user_return_frame* frame) {
-    INTERRUPT_CLD();
-    normalize_user_interrupt_return(frame);
-    timer_interrupt_entry();
-    outb(PIC2_COMMAND, PIC_EOI);
-    outb(PIC1_COMMAND, PIC_EOI);
-}
+
+#define DECLARE_IRQ_HANDLER(num) \
+    __attribute__((interrupt)) static void handler_irq_##num( \
+        struct user_return_frame* frame) { \
+        handle_registered_irq(frame, (uint8_t)(num)); \
+    }
+
+DECLARE_IRQ_HANDLER(0);  DECLARE_IRQ_HANDLER(1);
+DECLARE_IRQ_HANDLER(2);  DECLARE_IRQ_HANDLER(3);
+DECLARE_IRQ_HANDLER(4);  DECLARE_IRQ_HANDLER(5);
+DECLARE_IRQ_HANDLER(6);  DECLARE_IRQ_HANDLER(7);
+DECLARE_IRQ_HANDLER(8);  DECLARE_IRQ_HANDLER(9);
+DECLARE_IRQ_HANDLER(10); DECLARE_IRQ_HANDLER(11);
+DECLARE_IRQ_HANDLER(12); DECLARE_IRQ_HANDLER(13);
+DECLARE_IRQ_HANDLER(14); DECLARE_IRQ_HANDLER(15);
+
 __attribute__((interrupt)) static void handler_irq_keyboard(struct user_return_frame* frame) {
     INTERRUPT_CLD();
     normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     uint8_t scancode = inb(0x60);
-    outb(PIC1_COMMAND, PIC_EOI);
+    (void)irq_registry_dispatch(&g_irq_registry, 1);
+    pic_acknowledge_irq(1);
     keyboard_push_byte(scancode);
 }
 __attribute__((interrupt)) static void handler_irq_timer(struct user_return_frame* frame) {
@@ -231,7 +344,8 @@ __attribute__((interrupt)) static void handler_irq_timer(struct user_return_fram
      * A suspended timer handler must never retain the PIC in-service bit.
      * Acknowledge IRQ0 before a user quantum is allowed to switch tasks.
      */
-    outb(PIC1_COMMAND, PIC_EOI);
+    (void)irq_registry_dispatch(&g_irq_registry, 0);
+    pic_acknowledge_irq(0);
     scheduler_timer_tick();
 }
 __attribute__((interrupt)) static void handler_irq_mouse(struct user_return_frame* frame) {
@@ -239,8 +353,8 @@ __attribute__((interrupt)) static void handler_irq_mouse(struct user_return_fram
     normalize_user_interrupt_return(frame);
     timer_interrupt_entry();
     mouse_handle_interrupt();
-    outb(PIC2_COMMAND, PIC_EOI);
-    outb(PIC1_COMMAND, PIC_EOI);
+    (void)irq_registry_dispatch(&g_irq_registry, 12);
+    pic_acknowledge_irq(12);
 }
 
 static void idt_set_gate(uint8_t vector, void* handler) {
@@ -266,6 +380,8 @@ static void idt_set_gate_with_ist(uint8_t vector, void* handler, uint8_t ist) {
 }
 
 void interrupts_init(void) {
+    g_interrupts_ready = false;
+    irq_registry_init(&g_irq_registry);
     pic_remap_and_mask();
 
     idt_set_gate(0, handler_0); idt_set_gate(1, handler_1); idt_set_gate(2, handler_2); idt_set_gate(3, handler_3);
@@ -278,8 +394,22 @@ void interrupts_init(void) {
     idt_set_gate(25, handler_25); idt_set_gate(26, handler_26); idt_set_gate(27, handler_27); idt_set_gate(28, handler_28);
     idt_set_gate(29, handler_29); idt_set_gate(30, handler_30); idt_set_gate(31, handler_31);
 
-    for (uint8_t vector = 0x20; vector < 0x28; vector++) { idt_set_gate(vector, handler_irq_master); }
-    for (uint8_t vector = 0x28; vector < 0x30; vector++) { idt_set_gate(vector, handler_irq_slave); }
+    idt_set_gate(0x20, handler_irq_0);
+    idt_set_gate(0x21, handler_irq_1);
+    idt_set_gate(0x22, handler_irq_2);
+    idt_set_gate(0x23, handler_irq_3);
+    idt_set_gate(0x24, handler_irq_4);
+    idt_set_gate(0x25, handler_irq_5);
+    idt_set_gate(0x26, handler_irq_6);
+    idt_set_gate(0x27, handler_irq_7);
+    idt_set_gate(0x28, handler_irq_8);
+    idt_set_gate(0x29, handler_irq_9);
+    idt_set_gate(0x2A, handler_irq_10);
+    idt_set_gate(0x2B, handler_irq_11);
+    idt_set_gate(0x2C, handler_irq_12);
+    idt_set_gate(0x2D, handler_irq_13);
+    idt_set_gate(0x2E, handler_irq_14);
+    idt_set_gate(0x2F, handler_irq_15);
 
     idt_set_gate(0x20, handler_irq_timer);
     idt_set_gate(0x21, handler_irq_keyboard);
@@ -296,5 +426,6 @@ void interrupts_init(void) {
     }
 
     __asm__ volatile("lidt %0" : : "m"(descriptor));
+    g_interrupts_ready = true;
     syslog_write("Interrupts initialized (checked Apps INT 0x80 enabled)");
 }

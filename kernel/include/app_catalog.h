@@ -72,6 +72,10 @@ enum app_catalog_result app_catalog_install_ai_assistant(
     const void* image,
     size_t image_size,
     size_t* out_index);
+enum app_catalog_result app_catalog_install_browser(
+    const void* image,
+    size_t image_size,
+    size_t* out_index);
 
 /*
  * Resets the catalog, validates the ELFs embedded by the build, and registers

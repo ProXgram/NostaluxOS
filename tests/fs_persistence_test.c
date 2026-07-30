@@ -1351,6 +1351,7 @@ static void test_system_managed_files_require_trusted_apis(void) {
     assert(fs_name_is_system_managed("hello.elf"));
     assert(fs_name_is_system_managed("rflags-probe.elf"));
     assert(fs_name_is_system_managed("stack-probe.elf"));
+    assert(fs_name_is_system_managed("browser.elf"));
     assert(fs_name_is_system_managed("system-apps.db"));
     assert(!fs_name_is_system_managed("hello.backup"));
     assert(!fs_name_is_system_managed(NULL));

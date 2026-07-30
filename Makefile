@@ -92,15 +92,20 @@ AI_ASSISTANT_APP_OBJ := $(APP_BUILD_DIR)/ai-assistant.o
 AI_ASSISTANT_APP_LINKED := $(APP_BUILD_DIR)/ai-assistant.unstripped.elf
 AI_ASSISTANT_APP_ELF := $(APP_BUILD_DIR)/ai-assistant.elf
 AI_ASSISTANT_APP_BLOB_OBJ := $(APP_BUILD_DIR)/ai_assistant_blob.o
+BROWSER_APP_OBJ := $(APP_BUILD_DIR)/browser.o
+BROWSER_APP_LINKED := $(APP_BUILD_DIR)/browser.unstripped.elf
+BROWSER_APP_ELF := $(APP_BUILD_DIR)/browser.elf
+BROWSER_APP_BLOB_OBJ := $(APP_BUILD_DIR)/browser_blob.o
 DESKTOP_APP_ELFS := $(CALCULATOR_APP_ELF) $(NOTEPAD_APP_ELF) \
-	$(IMAGE_VIEWER_APP_ELF) $(AI_ASSISTANT_APP_ELF)
+	$(IMAGE_VIEWER_APP_ELF) $(AI_ASSISTANT_APP_ELF) \
+	$(BROWSER_APP_ELF)
 APP_ELFS := $(HELLO_APP_ELF) $(FAULT_APP_ELF) $(HANG_APP_ELF) \
 	$(RFLAGS_APP_ELF) $(STACK_APP_ELF) $(DESKTOP_APP_ELFS)
 KERNEL_EXTRA_OBJS := $(HELLO_APP_BLOB_OBJ) $(FAULT_APP_BLOB_OBJ) \
 	$(HANG_APP_BLOB_OBJ) $(RFLAGS_APP_BLOB_OBJ) \
 	$(STACK_APP_BLOB_OBJ) $(CALCULATOR_APP_BLOB_OBJ) \
 	$(NOTEPAD_APP_BLOB_OBJ) $(IMAGE_VIEWER_APP_BLOB_OBJ) \
-	$(AI_ASSISTANT_APP_BLOB_OBJ)
+	$(AI_ASSISTANT_APP_BLOB_OBJ) $(BROWSER_APP_BLOB_OBJ)
 
 APP_CFLAGS := -std=gnu11 -Os -ffreestanding -fno-builtin \
 	-fno-stack-protector -fcf-protection=none -fno-pic -fno-pie \
@@ -139,6 +144,11 @@ QEMU_SMOKE_ARGS ?= $(QEMU_ACCEL)
 QEMU_AUDIO_LINUX ?= -machine pcspk-audiodev=snd0 -audiodev pa,id=snd0
 QEMU_AUDIO_NATIVE ?= -machine pcspk-audiodev=snd0 -audiodev dsound,id=snd0
 QEMU_AUDIO_HEADLESS ?= -machine pcspk-audiodev=snd0 -audiodev none,id=snd0
+# Nostalux Networking v1 targets the simple RTL8139 device and QEMU's
+# unprivileged user-mode backend. Override this with `-nic none` for an
+# intentionally offline guest or with a TAP-backed RTL8139 for a LAN test.
+QEMU_NETWORK ?= -netdev user,id=nostaluxnet,ipv6=off \
+	-device rtl8139,netdev=nostaluxnet
 # GTK keeps Windows physical X/Y motion in one frontend path, hides the host
 # pointer, and preserves a 1:1 guest framebuffer scale. Hover grab also keeps
 # keyboard focus with the guest while the pointer is over the display.
@@ -163,6 +173,7 @@ define RUN_QEMU
 		if command -v "$(QEMU)" >/dev/null 2>&1; then \
 			echo "Running headless with $(QEMU)"; \
 			"$(QEMU)" $(QEMU_ACCEL) $(QEMU_DISPLAY_HEADLESS) $(QEMU_AUDIO_HEADLESS) \
+				$(QEMU_NETWORK) \
 				-drive format=raw,file=$(OS_IMAGE); \
 			exit $$?; \
 		fi; \
@@ -192,6 +203,7 @@ define RUN_QEMU
 	if [ -n "$$native_qemu" ] && [ -x "$$native_qemu" ]; then \
 		echo "Running with native Windows QEMU: $$native_qemu"; \
 		"$$native_qemu" $(QEMU_ACCEL) $(1) $(QEMU_AUDIO_NATIVE) \
+			$(QEMU_NETWORK) \
 			-drive format=raw,file=$(OS_IMAGE); \
 		exit $$?; \
 	fi; \
@@ -202,6 +214,7 @@ define RUN_QEMU
 			echo "Native Windows QEMU not found; using $(QEMU)."; \
 		fi; \
 		"$(QEMU)" $(QEMU_ACCEL) $(1) $(QEMU_AUDIO_LINUX) \
+			$(QEMU_NETWORK) \
 			-drive format=raw,file=$(OS_IMAGE); \
 		exit $$?; \
 	fi; \
@@ -210,10 +223,11 @@ define RUN_QEMU
 endef
 
 .PHONY: all apps clean test test-apps-v1 test-app-catalog-reclaim \
-	test-app-services \
+	test-app-services test-app-network-services \
 	test-app-behavior test-bmp \
 	test-terminal-capture test-shell-capture test-fs-persistence \
 	test-memory-accounting test-user-return test-vmmouse-decode \
+	test-pci test-irq-registry test-rtl8139 test-net test-tcp-http \
 	run run-windowed \
 	run-fullscreen test-qemu-smoke qemu-smoke check-conflicts \
 	check-target-tools
@@ -252,9 +266,11 @@ check-target-tools:
 	esac
 
 test: test-apps-v1 test-app-catalog-reclaim test-app-services \
+	test-app-network-services \
 	test-app-behavior test-bmp \
 	test-terminal-capture test-shell-capture test-fs-persistence \
-	test-memory-accounting test-user-return test-vmmouse-decode
+	test-memory-accounting test-user-return test-vmmouse-decode \
+	test-pci test-irq-registry test-rtl8139 test-net test-tcp-http
 
 test-apps-v1: check-target-tools $(APP_ELFS) | $(BUILD_DIR)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror \
@@ -281,6 +297,12 @@ test-app-services: | $(BUILD_DIR)
 		kernel/app_manifest.c \
 		-o $(BUILD_DIR)/app_services_test
 	$(BUILD_DIR)/app_services_test
+
+test-app-network-services: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/app_network_services_test.c kernel/app_network_services.c \
+		-o $(BUILD_DIR)/app_network_services_test
+	$(BUILD_DIR)/app_network_services_test
 
 test-app-behavior: | $(BUILD_DIR)
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror \
@@ -328,6 +350,34 @@ test-vmmouse-decode: | $(BUILD_DIR)
 		tests/vmmouse_decode_test.c kernel/vmmouse_decode.c \
 		-o $(BUILD_DIR)/vmmouse_decode_test
 	$(BUILD_DIR)/vmmouse_decode_test
+
+test-pci: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/pci_test.c kernel/pci.c -o $(BUILD_DIR)/pci_test
+	$(BUILD_DIR)/pci_test
+
+test-irq-registry: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/irq_registry_test.c kernel/irq_registry.c \
+		-o $(BUILD_DIR)/irq_registry_test
+	$(BUILD_DIR)/irq_registry_test
+
+test-rtl8139: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/rtl8139_test.c kernel/rtl8139.c kernel/pci.c \
+		-o $(BUILD_DIR)/rtl8139_test
+	$(BUILD_DIR)/rtl8139_test
+
+test-net: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/net_test.c kernel/net.c -o $(BUILD_DIR)/net_test
+	$(BUILD_DIR)/net_test
+
+test-tcp-http: | $(BUILD_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include \
+		tests/tcp_http_test.c kernel/tcp_client.c kernel/http_client.c \
+		-o $(BUILD_DIR)/tcp_http_test
+	$(BUILD_DIR)/tcp_http_test
 
 # This target intentionally has no build-artifact prerequisites: it must never
 # rebuild or write the user's primary disk image. Run `make` first when the
@@ -448,6 +498,10 @@ $(AI_ASSISTANT_APP_OBJ): apps/ai_assistant.c apps/app_ui.h \
 		kernel/include/app_abi.h Makefile | $(APP_BUILD_DIR)
 	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
 
+$(BROWSER_APP_OBJ): apps/browser.c apps/app_ui.h \
+		kernel/include/app_abi.h Makefile | $(APP_BUILD_DIR)
+	$(TARGET_CC) $(APP_CFLAGS) -c $< -o $@
+
 $(CALCULATOR_APP_LINKED): $(CALCULATOR_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
 	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
 		-T apps/hello.ld -o $@ $(CALCULATOR_APP_OBJ)
@@ -464,6 +518,10 @@ $(AI_ASSISTANT_APP_LINKED): $(AI_ASSISTANT_APP_OBJ) apps/hello.ld | $(APP_BUILD_
 	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
 		-T apps/hello.ld -o $@ $(AI_ASSISTANT_APP_OBJ)
 
+$(BROWSER_APP_LINKED): $(BROWSER_APP_OBJ) apps/hello.ld | $(APP_BUILD_DIR)
+	$(TARGET_LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+		-T apps/hello.ld -o $@ $(BROWSER_APP_OBJ)
+
 $(CALCULATOR_APP_ELF): $(CALCULATOR_APP_LINKED) | $(APP_BUILD_DIR)
 	$(TARGET_OBJCOPY) --strip-all $< $@
 
@@ -474,6 +532,9 @@ $(IMAGE_VIEWER_APP_ELF): $(IMAGE_VIEWER_APP_LINKED) | $(APP_BUILD_DIR)
 	$(TARGET_OBJCOPY) --strip-all $< $@
 
 $(AI_ASSISTANT_APP_ELF): $(AI_ASSISTANT_APP_LINKED) | $(APP_BUILD_DIR)
+	$(TARGET_OBJCOPY) --strip-all $< $@
+
+$(BROWSER_APP_ELF): $(BROWSER_APP_LINKED) | $(APP_BUILD_DIR)
 	$(TARGET_OBJCOPY) --strip-all $< $@
 
 $(CALCULATOR_APP_BLOB_OBJ): apps/calculator_blob.asm \
@@ -491,6 +552,10 @@ $(IMAGE_VIEWER_APP_BLOB_OBJ): apps/image_viewer_blob.asm \
 $(AI_ASSISTANT_APP_BLOB_OBJ): apps/ai_assistant_blob.asm \
 		$(AI_ASSISTANT_APP_ELF) | $(APP_BUILD_DIR)
 	$(NASM) -f elf64 apps/ai_assistant_blob.asm -o $@
+
+$(BROWSER_APP_BLOB_OBJ): apps/browser_blob.asm \
+		$(BROWSER_APP_ELF) | $(APP_BUILD_DIR)
+	$(NASM) -f elf64 apps/browser_blob.asm -o $@
 
 $(KERNEL_ELF): kernel/entry.asm $(KERNEL_OBJS) $(KERNEL_EXTRA_OBJS) \
 		kernel/linker.ld | $(BUILD_DIR)

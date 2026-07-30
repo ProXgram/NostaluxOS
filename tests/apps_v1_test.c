@@ -264,6 +264,57 @@ static void test_abi_contract(void) {
     assert(app_abi_required_capability(APP_SYSCALL_FILE_CLOSE) == 0);
     assert(app_abi_required_capability(APP_SYSCALL_MEMORY_MAP) ==
            APP_CAPABILITY_MEMORY);
+    assert(app_abi_required_capability(APP_SYSCALL_NETWORK_STATUS) ==
+           APP_CAPABILITY_NETWORK);
+    assert(strcmp(app_abi_syscall_name(APP_SYSCALL_NETWORK_STATUS),
+                  "network_status") == 0);
+    assert(app_abi_syscall_known(APP_SYSCALL_NETWORK_HTTP_START));
+    assert(app_abi_syscall_known(APP_SYSCALL_NETWORK_REQUEST_STATUS));
+    assert(app_abi_syscall_known(APP_SYSCALL_NETWORK_REQUEST_READ));
+    assert(app_abi_syscall_known(APP_SYSCALL_NETWORK_REQUEST_CANCEL));
+    assert(app_abi_syscall_known(APP_SYSCALL_NETWORK_REQUEST_CLOSE));
+    assert(app_abi_syscall_known(
+        APP_SYSCALL_FILE_CREATE_EXCLUSIVE));
+    assert(!app_abi_syscall_known(
+        APP_SYSCALL_FILE_CREATE_EXCLUSIVE + 1u));
+    assert(app_abi_required_capability(
+               APP_SYSCALL_NETWORK_HTTP_START) ==
+           APP_CAPABILITY_NETWORK);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_NETWORK_REQUEST_STATUS) ==
+           APP_CAPABILITY_NETWORK);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_NETWORK_REQUEST_READ) ==
+           APP_CAPABILITY_NETWORK);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_NETWORK_REQUEST_CANCEL) ==
+           APP_CAPABILITY_NETWORK);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_NETWORK_REQUEST_CLOSE) ==
+           APP_CAPABILITY_NETWORK);
+    assert(strcmp(
+               app_abi_syscall_name(APP_SYSCALL_NETWORK_HTTP_START),
+               "network_http_start") == 0);
+    assert(strcmp(
+               app_abi_syscall_name(APP_SYSCALL_NETWORK_REQUEST_STATUS),
+               "network_request_status") == 0);
+    assert(strcmp(
+               app_abi_syscall_name(APP_SYSCALL_NETWORK_REQUEST_READ),
+               "network_request_read") == 0);
+    assert(strcmp(
+               app_abi_syscall_name(APP_SYSCALL_NETWORK_REQUEST_CANCEL),
+               "network_request_cancel") == 0);
+    assert(strcmp(
+               app_abi_syscall_name(APP_SYSCALL_NETWORK_REQUEST_CLOSE),
+               "network_request_close") == 0);
+    assert(app_abi_required_capability(
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE) ==
+           APP_CAPABILITY_FILE_WRITE);
+    assert(strcmp(
+               app_abi_syscall_name(APP_SYSCALL_FILE_CREATE_EXCLUSIVE),
+               "file_create_exclusive") == 0);
+    assert(APP_SYSCALL_NETWORK_REQUEST_CLOSE == 0x1016u);
+    assert(APP_SYSCALL_FILE_CREATE_EXCLUSIVE == 0x1017u);
     assert(app_abi_required_capability(UINT64_MAX) == UINT64_MAX);
     assert(strcmp(app_abi_syscall_name(APP_SYSCALL_WINDOW_CREATE),
                   "window_create") == 0);
@@ -278,12 +329,21 @@ static void test_abi_contract(void) {
                   "file_replace") == 0);
     assert(APP_FILE_PATH_MAX == 31u);
     assert(APP_FILE_TRANSFER_MAX >= 4096u);
+    assert(APP_STARTUP_ARGUMENT_MAX == 255u);
+    assert(APP_NETWORK_URL_MAX == 511u);
+    assert(APP_NETWORK_RESPONSE_MAX == 8191u);
+    assert(APP_NETWORK_TRANSFER_MAX == 4096u);
+    assert(APP_NETWORK_REDIRECT_MAX == 5u);
     assert(APP_WINDOW_MIN_WIDTH <= APP_WINDOW_MAX_WIDTH);
     assert(APP_WINDOW_MIN_HEIGHT <= APP_WINDOW_MAX_HEIGHT);
+    assert(sizeof(struct app_network_http_request) == 32u);
+    assert(sizeof(struct app_network_request_status) == 40u);
     assert(sizeof(struct app_window_create) == 24u);
     assert(sizeof(struct app_window_present) == 32u);
     assert(sizeof(struct app_input_event) == 24u);
     assert((int64_t)(uint64_t)(int64_t)APP_STATUS_BAD_HANDLE < 0);
+    assert(APP_STATUS_BAD_HANDLE == -8);
+    assert(APP_STATUS_ALREADY_EXISTS == -9);
 }
 
 static void test_process_metadata(void) {
@@ -312,11 +372,25 @@ static void test_process_metadata(void) {
     assert(strcmp(process.app_id, "test-app") == 0);
     assert(process.entry_point == plan.entry_point);
     char startup_argument[APP_STARTUP_ARGUMENT_MAX + 1u];
+    char maximum_argument[APP_STARTUP_ARGUMENT_MAX + 1u];
+    char overlong_argument[APP_STARTUP_ARGUMENT_MAX + 2u];
     size_t startup_length = 0;
+    memset(maximum_argument, 'a', APP_STARTUP_ARGUMENT_MAX);
+    maximum_argument[APP_STARTUP_ARGUMENT_MAX] = '\0';
+    memset(overlong_argument, 'b', APP_STARTUP_ARGUMENT_MAX + 1u);
+    overlong_argument[APP_STARTUP_ARGUMENT_MAX + 1u] = '\0';
     assert(app_process_set_startup_argument(
-               process_id,
-               "argument-that-is-deliberately-too-long") ==
+               process_id, overlong_argument) ==
            APP_PROCESS_INVALID_ARGUMENT);
+    assert(app_process_set_startup_argument(
+               process_id, maximum_argument) == APP_PROCESS_OK);
+    assert(app_process_get_startup_argument(
+        process_id, startup_argument, sizeof(startup_argument),
+        &startup_length));
+    assert(startup_length == APP_STARTUP_ARGUMENT_MAX);
+    assert(memcmp(
+               startup_argument, maximum_argument,
+               APP_STARTUP_ARGUMENT_MAX + 1u) == 0);
     assert(app_process_set_startup_argument(
                process_id, "notes.txt") == APP_PROCESS_OK);
     assert(app_process_get_startup_argument(
@@ -526,6 +600,17 @@ static void test_catalog_app_elf(
     struct elf64_image_plan plan;
     assert(elf64_inspect(image, (size_t)file_length, &plan) ==
            ELF64_LOAD_OK);
+    if (strcmp(expected_id, "browser") == 0) {
+        bool writable_data = false;
+        for (size_t index = 0; index < plan.segment_count; index++) {
+            const uint32_t flags = plan.segments[index].flags;
+            if ((flags & ELF64_SEGMENT_WRITE) == 0) continue;
+            assert((flags & ELF64_SEGMENT_READ) != 0);
+            assert((flags & ELF64_SEGMENT_EXECUTE) == 0);
+            writable_data = true;
+        }
+        assert(writable_data);
+    }
     uint8_t* loaded = (uint8_t*)malloc(plan.image_span);
     assert(loaded != NULL);
     assert(elf64_load_contiguous(
@@ -553,7 +638,7 @@ int main(int argc, char** argv) {
     test_manifest_registry();
     test_abi_contract();
     test_process_metadata();
-    if (argc == 10) {
+    if (argc == 11) {
         test_toolchain_elf(argv[1]);
         test_fault_probe_elf(argv[2]);
         test_hang_probe_elf(argv[3]);
@@ -585,7 +670,15 @@ int main(int argc, char** argv) {
             "ai-assistant", "ai-assistant.elf",
             APP_CAPABILITY_LOG | APP_CAPABILITY_TIME |
                 APP_CAPABILITY_INPUT | APP_CAPABILITY_WINDOW |
-                APP_CAPABILITY_MEMORY);
+                APP_CAPABILITY_MEMORY | APP_CAPABILITY_NETWORK);
+        test_catalog_app_elf(
+            argv[10], app_catalog_install_browser,
+            "browser", "browser.elf",
+            APP_CAPABILITY_LOG | APP_CAPABILITY_TIME |
+                APP_CAPABILITY_FILE_READ |
+                APP_CAPABILITY_FILE_WRITE | APP_CAPABILITY_INPUT |
+                APP_CAPABILITY_WINDOW | APP_CAPABILITY_MEMORY |
+                APP_CAPABILITY_NETWORK);
     } else {
         assert(argc == 1);
     }

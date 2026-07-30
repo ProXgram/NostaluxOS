@@ -25,6 +25,10 @@ static uint64_t g_rejected_user_address;
 static MouseState g_mouse;
 static char g_key;
 
+void app_network_services_release_process(uint64_t process_id) {
+    (void)process_id;
+}
+
 static uint64_t status_value(enum app_status status) {
     return (uint64_t)(int64_t)status;
 }
@@ -347,6 +351,63 @@ static void test_file_services(void) {
     assert(file->data[0] == 'R' &&
            file->data[sizeof(replacement) - 1u] == 'R');
 
+    const char exclusive_path[] = "download.txt";
+    const char exclusive_contents[] = "first";
+    assert(call_service(
+               &space, process_id, 0,
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
+               (uint64_t)(uintptr_t)exclusive_path,
+               strlen(exclusive_path),
+               (uint64_t)(uintptr_t)exclusive_contents,
+               sizeof(exclusive_contents) - 1u) ==
+           status_value(APP_STATUS_PERMISSION_DENIED));
+    assert(fs_find(exclusive_path) == NULL);
+    g_rejected_user_address =
+        (uint64_t)(uintptr_t)exclusive_contents;
+    assert(call_service(
+               &space, process_id, read_write,
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
+               (uint64_t)(uintptr_t)exclusive_path,
+               strlen(exclusive_path),
+               (uint64_t)(uintptr_t)exclusive_contents,
+               sizeof(exclusive_contents) - 1u) ==
+           status_value(APP_STATUS_INVALID_ARGUMENT));
+    assert(fs_find(exclusive_path) == NULL);
+    g_rejected_user_address = 0;
+    assert(call_service(
+               &space, process_id, read_write,
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
+               (uint64_t)(uintptr_t)exclusive_path,
+               strlen(exclusive_path),
+               (uint64_t)(uintptr_t)exclusive_contents,
+               sizeof(exclusive_contents) - 1u) ==
+           sizeof(exclusive_contents) - 1u);
+    const struct fs_file* exclusive_file =
+        fs_find(exclusive_path);
+    assert(exclusive_file != NULL &&
+           exclusive_file->size ==
+               sizeof(exclusive_contents) - 1u &&
+           memcmp(
+               exclusive_file->data, exclusive_contents,
+               sizeof(exclusive_contents) - 1u) == 0);
+
+    const char overwrite_attempt[] = "second";
+    assert(call_service(
+               &space, process_id + 1u, read_write,
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
+               (uint64_t)(uintptr_t)exclusive_path,
+               strlen(exclusive_path),
+               (uint64_t)(uintptr_t)overwrite_attempt,
+               sizeof(overwrite_attempt) - 1u) ==
+           status_value(APP_STATUS_ALREADY_EXISTS));
+    exclusive_file = fs_find(exclusive_path);
+    assert(exclusive_file != NULL &&
+           exclusive_file->size ==
+               sizeof(exclusive_contents) - 1u &&
+           memcmp(
+               exclusive_file->data, exclusive_contents,
+               sizeof(exclusive_contents) - 1u) == 0);
+
     assert(call_service(
                &space, process_id + 1u, read_write,
                APP_SYSCALL_FILE_READ, handle,
@@ -382,6 +443,18 @@ static void test_file_services(void) {
     assert(call_service(
                &space, process_id, read_write,
                APP_SYSCALL_FILE_REPLACE,
+               (uint64_t)(uintptr_t)"system.log",
+               strlen("system.log"), 0, 0) ==
+           status_value(APP_STATUS_PERMISSION_DENIED));
+    assert(call_service(
+               &space, process_id, read_write,
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
+               (uint64_t)(uintptr_t)"calculator.elf",
+               strlen("calculator.elf"), 0, 0) ==
+           status_value(APP_STATUS_PERMISSION_DENIED));
+    assert(call_service(
+               &space, process_id, read_write,
+               APP_SYSCALL_FILE_CREATE_EXCLUSIVE,
                (uint64_t)(uintptr_t)"system.log",
                strlen("system.log"), 0, 0) ==
            status_value(APP_STATUS_PERMISSION_DENIED));

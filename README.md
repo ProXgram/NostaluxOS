@@ -10,7 +10,7 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
 - **VBE framebuffer console** — the loader selects an 800x600, 32-bit VBE mode. The text console and desktop are
   rendered into that linear framebuffer; this is not a VGA text-mode interface.
 - **Interactive shell** — `help` lists commands for system information, colors, history, arithmetic, files, a
-  non-destructive 64 KB memory sample, games, sound, reboot, shutdown, and launching the GUI.
+  non-destructive 64 KB memory sample, games, sound, networking, reboot, shutdown, and launching the GUI.
 - **Truthful flat filesystem** — `ls`, `cat`, `hexdump`, `touch`, `write`, `append`, and `rm` normally operate on a
   persistent ATA-backed filesystem stored inside the raw disk image. Missing, unreadable, or corrupt storage mounts
   an explicitly labeled volatile session volume; corrupt media is preserved without automatic formatting.
@@ -18,13 +18,22 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
   Notepad, Calculator, settings, monitors, games, and other retro desktop apps.
 - **Writable desktop apps** — Files creates, opens, renames, and deletes files. Notepad edits and saves text files,
   including insertion at a clicked cursor position, while Paint saves its 17x17 canvas as a real 24-bit BMP that
-  Image Viewer can reopen. Files, Settings, Browser, About, and the shell identify whether storage is persistent or
+  Image Viewer can reopen. Files, Settings, About, and the shell identify whether storage is persistent or
   session-only.
 - **Shell-backed GUI Terminal** — desktop terminal commands go through the same dispatcher and handlers as the boot
   shell. Commands that need exclusive console control or would stop the desktop are clearly reported as unavailable.
-- **Local Browser** — Browser opens real text files with `file:<name>` and automatically refreshes `about:files`,
-  `about:system`, and the live read-only `system.log`. It explicitly rejects Internet URLs because there is no network
-  driver or TCP/IP stack.
+- **Isolated Browser with real HTTP** — Browser is a separate ring-3 ELF app. Its process-owned HTTP requests run
+  asynchronously, follow at most five validated redirects, decode bounded chunked responses, report phase/byte
+  progress, support cancellation, and save exact decoded response bodies. Interactive Save atomically creates the
+  next unused `download[-N].txt` name. Explicit `--download` mode replaces `download.txt`, reopens it, and verifies every byte
+  before reporting success. It converts basic HTML to readable text, opens real files with `file:<name>`, and refreshes
+  `about:system` and the virtual read-only `file:system.log` every second. HTTPS is rejected honestly because TLS is
+  not implemented yet.
+- **Networking v2** — PCI discovery and an interrupt-driven RTL8139 driver with a polling fallback provide Ethernet,
+  ARP, IPv4, ICMP echo, UDP, DHCP, a bounded TTL-aware DNS cache, TCP, and bounded HTTP/1.1 GET requests with explicit
+  connection closure. `net`, `dhcp`, `dns`, `ping`, and `http` expose the real connection from the shell. Packet
+  parsing and completion work stay outside interrupt context. The stack is intentionally small: it supports IPv4,
+  one active high-level operation, and one TCP connection at a time.
 - **Kernel-backed diagnostics** — System Monitor graphs measured CPU busy-versus-idle time and distinguishes
   normalized usable RAM from the captured BIOS E820 map, currently mapped RAM, fixed reservations, and committed heap
   memory. Task Manager enumerates only genuine scheduler tasks and isolated app processes instead of presenting
@@ -35,18 +44,18 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
   renders valid uncompressed 24-bit BMP files. A small `nostalux.bmp` is installed automatically as a working example;
   BMPs can contain up to 8,191 bytes when enough shared extent records are free.
 - **AI Assistant** — a small offline, rule-based ELF app answers questions about real NostaluxOS features and reads
-  the actual RTC for time requests. It is deterministic rather than a trained model or network service, and it does
-  not pretend to perform actions it cannot perform.
+  the actual RTC and live network status through capability-checked system calls. It is deterministic rather than a
+  trained model or network service, and it does not pretend to perform actions it cannot perform.
 - **Isolated Apps v1** — a strict x86-64 ELF loader validates fixed-address executables, rejects writable code, and
   maps each process into its own ring-3 address space with a guarded NX stack. The checked `INT 0x80` ABI provides
-  capability-gated file handles and atomic file replacement, retained windows, queued keyboard/pointer input, dynamic
-  memory mappings, startup arguments, logging, time, yield, and exit. Every interrupt and system-call return sanitizes
-  user flags and safely converts malformed user instruction/stack state into a contained ring-3 fault, so app crashes
-  terminate only that process.
-- **Separate desktop applications** — Calculator, Notepad, Image Viewer, and AI Assistant are independently built ELF
-  executables packaged inside the read-only OS image. The kernel reinspects their immutable ELF bytes on every launch,
-  so app packages consume no records in the small user filesystem. Notepad atomically replaces its selected file when
-  saving.
+  capability-gated file handles, atomic file replacement and create-if-absent, retained windows, queued
+  keyboard/pointer input, dynamic memory mappings, startup arguments, logging, time, yield, and exit. Every interrupt
+  and system-call return sanitizes user flags and safely converts malformed user instruction/stack state into a
+  contained ring-3 fault, so app crashes terminate only that process.
+- **Separate desktop applications** — Calculator, Notepad, Image Viewer, AI Assistant, and Browser are independently
+  built ELF executables packaged inside the read-only OS image. Their linker layout page-separates executable code
+  from writable, NX data. The kernel reinspects their immutable ELF bytes on every launch, so app packages consume no
+  records in the small user filesystem. Notepad atomically replaces its selected file when saving.
 - **Real app launcher and isolation probes** — `apps` lists validated manifests and bounded process history;
   `app hello` runs the embedded sample, while `app fault-probe` deliberately touches supervisor-only memory to prove
   that the page fault is contained and the shell keeps running. `app hang-probe` sets the direction flag and spins
@@ -54,7 +63,7 @@ two-stage BIOS loader, enters long mode, and runs a freestanding kernel with a g
   `rflags-probe` and `stack-probe` are integration diagnostics for hostile interrupt-return flags and stack pointers.
   The hello sample also runs once during boot.
 
-The four migrated desktop apps use retained app windows that can be focused, closed, dragged within the desktop work
+The five migrated desktop apps use retained app windows that can be focused, closed, dragged within the desktop work
 area, and hidden or restored with Show Desktop. Their compositor is intentionally small: these windows do not yet
 share the kernel desktop's z-order, minimize, maximize, resize, or taskbar-tab implementation; isolated-app windows
 form a separate overlay capped at eight windows total and two per process. Kernel tasks still yield cooperatively,
@@ -126,11 +135,13 @@ Run all host-side validation tests with:
 make test
 ```
 
-The suite covers strict ELF and manifest validation, bounded process-history reuse, capability and ownership checks
-for the app services, retained-window event routing, app-service dynamic-memory mapping limits and ownership,
-Calculator/Notepad/AI behavior, BMP parsing, legacy app-package reclamation, terminal and shell capture, malformed
-filesystem extents, commit rollback and persistence reloads, protected reserved package names, VMMouse coordinate
-decoding, live log projection, normalized user-return frames, and normalized 64-bit E820 memory accounting.
+The suite covers strict W^X ELF and manifest validation, bounded process-history reuse, capability and ownership
+checks for ordinary and asynchronous network app services, retained-window event routing, app-service dynamic-memory
+mapping limits and ownership, Calculator/Notepad/AI/Browser behavior, BMP parsing, legacy app-package reclamation,
+terminal and shell capture, malformed filesystem extents, commit rollback and persistence reloads, protected reserved
+package names, VMMouse coordinate decoding, live log projection, normalized user-return frames, normalized 64-bit
+E820 memory accounting, PCI/BAR discovery, shared IRQ routing, RTL8139 interrupt deferral/DMA/polling fallback,
+Ethernet/ARP/IPv4/ICMP/UDP/DHCP/DNS-cache behavior, and blocking/asynchronous TCP plus HTTP state handling.
 
 The QEMU integration test is separate because QEMU is an optional dependency:
 
@@ -143,14 +154,17 @@ make test-qemu-smoke
 that image is missing or stale. The harness takes a shared image lock only while making a byte-for-byte disposable
 copy, marks that copy read-only, and also enables QEMU snapshot writes. Through QEMU's control monitor, it verifies
 that the CPU reaches a CS64/CPL0 halt in the fixed kernel address region, checks that a nonuniform framebuffer of at
-least 640x480 contains rendered output, types `app hang-probe`, and observes the probe executing in ring 3 with a
-SysV-aligned entry stack plus scrubbed general, x87/MMX, and SSE registers. It then proves timer preemption, verifies
-that an app setting the hostile NT flag survives both a system call and repeated interrupt returns, and verifies that
-a noncanonical app stack becomes a contained user fault rather than a kernel panic. Finally, it launches a fresh
-probe to prove the shell still makes progress. Kernel/app sidecar ELFs are not consulted, so a concurrent compiler
-cannot mismatch their metadata with the locked image copy. QEMU is stopped and the entire temporary directory is
-discarded. The test never interrupts an interactive guest; if the primary image is already locked, it exits with an
-explanation.
+least 640x480 contains rendered output, and exercises the app-isolation probes. Those probes verify a SysV-aligned
+ring-3 entry stack, scrubbed registers, timer preemption, safe hostile-flag returns, containment of a noncanonical app
+stack, and recovery into a fresh process. The harness then waits for DHCP and confirms that the RTL8139 IRQ handler
+actually delivered an interrupt, pings QEMU's virtual gateway, and runs a shell HTTP request. Finally, two isolated
+Browser processes contact a temporary host server in sequence. Each must accept an informational response, normalize
+a relative redirect containing `..` without collapsing a repeated slash, decode a chunked body, replace and
+byte-verify `download.txt`, and report the expected body length and FNV-1a digest. Each process deliberately leaves its
+completed request handle for mandatory process-exit cleanup; the next process must acquire the single request slot.
+Kernel/app sidecar ELFs are not consulted, so a concurrent compiler cannot mismatch their metadata with the locked
+image copy. QEMU is stopped, the temporary HTTP server is closed, and the entire temporary directory is discarded.
+The test never interrupts an interactive guest; if the primary image is already locked, it exits with an explanation.
 
 The default hard timeout is 30 seconds. Slow ARM64 software emulation can use a larger bound:
 
@@ -170,7 +184,7 @@ restarts and normal `make` rebuilds.
 
 At boot, NostaluxOS formats storage only when both filesystem slots are completely blank. Corrupt or partially
 readable storage is never overwritten automatically: the OS mounts a volatile recovery volume and labels it in
-Files, Settings, Browser, `sysinfo`, and About. The on-disk self-test verifies write, rename, and removal by reloading
+Files, Settings, `sysinfo`, and About. The on-disk self-test verifies write, rename, and removal by reloading
 sectors after each operation.
 
 Filesystem v5 stores each logical file as one or more 1,024-byte extent records, for a maximum payload of 8,191 bytes
@@ -229,6 +243,10 @@ On x86-64 WSL, the launcher first looks for `qemu-system-x86_64.exe` on `PATH` a
 directories. If found, it uses the native Windows GTK frontend; otherwise it falls back to Linux
 `qemu-system-x86_64`.
 
+Normal runs attach an RTL8139 device to QEMU's unprivileged user-mode IPv4 network. Nostalux requests its address,
+gateway, and DNS server with DHCP; no administrator access, TAP adapter, or host network reconfiguration is required.
+The guest can reach services allowed by the host's current network connection.
+
 The normal GTK window shows the complete 800x600 guest framebuffer at a 1:1 scale. On QEMU, NostaluxOS uses the
 VMware-compatible VMMouse protocol for absolute host/guest coordinates, so diagonal movement is delivered as one
 coherent position rather than separate horizontal and vertical steps. Other machines fall back to relative PS/2
@@ -272,17 +290,27 @@ the audio flags or select the silent backend:
 make QEMU_AUDIO_LINUX='-machine pcspk-audiodev=snd0 -audiodev none,id=snd0' run
 ```
 
+To boot intentionally without a network adapter, override the default network flags:
+
+```sh
+make QEMU_NETWORK='-nic none' run
+```
+
 ## Using NostaluxOS
 
 QEMU displays the boot banner and then the `nostalux>` shell prompt. Type `help` for the current command list and
 `gui` to launch the desktop.
 
 Use `apps` to inspect the separate ELF catalog and recent process outcomes. `app hello` exercises the implemented
-Apps v1 calls and exits normally. `app fault-probe` intentionally causes a user-mode page fault; the command should
-report that the process was isolated and then return to the prompt. `app hang-probe` intentionally never yields;
-the shell should return after a short bounded launch period. Run `apps`, note the probe's process ID, and stop it with
-`appkill <process-id>`. `app rflags-probe` and `app stack-probe` are destructive-to-their-own-process diagnostics
-used by the QEMU integration test; they cannot modify another process or the kernel.
+Apps v1 calls and exits normally. `app <id> [startup-argument]` can pass one bounded argument, for example a URL to
+Browser. The graphical form is `app browser http://host/path`; if its window cannot be created, it cancels the request
+and does not save a file. For an intentional non-window download, use
+`app browser --download http://host/path`. That explicit mode replaces `download.txt`, then reopens and compares the
+saved bytes before it exits successfully. `app fault-probe` intentionally causes a user-mode page fault; the command
+should report that the process was isolated and then return to the prompt. `app hang-probe` intentionally never
+yields; the shell should return after a short bounded launch period. Run `apps`, note the probe's process ID, and stop
+it with `appkill <process-id>`. `app rflags-probe` and `app stack-probe` are destructive-to-their-own-process
+diagnostics used by the QEMU integration test; they cannot modify another process or the kernel.
 
 Open **AI Assistant** from the welcome window, desktop icon, Start menu, or Run dialog (`ai` or `assistant`). `Esc`
 closes AI Assistant while it has keyboard focus. Choose **Exit Desktop** from Start to return to the shell, or press
@@ -296,9 +324,19 @@ Notepad process is editing it. Reserved app-package filenames cannot be changed 
 service operations. The Files footer reports whether changes are persistent or session-only; `system.log` opens as a
 live read-only Browser page.
 
-Browser is a local document viewer rather than a web browser. Try `about:home`, `about:files`, `about:system`,
-`file:system.log`, or `file:readme.txt`. Dynamic pages refresh every second and can also be reloaded immediately with
-**Refresh**. Internet addresses remain unsupported and are rejected with an explanation.
+Use `net` at the shell to see the link, DHCP address, gateway, DNS server, and packet counters. `dhcp` renews the
+lease, `dns <hostname>` resolves an IPv4 address, `ping <hostname-or-ip>` sends an ICMP echo, and
+`http http://host/path` performs a bounded cleartext GET.
+
+Browser supports `http://` in addition to its local pages. Try `about:home`, `about:files`, `about:system`,
+`file:system.log`, `file:readme.txt`, or a cleartext HTTP address. `about:files` directs file management to the Files
+app; the genuinely dynamic `about:system` and `file:system.log` pages refresh every second and **Go** reloads any
+address immediately. **Stop** cancels an active transfer; after completion, **Save** atomically creates the first
+unused name among `download.txt`, `download-1.txt`, and so on. The explicit shell `--download` mode instead
+replaces and verifies `download.txt`. The renderer extracts readable text rather than implementing full HTML, CSS, or
+JavaScript.
+`https://` remains unsupported until Nostalux has secure entropy, trusted time, certificate-chain and hostname
+validation, and a reviewed TLS implementation.
 
 ## Cleaning
 

@@ -22,11 +22,13 @@
 #include "ata.h"    
 #include "banner.h"
 #include "gui_demo.h" // Includes the GUI entry point
+#include "heap.h"
 #include "rtc.h"
 #include "scheduler.h"
 #include "app_catalog.h"
 #include "app_process.h"
 #include "app_runtime.h"
+#include "network.h"
 
 struct shell_command {
     const char* name;
@@ -74,6 +76,11 @@ static void command_appkill(const char* args);
 static void command_banner(const char* args);
 static void command_gui(const char* args);
 static void command_palette(const char* args);
+static void command_net(const char* args);
+static void command_dhcp(const char* args);
+static void command_dns(const char* args);
+static void command_ping(const char* args);
+static void command_http(const char* args);
 
 static const struct shell_command COMMANDS[] = {
     {"help", command_help, "Show this help message", 0},
@@ -82,7 +89,7 @@ static const struct shell_command COMMANDS[] = {
     {"banner", command_banner, "Show moving banner screensaver", SHELL_COMMAND_CONSOLE_ONLY},
     {"gui", command_gui, "Launch graphical desktop", SHELL_COMMAND_CONSOLE_ONLY},
     {"apps", command_apps, "List separate ELF applications and process history", 0},
-    {"app", command_app, "Run an ELF app (for example 'app hello')", 0},
+    {"app", command_app, "Run an ELF app with an optional startup argument", 0},
     {"appkill", command_appkill, "Stop a running ELF app by process ID", 0},
     {"time", command_time, "Show current RTC time", 0},
     {"uptime", command_uptime, "Show time since boot", 0},
@@ -91,6 +98,11 @@ static const struct shell_command COMMANDS[] = {
     {"foreground", command_foreground, "Set text color", SHELL_COMMAND_CONSOLE_ONLY},
     {"background", command_background, "Set background color", SHELL_COMMAND_CONSOLE_ONLY},
     {"palette", command_palette, "Preview IBM PC color swatches", 0},
+    {"net", command_net, "Show real network link and IP status", 0},
+    {"dhcp", command_dhcp, "Request a fresh DHCP configuration", 0},
+    {"dns", command_dns, "Resolve a hostname (e.g. 'dns example.com')", 0},
+    {"ping", command_ping, "Send an ICMP echo request", 0},
+    {"http", command_http, "Fetch a cleartext HTTP URL", 0},
     {"ls", command_ls, "List filesystem files and sizes", 0},
     {"cat", command_cat, "Print a file's text content", 0},
     {"hexdump", command_hexdump, "View file content in hex", 0},
@@ -260,6 +272,153 @@ static void command_palette(const char* args) {
         terminal_setcolors(old_fg, old_bg);
         kprintf(" %2u - %s\n", i, COLOR_NAMES[i]);
     }
+}
+
+static void command_net(const char* args) {
+    if (*kskip_spaces(args) != '\0') {
+        kprintf("Usage: net\n");
+        return;
+    }
+    network_poll();
+    struct network_status status;
+    network_get_status(&status);
+    if (!status.device_present) {
+        kprintf("Network: no compatible RTL8139 device detected.\n");
+        return;
+    }
+
+    char mac[18];
+    char address[16];
+    char gateway[16];
+    char dns[16];
+    network_format_mac(status.mac, mac, sizeof(mac));
+    network_format_ipv4(
+        status.ipv4_address, address, sizeof(address));
+    network_format_ipv4(status.gateway, gateway, sizeof(gateway));
+    network_format_ipv4(
+        status.dns_server, dns, sizeof(dns));
+    kprintf("Device: RTL8139 (%s), MAC %s\n",
+            status.device_ready ? "ready" : "not ready", mac);
+    kprintf("Link: %s\n", status.link_up ? "up" : "down");
+    if (status.configured) {
+        kprintf("IPv4: %s  Gateway: %s  DNS: %s\n",
+                address, gateway, dns);
+    } else {
+        kprintf("IPv4: %s\n",
+                status.dhcp_in_progress
+                    ? "DHCP configuration in progress"
+                    : "not configured");
+    }
+    kprintf("Packets: RX %llu  TX %llu  dropped %llu\n",
+            (unsigned long long)status.received_packets,
+            (unsigned long long)status.transmitted_packets,
+            (unsigned long long)status.dropped_packets);
+}
+
+static void command_dhcp(const char* args) {
+    if (*kskip_spaces(args) != '\0') {
+        kprintf("Usage: dhcp\n");
+        return;
+    }
+    kprintf("Requesting an IPv4 configuration...\n");
+    enum network_result result = network_renew_dhcp(5000u);
+    if (result != NETWORK_OK) {
+        kprintf("DHCP failed: %s.\n", network_result_text(result));
+        return;
+    }
+    struct network_status status;
+    char address[16];
+    network_get_status(&status);
+    network_format_ipv4(
+        status.ipv4_address, address, sizeof(address));
+    kprintf("DHCP configured IPv4 %s.\n", address);
+    syslog_write("Network: DHCP command completed");
+}
+
+static void command_dns(const char* args) {
+    const char* hostname = kskip_spaces(args);
+    if (*hostname == '\0') {
+        kprintf("Usage: dns <hostname>\n");
+        return;
+    }
+    for (const char* cursor = hostname; *cursor != '\0'; cursor++) {
+        if (*cursor == ' ' || *cursor == '\t') {
+            kprintf("Usage: dns <hostname>\n");
+            return;
+        }
+    }
+
+    uint32_t address = 0;
+    enum network_result result =
+        network_resolve_ipv4(hostname, 4000u, &address);
+    if (result != NETWORK_OK) {
+        kprintf("DNS failed: %s.\n", network_result_text(result));
+        return;
+    }
+    char formatted[16];
+    network_format_ipv4(address, formatted, sizeof(formatted));
+    kprintf("%s resolves to %s.\n", hostname, formatted);
+    syslog_write("Network: DNS command completed");
+}
+
+static void command_ping(const char* args) {
+    const char* host = kskip_spaces(args);
+    if (*host == '\0') {
+        kprintf("Usage: ping <IPv4-or-hostname>\n");
+        return;
+    }
+    for (const char* cursor = host; *cursor != '\0'; cursor++) {
+        if (*cursor == ' ' || *cursor == '\t') {
+            kprintf("Usage: ping <IPv4-or-hostname>\n");
+            return;
+        }
+    }
+
+    uint32_t round_trip = 0;
+    enum network_result result =
+        network_ping(host, 3000u, &round_trip);
+    if (result != NETWORK_OK) {
+        kprintf("Ping failed: %s.\n", network_result_text(result));
+        return;
+    }
+    kprintf("Reply from %s in %u ms.\n", host, round_trip);
+    syslog_write("Network: ICMP echo command completed");
+}
+
+static void command_http(const char* args) {
+    const char* url = kskip_spaces(args);
+    if (*url == '\0') {
+        kprintf("Usage: http <http://URL>\n");
+        return;
+    }
+    for (const char* cursor = url; *cursor != '\0'; cursor++) {
+        if (*cursor == ' ' || *cursor == '\t') {
+            kprintf("Usage: http <http://URL>\n");
+            return;
+        }
+    }
+
+    const size_t capacity = 4096u;
+    char* body = (char*)kmalloc(capacity);
+    if (body == NULL) {
+        kprintf("HTTP failed: no response memory.\n");
+        return;
+    }
+    size_t length = 0;
+    unsigned int status_code = 0;
+    enum network_result result = network_http_get(
+        url, body, capacity, &length, &status_code, 8000u);
+    if (result == NETWORK_OK) {
+        kprintf("HTTP %u (%zu bytes)\n", status_code, length);
+        terminal_write(body, length);
+        if (length == 0 || body[length - 1u] != '\n') {
+            terminal_newline();
+        }
+        syslog_write("Network: HTTP command completed");
+    } else {
+        kprintf("HTTP failed: %s.\n", network_result_text(result));
+    }
+    kfree(body);
 }
 
 static void command_about(const char* args) {
@@ -525,7 +684,7 @@ static void command_apps(const char* args) {
     if (catalog_count == 0) {
         kprintf("  No validated embedded applications are available.\n");
     } else {
-        kprintf("Run one with: app <id>\n");
+        kprintf("Run one with: app <id> [startup-argument]\n");
     }
 
     size_t process_count = app_process_count();
@@ -563,14 +722,18 @@ static void command_app(const char* args) {
         length++;
     }
     app_id[length] = '\0';
-    if (length == 0 ||
-        *kskip_spaces(cursor + length) != '\0') {
-        kprintf("Usage: app <id>\n");
+    if (length == 0) {
+        kprintf("Usage: app <id> [startup-argument]\n");
         return;
     }
 
+    const char* startup_argument =
+        kskip_spaces(cursor + length);
     enum app_runtime_launch_result result =
-        app_runtime_run_catalog_id(app_id);
+        *startup_argument == '\0'
+            ? app_runtime_run_catalog_id(app_id)
+            : app_runtime_run_catalog_id_with_argument(
+                app_id, startup_argument);
     if (result == APP_RUNTIME_LAUNCH_OK) {
         kprintf("App '%s' exited normally.\n", app_id);
     } else if (result == APP_RUNTIME_LAUNCH_APP_FAULTED) {
@@ -762,6 +925,7 @@ static void shell_idle(void) {
      * Kernel tasks still yield cooperatively. Ring-3 apps receive a timer
      * quantum once dispatched, so even a non-yielding app returns here.
      */
+    network_poll();
     schedule();
 }
 

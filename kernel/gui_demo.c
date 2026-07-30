@@ -18,6 +18,7 @@
 #include "app_services.h"
 #include "app_process.h"
 #include "app_runtime.h"
+#include "network.h"
 #include <stdbool.h>
 #include <limits.h>
 
@@ -33,6 +34,7 @@ static void desktop_yield(void) {
      * as adjacent events. Coalescing them into the same 100 Hz desktop frame
      * prevents a visible horizontal-then-vertical staircase.
      */
+    network_poll();
     schedule();
     uint64_t tick = timer_get_ticks();
     while (timer_get_ticks() == tick) {
@@ -176,16 +178,6 @@ typedef struct {
     bool history_truncated;
 } TerminalState;
 typedef struct {
-    char address[64];
-    int address_len;
-    char content[FS_MAX_FILE_SIZE];
-    int content_len;
-    char status[64];
-    int scroll;
-    uint64_t last_refresh_tick;
-    bool address_select_all;
-} BrowserState;
-typedef struct {
     uint64_t selected_pid;
     size_t page_offset;
     char status[48];
@@ -257,7 +249,7 @@ typedef struct {
     int restore_x, restore_y, restore_w, restore_h;
     union { 
         FileManagerState files; SettingsState settings;
-        TerminalState term; BrowserState browser;
+        TerminalState term;
         TaskMgrState taskmgr; PaintState paint; MineState mine;
         SysMonState sysmon; RunState run; TicTacToeState ttt;
         AboutState about;
@@ -290,7 +282,7 @@ static const AppType start_menu_apps[START_MENU_ITEM_COUNT] = {
     APP_SYSMON, APP_RUN, APP_NONE
 };
 static const char* start_menu_labels[START_MENU_ITEM_COUNT] = {
-    "AI Assistant", "Local Browser", "Terminal", "Paint",
+    "AI Assistant", "Browser", "Terminal", "Paint",
     "Files", "Task Manager", "Notepad", "Calculator",
     "Minesweeper", "Tic-Tac-Toe", "Image Viewer",
     "Sys Monitor", "Run...", "Exit Desktop"
@@ -305,13 +297,10 @@ static void handle_paint_click(Window* w, int x, int y);
 static void handle_settings_click(Window* w, int x, int y);
 static void handle_files_click(Window* w, int x, int y);
 static void handle_taskmgr_click(Window* w, int x, int y);
-static void handle_browser_click(Window* w, int x, int y);
 static void handle_terminal_input(Window* w, char c);
-static void handle_browser_input(Window* w, char c);
 static void handle_run_command(Window* w);
 static void handle_minesweeper(Window* w, int rx, int ry, bool right_click);
 static void handle_tictactoe(Window* w, int x, int y);
-static void browser_load(Window* w);
 static void terminal_execute(Window* w);
 static void settings_load(void);
 static bool settings_save(void);
@@ -437,37 +426,6 @@ static void uint64_to_str(uint64_t value, char* buf) {
     buf[out] = 0;
 }
 
-static int wrapped_content_line_count(const char* text, int max_columns) {
-    int lines = 1;
-    int column = 0;
-    if (max_columns < 1) max_columns = 1;
-    for (int i = 0; text && text[i]; i++) {
-        char current = text[i];
-        if (current == '\r') continue;
-        if (current == '\n') {
-            lines++;
-            column = 0;
-            continue;
-        }
-        if (column >= max_columns) {
-            lines++;
-            column = 0;
-        }
-        column++;
-    }
-    return lines;
-}
-
-static bool str_starts_with(const char* text, const char* prefix) {
-    int i = 0;
-    if (!text || !prefix) return false;
-    while (prefix[i]) {
-        if (text[i] != prefix[i]) return false;
-        i++;
-    }
-    return true;
-}
-
 static bool str_ends_with_ci(const char* text, const char* suffix) {
     int text_length = kstrlen_local(text);
     int suffix_length = kstrlen_local(suffix);
@@ -519,13 +477,6 @@ static const char* storage_compact_label(void) {
         default:
             return "not initialized";
     }
-}
-
-static bool browser_address_is_dynamic(const char* address) {
-    return kstrcmp(address, "about:files") == 0 ||
-           kstrcmp(address, "about:system") == 0 ||
-           kstrcmp(address, "system.log") == 0 ||
-           kstrcmp(address, "file:system.log") == 0;
 }
 
 static int file_index_by_name(const char* name) {
@@ -1257,13 +1208,6 @@ static Window* create_window(AppType type, const char* title, int w, int h) {
         str_copy(win->state.settings.status,
                   sizeof(win->state.settings.status),
                   "Change wallpaper or theme.");
-    } else if (type == APP_BROWSER) {
-        win->min_w = 360; win->min_h = 180;
-        str_copy(win->state.browser.address,
-                 sizeof(win->state.browser.address), "about:home");
-        win->state.browser.address_len = kstrlen_local("about:home");
-        win->state.browser.address_select_all = true;
-        browser_load(win);
     } else if (type == APP_TASKMGR) {
         win->min_w = 380; win->min_h = 240;
         win->state.taskmgr.selected_pid = 0;
@@ -1354,30 +1298,10 @@ static bool open_image_file(const char* filename) {
         "image-viewer", filename);
 }
 
-static Window* open_browser_file(const char* filename) {
+static bool open_browser_file(const char* filename) {
     char address[FS_MAX_FILENAME + 6] = "file:";
     str_append(address, sizeof(address), filename);
-
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        Window* existing = windows[i];
-        if (existing && existing->type == APP_BROWSER &&
-            kstrcmp(existing->state.browser.address, address) == 0) {
-            existing->minimized = false;
-            browser_load(existing);
-            int focused_index = focus_window(i);
-            return focused_index >= 0 ? windows[focused_index] : existing;
-        }
-    }
-
-    Window* win = create_window(APP_BROWSER, "Local Browser", 500, 400);
-    if (!win) return NULL;
-    str_copy(win->state.browser.address,
-             sizeof(win->state.browser.address), address);
-    win->state.browser.address_len =
-        kstrlen_local(win->state.browser.address);
-    win->state.browser.address_select_all = false;
-    browser_load(win);
-    return win;
+    return launch_isolated_app_with_argument("browser", address);
 }
 
 static bool launch_isolated_app_with_argument(
@@ -1410,8 +1334,7 @@ static bool launch_app(AppType type) {
         case APP_ASSISTANT:
             return launch_isolated_app("ai-assistant");
         case APP_BROWSER:
-            opened = create_window(APP_BROWSER, "Local Browser", 500, 400);
-            break;
+            return launch_isolated_app("browser");
         case APP_TERMINAL:
             opened = create_window(APP_TERMINAL, "Terminal", 400, 300);
             break;
@@ -1603,163 +1526,6 @@ static void handle_tictactoe(Window* w, int x, int y) {
             }
         }
     }
-}
-
-static void browser_set_content(BrowserState* state, const char* text) {
-    str_copy(state->content, sizeof(state->content), text ? text : "");
-    state->content_len = kstrlen_local(state->content);
-}
-
-static bool browser_append_content(BrowserState* state, const char* text) {
-    bool complete =
-        str_append(state->content, sizeof(state->content), text ? text : "");
-    state->content_len = kstrlen_local(state->content);
-    return complete;
-}
-
-static int browser_max_columns(const Window* w) {
-    int content_width = w->w - 4;
-    int columns = (content_width - 20) / 8;
-    return columns < 1 ? 1 : columns;
-}
-
-static int browser_visible_rows(const Window* w) {
-    int content_height = w->h - WIN_CAPTION_H - 4;
-    int browser_content_height = content_height - 60;
-    int rows = (browser_content_height - 12) / 10;
-    return rows < 1 ? 1 : rows;
-}
-
-static int browser_max_scroll(const Window* w, const BrowserState* state) {
-    int logical_rows =
-        wrapped_content_line_count(state->content, browser_max_columns(w));
-    int visible_rows = browser_visible_rows(w);
-    return logical_rows > visible_rows ? logical_rows - visible_rows : 0;
-}
-
-static void browser_load(Window* w) {
-    BrowserState* state = &w->state.browser;
-    const char* address = state->address;
-    state->scroll = 0;
-    state->content[0] = 0;
-    state->content_len = 0;
-    state->last_refresh_tick = timer_get_ticks();
-
-    if (kstrcmp(address, "about:home") == 0 || address[0] == 0) {
-        browser_set_content(state,
-            "Nostalux Local Browser\n\n"
-            "This browser opens real files from the Nostalux filesystem.\n"
-            "Try file:readme.txt, file:motd.txt, about:files, or about:system.\n"
-            "System, file-index, and system.log pages refresh automatically.\n"
-            "Use Refresh to reload any page immediately.\n"
-            "Internet URLs are rejected because no network driver is installed.");
-        str_copy(state->status, sizeof(state->status), "Built-in home page.");
-        return;
-    }
-
-    if (kstrcmp(address, "about:files") == 0) {
-        browser_set_content(state, "Filesystem files\n\n");
-        browser_append_content(state, "Storage: ");
-        browser_append_content(state, fs_backend_status_text());
-        browser_append_content(state, "\n\n");
-        size_t count = fs_file_count();
-        bool complete = true;
-        for (size_t i = 0; i < count; i++) {
-            const struct fs_file* file = fs_file_at(i);
-            if (!file) continue;
-            int required = 5 + kstrlen_local(file->name) + 1;
-            int remaining = (int)sizeof(state->content) -
-                            kstrlen_local(state->content) - 1;
-            if (remaining < required + 32) {
-                browser_append_content(
-                    state, "[Additional files omitted.]\n");
-                complete = false;
-                break;
-            }
-            browser_append_content(state, "file:");
-            browser_append_content(state, file->name);
-            browser_append_content(state, "\n");
-        }
-        str_copy(state->status, sizeof(state->status),
-                 complete ? "Auto-refreshing filesystem index."
-                          : "Auto-refreshing shortened index.");
-        return;
-    }
-
-    if (kstrcmp(address, "about:system") == 0) {
-        const struct BootInfo* boot = system_boot_info();
-        const struct system_profile* profile = system_profile_info();
-        char number[24];
-        browser_set_content(state, "NostaluxOS system page\n\nResolution: ");
-        int_to_str((int)boot->width, number);
-        browser_append_content(state, number);
-        browser_append_content(state, "x");
-        int_to_str((int)boot->height, number);
-        browser_append_content(state, number);
-        browser_append_content(state, "\nPhysical usable RAM: ");
-        uint64_to_str(profile->memory_total_kb, number);
-        browser_append_content(state, number);
-        browser_append_content(state, " KB\nMapped usable RAM: ");
-        uint64_to_str(profile->memory_mapped_kb, number);
-        browser_append_content(state, number);
-        browser_append_content(state, " KB\nKernel committed RAM: ");
-        uint64_to_str(profile->memory_used_kb, number);
-        browser_append_content(state, number);
-        browser_append_content(state, " KB\n  Reserved low RAM: ");
-        uint64_to_str(profile->memory_reserved_kb, number);
-        browser_append_content(state, number);
-        browser_append_content(state, " KB\n  Heap committed: ");
-        uint64_to_str(profile->memory_heap_committed_kb, number);
-        browser_append_content(state, number);
-        browser_append_content(state, " KB\nUptime: ");
-        uint64_to_str(timer_get_uptime(), number);
-        browser_append_content(state, number);
-        browser_append_content(state, " seconds\nStorage: ");
-        browser_append_content(state, fs_backend_status_text());
-        browser_append_content(state, "\n");
-        str_copy(state->status, sizeof(state->status),
-                 "Auto-refreshing kernel information.");
-        return;
-    }
-
-    if (str_starts_with(address, "http:") ||
-        str_starts_with(address, "https:") ||
-        text_contains_ci(address, "://")) {
-        browser_set_content(state,
-            "Internet access is unavailable.\n\n"
-            "NostaluxOS does not include a network driver or TCP/IP stack yet.\n"
-            "Use file:<name> to open a real filesystem document.");
-        str_copy(state->status, sizeof(state->status), "Network URL rejected honestly.");
-        return;
-    }
-
-    const char* filename = str_starts_with(address, "file:")
-                         ? address + 5 : address;
-    const struct fs_file* file = fs_find(filename);
-    if (!file) {
-        browser_set_content(state, "The requested filesystem file does not exist.");
-        str_copy(state->status, sizeof(state->status), "File not found.");
-        return;
-    }
-    if (!file_is_text(file)) {
-        browser_set_content(state,
-            "This is a binary file.\n\n"
-            "Open BMP images in Image Viewer, or use hexdump in Terminal.");
-        str_copy(state->status, sizeof(state->status), "Binary file identified.");
-        return;
-    }
-
-    size_t length = file->size;
-    if (length >= sizeof(state->content)) length = sizeof(state->content) - 1;
-    for (size_t i = 0; i < length; i++) state->content[i] = file->data[i];
-    state->content[length] = 0;
-    state->content_len = (int)length;
-    char status[64] = "Opened ";
-    char number[24];
-    uint64_to_str(file->size, number);
-    str_append(status, sizeof(status), number);
-    str_append(status, sizeof(status), " filesystem bytes.");
-    str_copy(state->status, sizeof(state->status), status);
 }
 
 static bool filename_is_bmp(const char* name) {
@@ -1984,11 +1750,6 @@ static const struct fs_file* files_selected(Window* w) {
 }
 
 static void retarget_open_file(const char* old_name, const char* new_name) {
-    char old_address[FS_MAX_FILENAME + 6] = "file:";
-    char new_address[FS_MAX_FILENAME + 6] = "file:";
-    str_append(old_address, sizeof(old_address), old_name);
-    str_append(new_address, sizeof(new_address), new_name);
-
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window* open = windows[i];
         if (!open) continue;
@@ -2000,14 +1761,6 @@ static void retarget_open_file(const char* old_name, const char* new_name) {
             str_copy(open->state.paint.status,
                      sizeof(open->state.paint.status),
                      "Backing file was renamed.");
-        } else if (open->type == APP_BROWSER &&
-                   (kstrcmp(open->state.browser.address, old_name) == 0 ||
-                    kstrcmp(open->state.browser.address, old_address) == 0)) {
-            str_copy(open->state.browser.address,
-                     sizeof(open->state.browser.address), new_address);
-            open->state.browser.address_len =
-                kstrlen_local(open->state.browser.address);
-            browser_load(open);
         } else if (open->type == APP_FILES &&
                    kstrcmp(open->state.files.selected_name, old_name) == 0) {
             str_copy(open->state.files.selected_name,
@@ -2019,9 +1772,6 @@ static void retarget_open_file(const char* old_name, const char* new_name) {
 }
 
 static void detach_deleted_file(const char* filename) {
-    char file_address[FS_MAX_FILENAME + 6] = "file:";
-    str_append(file_address, sizeof(file_address), filename);
-
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window* open = windows[i];
         if (!open) continue;
@@ -2036,10 +1786,6 @@ static void detach_deleted_file(const char* filename) {
                      sizeof(open->state.paint.status),
                      was_dirty ? "Deleted externally; edits save as a new BMP."
                                : "Deleted; paint to save as a new BMP.");
-        } else if (open->type == APP_BROWSER &&
-                   (kstrcmp(open->state.browser.address, filename) == 0 ||
-                    kstrcmp(open->state.browser.address, file_address) == 0)) {
-            browser_load(open);
         } else if (open->type == APP_FILES &&
                    kstrcmp(open->state.files.selected_name, filename) == 0) {
             open->state.files.selected_name[0] = 0;
@@ -2079,7 +1825,7 @@ static void files_open_selected(Window* w) {
                      "Opened live read-only system.log.");
         } else {
             str_copy(w->state.files.status, sizeof(w->state.files.status),
-                     "Local Browser could not be opened.");
+                     "Browser could not be opened.");
         }
     } else if (filename_is_bmp(filename)) {
         struct bmp_image image;
@@ -2400,32 +2146,6 @@ static void handle_taskmgr_click(Window* w, int x, int y) {
     }
 }
 
-static void handle_browser_click(Window* w, int x, int y) {
-    int cx = w->x + 2;
-    int cy = w->y + WIN_CAPTION_H + 2;
-    int cw = w->w - 4;
-    int ch = w->h - WIN_CAPTION_H - 4;
-    int button_y = cy + ch - 24;
-    BrowserState* state = &w->state.browser;
-
-    if (rect_contains(cx + 2, cy + 2, cw - 44, 24, x, y)) {
-        state->address_select_all = true;
-        str_copy(state->status, sizeof(state->status),
-                 "Type an address and press Enter.");
-    } else if (rect_contains(cx + cw - 38, cy + 2, 34, 24, x, y)) {
-        state->address_select_all = false;
-        browser_load(w);
-    } else if (rect_contains(cx + 8, button_y, 42, 20, x, y)) {
-        if (state->scroll > 0) state->scroll--;
-    } else if (rect_contains(cx + 56, button_y, 50, 20, x, y)) {
-        int max_scroll = browser_max_scroll(w, state);
-        if (state->scroll < max_scroll) state->scroll++;
-    } else if (rect_contains(cx + 112, button_y, 66, 20, x, y)) {
-        state->address_select_all = false;
-        browser_load(w);
-    }
-}
-
 static void gui_terminal_add_line(TerminalState* state, const char* line) {
     if (state->line_count >= GUI_TERM_LINES) {
         for (int i = 1; i < GUI_TERM_LINES; i++) {
@@ -2629,32 +2349,6 @@ static void handle_terminal_input(Window* w, char c) {
     }
 }
 
-static void handle_browser_input(Window* w, char c) {
-    BrowserState* state = &w->state.browser;
-    if (c == '\b') {
-        if (state->address_select_all) {
-            state->address[0] = 0;
-            state->address_len = 0;
-            state->address_select_all = false;
-        } else if (state->address_len > 0) {
-            state->address[--state->address_len] = 0;
-        }
-    } else if (c == '\n') {
-        state->address_select_all = false;
-        browser_load(w);
-    } else if (c >= 32 && c <= 126) {
-        if (state->address_select_all) {
-            state->address[0] = 0;
-            state->address_len = 0;
-            state->address_select_all = false;
-        }
-        if (state->address_len < (int)sizeof(state->address) - 1) {
-            state->address[state->address_len++] = c;
-            state->address[state->address_len] = 0;
-        }
-    }
-}
-
 static void update_sysmon(Window* w) {
     SysMonState* s = &w->state.sysmon;
     uint64_t now_tick = timer_get_ticks();
@@ -2712,8 +2406,6 @@ static void reconcile_filesystem_windows(const char* files_status) {
             str_copy(w->state.files.status, sizeof(w->state.files.status),
                      files_status ? files_status
                                   : "Refreshed current filesystem listing.");
-        } else if (w->type == APP_BROWSER) {
-            browser_load(w);
         } else if (w->type == APP_PAINT &&
                    !w->state.paint.dirty &&
                    w->state.paint.filename[0]) {
@@ -3124,84 +2816,6 @@ static void render_window(Window* w) {
         } else {
             graphics_draw_string_scaled(gx, gy+185, (s->turn==1)?"Turn: X":"Turn: O", COL_BLACK, COL_WIN_BODY, 1);
         }
-    }
-    else if (w->type == APP_BROWSER) {
-        BrowserState* state = &w->state.browser;
-        uint64_t browser_now = timer_get_ticks();
-        if (browser_address_is_dynamic(state->address) &&
-            browser_now - state->last_refresh_tick >= 100u) {
-            int previous_scroll = state->scroll;
-            browser_load(w);
-            int max_scroll = browser_max_scroll(w, state);
-            if (previous_scroll < 0) previous_scroll = 0;
-            state->scroll =
-                previous_scroll > max_scroll ? max_scroll : previous_scroll;
-        }
-        int field_w = cw - 44;
-        uint32_t field_bg =
-            state->address_select_all ? 0xFF2255AA : COL_WHITE;
-        uint32_t field_fg =
-            state->address_select_all ? COL_WHITE : COL_BLACK;
-        draw_bevel_box(cx + 2, cy + 2, field_w, 24, true);
-        graphics_fill_rect(cx + 4, cy + 4, field_w - 4, 20, field_bg);
-        int address_chars = (field_w - 10) / 8;
-        int address_offset = state->address_len > address_chars
-                           ? state->address_len - address_chars : 0;
-        draw_string_bounded(cx + 7, cy + 9, field_w - 10,
-                            state->address + address_offset,
-                            field_fg, field_bg, 1);
-        if ((timer_get_ticks() / 15) % 2) {
-            int shown = state->address_len - address_offset;
-            graphics_fill_rect(cx + 7 + shown * 8, cy + 8,
-                               2, 11, field_fg);
-        }
-        draw_bevel_box(cx + cw - 38, cy + 2, 34, 24, false);
-        graphics_draw_string_scaled(cx + cw - 31, cy + 9, "GO",
-                                    COL_BLACK, COL_BTN_FACE, 1);
-
-        int content_y = cy + 30;
-        int content_h = ch - 60;
-        draw_bevel_box(cx + 2, content_y, cw - 4, content_h, true);
-        graphics_fill_rect(cx + 4, content_y + 2, cw - 8,
-                           content_h - 4, COL_WHITE);
-        int max_cols = browser_max_columns(w);
-        int visible_rows = browser_visible_rows(w);
-        int row = 0;
-        int column = 0;
-        for (int i = 0; state->content[i]; i++) {
-            char current = state->content[i];
-            if (current == '\r') continue;
-            if (current == '\n') {
-                row++;
-                column = 0;
-                continue;
-            }
-            if (column >= max_cols) {
-                row++;
-                column = 0;
-            }
-            if (row >= state->scroll &&
-                row < state->scroll + visible_rows) {
-                graphics_draw_char(cx + 10 + column * 8,
-                                   content_y + 6 +
-                                       (row - state->scroll) * 10,
-                                   current, COL_BLACK, COL_WHITE);
-            }
-            column++;
-        }
-
-        int button_y = cy + ch - 24;
-        draw_bevel_box(cx + 8, button_y, 42, 20, false);
-        graphics_draw_string_scaled(cx + 17, button_y + 6, "UP",
-                                    COL_BLACK, COL_BTN_FACE, 1);
-        draw_bevel_box(cx + 56, button_y, 50, 20, false);
-        graphics_draw_string_scaled(cx + 63, button_y + 6, "DOWN",
-                                    COL_BLACK, COL_BTN_FACE, 1);
-        draw_bevel_box(cx + 112, button_y, 66, 20, false);
-        graphics_draw_string_scaled(cx + 117, button_y + 6, "REFRESH",
-                                    COL_BLACK, COL_BTN_FACE, 1);
-        draw_string_bounded(cx + 184, button_y + 6, cw - 192,
-                            state->status, 0xFF226622, COL_WIN_BODY, 1);
     }
     else if (w->type == APP_TASKMGR) {
         int rows = taskmgr_visible_rows(w);
@@ -3828,7 +3442,6 @@ static void on_click(int x, int y) {
                 if (w->type == APP_PAINT) handle_paint_click(w, x, y);
                 if (w->type == APP_SETTINGS) handle_settings_click(w, x, y);
                 if (w->type == APP_FILES) handle_files_click(w, x, y);
-                if (w->type == APP_BROWSER) handle_browser_click(w, x, y);
                 if (w->type == APP_TASKMGR) handle_taskmgr_click(w, x, y);
                 if (w->type == APP_MINESWEEPER) handle_minesweeper(w, x, y, false);
                 if (w->type == APP_TICTACTOE) handle_tictactoe(w, x, y);
@@ -3852,7 +3465,7 @@ static void on_click(int x, int y) {
     
     struct { int x, y; const char* n; AppType t; } icons[] = {
         {20, 20, "Terminal", APP_TERMINAL}, {20, 90, "Files", APP_FILES},
-        {20, 160, "Paint", APP_PAINT}, {20, 230, "Local Browser", APP_BROWSER},
+        {20, 160, "Paint", APP_PAINT}, {20, 230, "Browser", APP_BROWSER},
         {20, 300, "Calc", APP_CALC}, {20, 370, "Task Mgr", APP_TASKMGR},
         {20, 440, "Settings", APP_SETTINGS}, {100, 20, "Tic-Tac-Toe", APP_TICTACTOE},
         {100, 90, "ImageView", APP_IMAGEVIEW}, {100, 160, "About", APP_ABOUT},
@@ -3958,7 +3571,6 @@ void gui_demo_run(void) {
                 }
             }
             else if(top->type == APP_TERMINAL) handle_terminal_input(top, c);
-            else if(top->type == APP_BROWSER) handle_browser_input(top, c);
             else if(top->type == APP_RUN) {
                 RunState* r = &top->state.run;
                 if (c == '\n') handle_run_command(top);

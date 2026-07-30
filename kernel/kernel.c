@@ -19,6 +19,7 @@
 #include "app_catalog.h"
 #include "app_process.h"
 #include "app_runtime.h"
+#include "network.h"
 
 #define HEAP_START_ADDR  SYSTEM_RESERVED_LOW_MEMORY_BYTES
 #define HEAP_TARGET_SIZE (16ull * 1024ull * 1024ull)
@@ -67,6 +68,7 @@ static void boot_sequence(const struct BootInfo* boot_info) {
     timer_init();
     keyboard_init();
     mouse_init();
+    network_init();
 
     // Kernel tasks yield cooperatively; ring-3 apps receive timer quanta.
     scheduler_init();
@@ -98,6 +100,7 @@ void kmain(const struct BootInfo* boot_info) {
      * ready; make those initialized devices globally interruptible now.
      */
     __asm__ volatile("sti" ::: "memory");
+    network_poll();
 
     enum app_runtime_launch_result app_result =
         app_runtime_run_catalog_id("hello");

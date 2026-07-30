@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "app_network_services.h"
 #include "app_abi.h"
 #include "app_manifest.h"
 #include "fs.h"
@@ -419,13 +420,14 @@ static uint64_t dispatch_file_write(
     return (uint64_t)length;
 }
 
-static uint64_t dispatch_file_replace(
+static uint64_t dispatch_file_store(
     struct paging_address_space* space,
     uint64_t capabilities,
     uint64_t user_path,
     uint64_t path_length,
     uint64_t user_buffer,
-    uint64_t requested_length) {
+    uint64_t requested_length,
+    bool require_absent) {
     if (!has_capability(capabilities, APP_CAPABILITY_FILE_WRITE)) {
         return app_error(APP_STATUS_PERMISSION_DENIED);
     }
@@ -441,6 +443,14 @@ static uint64_t dispatch_file_replace(
     if (strings_equal(path, "system.log") ||
         app_registry_find_executable(path) != NULL) {
         return app_error(APP_STATUS_PERMISSION_DENIED);
+    }
+    /*
+     * App service calls run as one kernel operation. Keeping the existence
+     * check and write inside this dispatch makes create-if-absent atomic with
+     * respect to every other app filesystem call.
+     */
+    if (require_absent && fs_find(path) != NULL) {
+        return app_error(APP_STATUS_ALREADY_EXISTS);
     }
 
     const size_t length = (size_t)requested_length;
@@ -464,6 +474,30 @@ static uint64_t dispatch_file_replace(
     kfree(contents);
     if (!written) return app_error(APP_STATUS_IO_ERROR);
     return (uint64_t)length;
+}
+
+static uint64_t dispatch_file_replace(
+    struct paging_address_space* space,
+    uint64_t capabilities,
+    uint64_t user_path,
+    uint64_t path_length,
+    uint64_t user_buffer,
+    uint64_t requested_length) {
+    return dispatch_file_store(
+        space, capabilities, user_path, path_length,
+        user_buffer, requested_length, false);
+}
+
+static uint64_t dispatch_file_create_exclusive(
+    struct paging_address_space* space,
+    uint64_t capabilities,
+    uint64_t user_path,
+    uint64_t path_length,
+    uint64_t user_buffer,
+    uint64_t requested_length) {
+    return dispatch_file_store(
+        space, capabilities, user_path, path_length,
+        user_buffer, requested_length, true);
 }
 
 static uint64_t dispatch_file_close(uint64_t process_id,
@@ -1225,6 +1259,10 @@ uint64_t app_services_dispatch(
             return dispatch_file_replace(
                 address_space, granted_capabilities,
                 argument1, argument2, argument3, argument4);
+        case APP_SYSCALL_FILE_CREATE_EXCLUSIVE:
+            return dispatch_file_create_exclusive(
+                address_space, granted_capabilities,
+                argument1, argument2, argument3, argument4);
         case APP_SYSCALL_WINDOW_CREATE:
             return dispatch_window_create(
                 address_space, process_id, granted_capabilities,
@@ -1255,6 +1293,7 @@ uint64_t app_services_dispatch(
 
 void app_services_release_process(uint64_t process_id) {
     if (process_id == 0) return;
+    app_network_services_release_process(process_id);
     if (g_launch_focus_process_id == process_id) {
         g_launch_focus_process_id = 0;
     }

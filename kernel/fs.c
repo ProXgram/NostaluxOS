@@ -128,6 +128,7 @@ bool fs_name_is_system_managed(const char* name) {
         "notepad.elf",
         "image-viewer.elf",
         "ai-assistant.elf",
+        "browser.elf",
         "system-apps.db",
     };
     for (size_t index = 0;

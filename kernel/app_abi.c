@@ -2,7 +2,7 @@
 
 bool app_abi_syscall_known(uint64_t syscall_id) {
     return syscall_id >= APP_SYSCALL_ABI_QUERY &&
-           syscall_id <= APP_SYSCALL_FILE_REPLACE;
+           syscall_id <= APP_SYSCALL_FILE_CREATE_EXCLUSIVE;
 }
 
 uint64_t app_abi_required_capability(uint64_t syscall_id) {
@@ -16,6 +16,13 @@ uint64_t app_abi_required_capability(uint64_t syscall_id) {
             return APP_CAPABILITY_LOG;
         case APP_SYSCALL_TIME_GET:
             return APP_CAPABILITY_TIME;
+        case APP_SYSCALL_NETWORK_STATUS:
+        case APP_SYSCALL_NETWORK_HTTP_START:
+        case APP_SYSCALL_NETWORK_REQUEST_STATUS:
+        case APP_SYSCALL_NETWORK_REQUEST_READ:
+        case APP_SYSCALL_NETWORK_REQUEST_CANCEL:
+        case APP_SYSCALL_NETWORK_REQUEST_CLOSE:
+            return APP_CAPABILITY_NETWORK;
         case APP_SYSCALL_FILE_OPEN:
             /*
              * OPEN is capability-neutral. The kernel checks the requested
@@ -27,6 +34,7 @@ uint64_t app_abi_required_capability(uint64_t syscall_id) {
             return APP_CAPABILITY_FILE_READ;
         case APP_SYSCALL_FILE_WRITE:
         case APP_SYSCALL_FILE_REPLACE:
+        case APP_SYSCALL_FILE_CREATE_EXCLUSIVE:
             return APP_CAPABILITY_FILE_WRITE;
         case APP_SYSCALL_FILE_CLOSE:
             return 0;
@@ -63,6 +71,19 @@ const char* app_abi_syscall_name(uint64_t syscall_id) {
         case APP_SYSCALL_MEMORY_UNMAP: return "memory_unmap";
         case APP_SYSCALL_ARGUMENT_GET: return "argument_get";
         case APP_SYSCALL_FILE_REPLACE: return "file_replace";
+        case APP_SYSCALL_NETWORK_STATUS: return "network_status";
+        case APP_SYSCALL_NETWORK_HTTP_START:
+            return "network_http_start";
+        case APP_SYSCALL_NETWORK_REQUEST_STATUS:
+            return "network_request_status";
+        case APP_SYSCALL_NETWORK_REQUEST_READ:
+            return "network_request_read";
+        case APP_SYSCALL_NETWORK_REQUEST_CANCEL:
+            return "network_request_cancel";
+        case APP_SYSCALL_NETWORK_REQUEST_CLOSE:
+            return "network_request_close";
+        case APP_SYSCALL_FILE_CREATE_EXCLUSIVE:
+            return "file_create_exclusive";
         default: return "unknown";
     }
 }

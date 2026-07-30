@@ -5,6 +5,7 @@
 #include "fs.h"
 #include "graphics.h"
 #include "keyboard.h"
+#include "network.h"
 #include "rtc.h"
 #include "shell.h"
 #include "syslog.h"
@@ -26,6 +27,8 @@ static fs_legacy_upgrade_status_t test_upgrade_status =
     FS_LEGACY_UPGRADE_UNAVAILABLE;
 static size_t test_upgrade_calls;
 static uint64_t terminated_app_process_id;
+static char last_startup_argument[APP_STARTUP_ARGUMENT_MAX + 1u];
+static uint8_t test_http_allocation[4096];
 static struct fs_file test_file = {
     .in_use = true,
     .name = "test.txt",
@@ -86,6 +89,20 @@ static const struct app_process_info test_process = {
     .exit_code = 0,
 };
 
+static const struct network_status test_network_status = {
+    .device_present = true,
+    .device_ready = true,
+    .link_up = true,
+    .configured = true,
+    .mac = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56},
+    .ipv4_address = 0x0a00020fu,
+    .subnet_mask = 0xffffff00u,
+    .gateway = 0x0a000202u,
+    .dns_server = 0x0a000203u,
+    .received_packets = 7,
+    .transmitted_packets = 9,
+};
+
 void graphics_init(void) {}
 uint32_t graphics_get_width(void) { return 640; }
 uint32_t graphics_get_height(void) { return 480; }
@@ -119,6 +136,71 @@ void timer_wait(int ticks) { (void)ticks; }
 uint64_t timer_get_ticks(void) { return 1234; }
 uint64_t timer_get_uptime(void) { return 12; }
 
+void network_init(void) {}
+void network_poll(void) {}
+enum network_result network_renew_dhcp(uint32_t timeout_milliseconds) {
+    (void)timeout_milliseconds;
+    return NETWORK_OK;
+}
+void network_get_status(struct network_status* status) {
+    if (status != NULL) *status = test_network_status;
+}
+enum network_result network_resolve_ipv4(
+    const char* hostname, uint32_t timeout_milliseconds,
+    uint32_t* out_address) {
+    (void)hostname;
+    (void)timeout_milliseconds;
+    if (out_address != NULL) *out_address = 0xc0000201u;
+    return NETWORK_OK;
+}
+enum network_result network_ping(
+    const char* host, uint32_t timeout_milliseconds,
+    uint32_t* out_round_trip_milliseconds) {
+    (void)host;
+    (void)timeout_milliseconds;
+    if (out_round_trip_milliseconds != NULL) {
+        *out_round_trip_milliseconds = 12u;
+    }
+    return NETWORK_OK;
+}
+enum network_result network_http_get(
+    const char* url, char* body, size_t body_capacity,
+    size_t* out_body_length, unsigned int* out_status_code,
+    uint32_t timeout_milliseconds) {
+    (void)url;
+    (void)timeout_milliseconds;
+    static const char response[] = "test response\n";
+    if (body == NULL || body_capacity < sizeof(response)) {
+        return NETWORK_RESPONSE_TOO_LARGE;
+    }
+    memcpy(body, response, sizeof(response));
+    if (out_body_length != NULL) {
+        *out_body_length = sizeof(response) - 1u;
+    }
+    if (out_status_code != NULL) *out_status_code = 200u;
+    return NETWORK_OK;
+}
+const char* network_result_text(enum network_result result) {
+    return result == NETWORK_OK ? "ok" : "test network error";
+}
+bool network_parse_ipv4(const char* text, uint32_t* out_address) {
+    (void)text;
+    if (out_address != NULL) *out_address = 0x0a00020fu;
+    return true;
+}
+void network_format_ipv4(
+    uint32_t address, char* buffer, size_t capacity) {
+    (void)address;
+    if (capacity >= 10u) memcpy(buffer, "10.0.2.15", 10u);
+}
+void network_format_mac(
+    const uint8_t mac[6], char* buffer, size_t capacity) {
+    (void)mac;
+    if (capacity >= 18u) {
+        memcpy(buffer, "52:54:00:12:34:56", 18u);
+    }
+}
+
 size_t app_catalog_count(void) {
     return sizeof(test_apps) / sizeof(test_apps[0]);
 }
@@ -143,6 +225,21 @@ enum app_runtime_launch_result app_runtime_run_catalog_id(
         return APP_RUNTIME_LAUNCH_DISPATCH_BUDGET;
     }
     return APP_RUNTIME_LAUNCH_NOT_FOUND;
+}
+enum app_runtime_launch_result app_runtime_run_catalog_id_with_argument(
+    const char* app_id, const char* startup_argument) {
+    if (startup_argument == NULL) {
+        last_startup_argument[0] = '\0';
+    } else {
+        size_t length = strlen(startup_argument);
+        if (length > APP_STARTUP_ARGUMENT_MAX) {
+            return APP_RUNTIME_LAUNCH_INVALID_ARGUMENT;
+        }
+        memcpy(
+            last_startup_argument, startup_argument,
+            length + 1u);
+    }
+    return app_runtime_run_catalog_id(app_id);
 }
 const char* app_runtime_launch_result_text(
     enum app_runtime_launch_result result) {
@@ -180,6 +277,13 @@ size_t syslog_length(void) { return 1; }
 const char* syslog_entry(size_t index) {
     return index == 0 ? "test log" : "";
 }
+void syslog_write(const char* message) { (void)message; }
+
+void* kmalloc(size_t size) {
+    return size <= sizeof(test_http_allocation)
+         ? test_http_allocation : NULL;
+}
+void kfree(void* pointer) { (void)pointer; }
 
 size_t fs_file_count(void) { return 0; }
 const struct fs_file* fs_file_at(size_t index) { (void)index; return NULL; }
@@ -312,6 +416,15 @@ static void test_app_launcher_commands(void) {
     execute("app hello", output, sizeof(output), NULL, NULL);
     assert(strcmp(output, "App 'hello' exited normally.\n") == 0);
 
+    last_startup_argument[0] = '\0';
+    execute(
+        "app hello http://10.0.2.2/start",
+        output, sizeof(output), NULL, NULL);
+    assert(strcmp(output, "App 'hello' exited normally.\n") == 0);
+    assert(strcmp(
+               last_startup_argument,
+               "http://10.0.2.2/start") == 0);
+
     execute("app fault-probe", output, sizeof(output), NULL, NULL);
     assert(strstr(output, "faulted in ring 3 and was isolated") != NULL);
     assert(strstr(output, "OS is still running") != NULL);
@@ -347,7 +460,9 @@ static void test_app_launcher_commands(void) {
     assert(strstr(output, "application not found") != NULL);
 
     execute("app", output, sizeof(output), NULL, NULL);
-    assert(strcmp(output, "Usage: app <id>\n") == 0);
+    assert(strcmp(
+               output,
+               "Usage: app <id> [startup-argument]\n") == 0);
 }
 
 static void test_legacy_upgrade_confirmation(void) {
