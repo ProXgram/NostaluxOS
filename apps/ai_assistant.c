@@ -124,9 +124,7 @@ static void assistant_answer(const char* prompt,
     } else if (app_text_has_word(prompt, "INTERNET") ||
                app_text_has_word(prompt, "NETWORK") ||
                app_text_has_word(prompt, "BROWSER")) {
-        app_text_copy(
-            answer, capacity,
-            "NO NETWORK STACK YET. BROWSER OPENS LOCAL PAGES.");
+        assistant_network_answer(answer, capacity);
     } else if (app_text_has_word(prompt, "CALCULATOR") ||
                app_text_has_word(prompt, "IMAGE") ||
                app_text_has_word(prompt, "IMAGES") ||
